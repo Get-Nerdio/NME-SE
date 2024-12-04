@@ -34,6 +34,10 @@
 
     .EXAMPLE
         .\Start-NerdioManagerPreFlight.ps1 -SubscriptionId "17c99779-9397-4bd4-b7c0-2cde094b9646" -ResourceGroupName "rg-NerdioManagerPreflight-aue"
+
+    .EXAMPLE 
+        & ([ScriptBlock]::Create((New-Object System.Net.WebClient).DownloadString('https://raw.githubusercontent.com/Get-Nerdio/NME-SE/refs/heads/main/Start-NerdioManagerPreFlight.ps1'))) 
+ 
 #>
 [CmdletBinding()]
 param (
@@ -51,7 +55,7 @@ param (
 
     [Parameter(Mandatory = $false)]
     [ValidateNotNullOrEmpty()]
-    [System.String] $OutFile = $(Join-Path -Path $PSScriptRoot -ChildPath "NerdioManagerPreflightOutput.json")
+    [System.String] $OutFile = $(Join-Path -Path './' -ChildPath "NerdioManagerPreflightOutput.json")
 )
 
 try {
