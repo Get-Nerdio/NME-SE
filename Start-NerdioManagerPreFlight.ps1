@@ -172,33 +172,38 @@ if ([System.String]::IsNullOrEmpty($ResourceGroupName)) {
     }
     while ($ResourceGroupName -notmatch "^[a-zA-Z0-9_\-\(\)\.]{1,90}$")
     Write-Host "Target resource group: $ResourceGroupName"
+    if (Get-AzResourceGroup -Name $ResourceGroupName -ErrorAction "SilentlyContinue") {
+        Write-Host "Resource group '$ResourceGroupName' already exists."
 
-    Write-Host "Retrieving available locations for the resource group..."
-    $Region = Get-AzLocation | Where-Object { $_.RegionType -match "Physical" } | `
-        Sort-Object -Property "Location" | `
-        Select-Object -Property "DisplayName", "Location" | `
-        Out-ConsoleGridView -Title "Select the location for the resource group" -OutputMode "Single"
-    Write-Host "Selected location: '$($Region.DisplayName)'"
-
-    do {
-        $Response = Read-Host -Prompt "Include tags on the resource group? [y/n]"
-    } while ($Response -notmatch "^[YyNn]$")
-    if ($Response -match "^[Yy]$") {
-        $params = @{
-            Name        = $ResourceGroupName
-            Location    = $Region.Location
-            Tag         = $Tags
-            ErrorAction = "Stop"
-        }
-        New-AzResourceGroup @params
     }
     else {
-        $params = @{
-            Name        = $ResourceGroupName
-            Location    = $Region.Location
-            ErrorAction = "Stop"
+        Write-Host "Retrieving available locations for the resource group..."
+        $Region = Get-AzLocation | Where-Object { $_.RegionType -match "Physical" } | `
+            Sort-Object -Property "Location" | `
+            Select-Object -Property "DisplayName", "Location" | `
+            Out-ConsoleGridView -Title "Select the location for the resource group" -OutputMode "Single"
+        Write-Host "Selected location: '$($Region.DisplayName)'"
+
+        do {
+            $Response = Read-Host -Prompt "Include tags on the resource group? [y/n]"
+        } while ($Response -notmatch "^[YyNn]$")
+        if ($Response -match "^[Yy]$") {
+            $params = @{
+                Name        = $ResourceGroupName
+                Location    = $Region.Location
+                Tag         = $Tags
+                ErrorAction = "Stop"
+            }
+            New-AzResourceGroup @params
         }
-        New-AzResourceGroup @params
+        else {
+            $params = @{
+                Name        = $ResourceGroupName
+                Location    = $Region.Location
+                ErrorAction = "Stop"
+            }
+            New-AzResourceGroup @params
+        }
     }
 }
 else {
