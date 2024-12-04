@@ -28,7 +28,7 @@ if ($ownerRole) {
 }
 
 Write-Host "Checking global administrator role..."
-Connect-MgGraph -scopes "User.Read" -ErrorAction SilentlyContinue -NoWelcome -UseDeviceAuthentication
+Connect-MgGraph -scopes "User.Read, Group.Read.All" -ErrorAction SilentlyContinue -NoWelcome -UseDeviceAuthentication
 $GA = Get-MgDirectoryRole -ExpandProperty members | ? DisplayName -eq 'Global Administrator'
 if (($currentUser.Account.ExtendedProperties.HomeAccountId -split '\.')[0] -in $ga.Members.id) {
     Write-Host -ForegroundColor Green "You are a global administrator in the tenant"
