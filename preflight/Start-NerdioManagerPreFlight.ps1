@@ -29,25 +29,25 @@
         https://learn.microsoft.com/en-us/azure/azure-resource-manager/management/azure-subscription-service-limits#automation-limits
         https://learn.microsoft.com/en-us/azure/key-vault/general/key-vault-recovery
 
-        TODO: Random resource names generated are unique per run. These need to be updated to be unique to the subscription and
-              resource group, like Bicep does so the same resource name will be generated each time the script is run
-
     .EXAMPLE
+        Start the preflight check for Nerdio Manager in the specified subscription and resource group:
+
         .\Start-NerdioManagerPreFlight.ps1 -SubscriptionId "17c99779-9397-4bd4-b7c0-2cde094b9646" -ResourceGroupName "rg-NerdioManagerPreflight-aue"
 
-    .EXAMPLE 
-        & ([ScriptBlock]::Create((New-Object System.Net.WebClient).DownloadString('https://raw.githubusercontent.com/Get-Nerdio/NME-SE/refs/heads/main/Start-NerdioManagerPreFlight.ps1'))) 
- 
+    .EXAMPLE
+        Start the preflight check for Nerdio Manager in the specified subscription and ask to create a resource group:
+
+        .\Start-NerdioManagerPreFlight.ps1 -SubscriptionId "17c99779-9397-4bd4-b7c0-2cde094b9646"
 #>
 [CmdletBinding()]
 param (
     [Parameter(Mandatory = $true, Position = 0, HelpMessage = "The ID of the Azure subscription where the resources will be created.")]
     [ValidateNotNullOrEmpty()]
-    [System.String] $SubscriptionId, #= "17c99779-9397-4bd4-b7c0-2cde094b9646",
+    [System.String] $SubscriptionId,
 
     [Parameter(Mandatory = $false, Position = 1, HelpMessage = "The name of the resource group where the resources will be created.")]
     [ValidateNotNullOrEmpty()]
-    [System.String] $ResourceGroupName, #= "rg-NerdioManagerPreflight-aue",
+    [System.String] $ResourceGroupName,
 
     [Parameter(Mandatory = $false)]
     [ValidateNotNullOrEmpty()]
@@ -55,7 +55,7 @@ param (
 
     [Parameter(Mandatory = $false)]
     [ValidateNotNullOrEmpty()]
-    [System.String] $OutFile = $(Join-Path -Path './' -ChildPath "NerdioManagerPreflightOutput.json")
+    [System.String] $OutFile = $(Join-Path -Path $PSScriptRoot -ChildPath "NerdioManagerPreflightOutput.json")
 )
 
 try {
@@ -89,7 +89,7 @@ function New-PreflightObject {
             $Policy = $Matches[0] | ConvertFrom-Json
         }
         else {
-            $Policy = "Not found"
+            $Policy = "No policy details returned."
         }
 
         $Object = [PSCustomObject]@{
@@ -109,11 +109,22 @@ function New-PreflightObject {
         $Object = [PSCustomObject]@{
             Target  = $Target
             Message = $ExceptionMessage
-            Policy  = "Not found"
+            Policy  = "No policy details could be determined."
         }
     }
 
     return $Object
+}
+
+function New-UniqueString {
+    param (
+        [System.String] $InputString
+    )
+    $Hash = [System.Security.Cryptography.HashAlgorithm]::Create("SHA256")
+    $Bytes = [System.Text.Encoding]::UTF8.GetBytes($InputString)
+    $HashBytes = $Hash.ComputeHash($Bytes)
+    $UniqueString = [BitConverter]::ToString($HashBytes).Replace("-", "").Substring(0, 10)
+    return $UniqueString.ToLower()
 }
 #endregion
 
@@ -172,38 +183,33 @@ if ([System.String]::IsNullOrEmpty($ResourceGroupName)) {
     }
     while ($ResourceGroupName -notmatch "^[a-zA-Z0-9_\-\(\)\.]{1,90}$")
     Write-Host "Target resource group: $ResourceGroupName"
-    if (Get-AzResourceGroup -Name $ResourceGroupName -ErrorAction "SilentlyContinue") {
-        Write-Host "Resource group '$ResourceGroupName' already exists."
 
+    Write-Host "Retrieving available locations for the resource group..."
+    $Region = Get-AzLocation | Where-Object { $_.RegionType -match "Physical" } | `
+        Sort-Object -Property "Location" | `
+        Select-Object -Property "DisplayName", "Location" | `
+        Out-ConsoleGridView -Title "Select the location for the resource group" -OutputMode "Single"
+    Write-Host "Selected location: '$($Region.DisplayName)'"
+
+    do {
+        $Response = Read-Host -Prompt "Include tags on the resource group? [y/n]"
+    } while ($Response -notmatch "^[YyNn]$")
+    if ($Response -match "^[Yy]$") {
+        $params = @{
+            Name        = $ResourceGroupName
+            Location    = $Region.Location
+            Tag         = $Tags
+            ErrorAction = "Stop"
+        }
+        New-AzResourceGroup @params
     }
     else {
-        Write-Host "Retrieving available locations for the resource group..."
-        $Region = Get-AzLocation | Where-Object { $_.RegionType -match "Physical" } | `
-            Sort-Object -Property "Location" | `
-            Select-Object -Property "DisplayName", "Location" | `
-            Out-ConsoleGridView -Title "Select the location for the resource group" -OutputMode "Single"
-        Write-Host "Selected location: '$($Region.DisplayName)'"
-
-        do {
-            $Response = Read-Host -Prompt "Include tags on the resource group? [y/n]"
-        } while ($Response -notmatch "^[YyNn]$")
-        if ($Response -match "^[Yy]$") {
-            $params = @{
-                Name        = $ResourceGroupName
-                Location    = $Region.Location
-                Tag         = $Tags
-                ErrorAction = "Stop"
-            }
-            New-AzResourceGroup @params
+        $params = @{
+            Name        = $ResourceGroupName
+            Location    = $Region.Location
+            ErrorAction = "Stop"
         }
-        else {
-            $params = @{
-                Name        = $ResourceGroupName
-                Location    = $Region.Location
-                ErrorAction = "Stop"
-            }
-            New-AzResourceGroup @params
-        }
+        New-AzResourceGroup @params
     }
 }
 else {
@@ -302,6 +308,9 @@ if ($Response -match "^[Yy]$") {
     # Wrap script in try/catch/finally block so that we ensure cleanup is performed
     try {
 
+        # Generate a unique string for the resource names
+        $UniqueString = New-UniqueString -InputString $ResourceGroup.ResourceId
+
         # Attempt to create a new Azure Log Analytics Workspace
         try {
             $LogAnalyticsWorkspaceName = "log-$($AppName)-$($ResourceGroup.Location)"
@@ -325,9 +334,7 @@ if ($Response -match "^[Yy]$") {
         # Attempt to create a new storage account
         try {
             # Generate a random storage account name
-            $Length = 10
-            $RandomString = -join ((1..$Length) | ForEach-Object { $Chars.ToCharArray() | Get-Random })
-            $StorageAccountName = ("$($AppName)$($RandomString)").ToLower()
+            $StorageAccountName = ("$($AppName)$($UniqueString)").ToLower()
             Write-Host -ForegroundColor "Cyan" "Attempting to create a new storage account with name: '$($StorageAccountName)'."
             $params = @{
                 ResourceGroupName               = $ResourceGroupName
@@ -363,7 +370,7 @@ if ($Response -match "^[Yy]$") {
             $Credentials = $(New-Object -TypeName "System.Management.Automation.PSCredential" -ArgumentList $AdminLogin, $(ConvertTo-SecureString -String $Password -AsPlainText -Force))
 
             # SQL Server name
-            $SqlServerName = ("$($AppName)-Sql-$(Get-Random)").ToLower()
+            $SqlServerName = ("$($AppName)-Sql-$($UniqueString)").ToLower()
 
             Write-Host -ForegroundColor "Cyan" "Attempting to create a new SQL Server with name: '$SqlServerName'."
             $params = @{
@@ -468,11 +475,12 @@ if ($Response -match "^[Yy]$") {
                 ErrorAction       = "Stop"
             }
             New-AzAppServicePlan @params *> $null
+            $ErrorMsg = $Error[0].Exception.Message
             Start-Sleep -Seconds 5
             $AppServicePlan = Get-AzAppServicePlan -ResourceGroupName $ResourceGroupName -Name $params.Name
             if ([System.String]::IsNullOrEmpty($AppServicePlan.Name)) {
                 Write-Host -ForegroundColor "Red" "[x] Failed to create a new App Service Plan."
-                $OutputArray.Add($(New-PreflightObject -ExceptionMessage $Error[0].Exception.Message -Target "AppServicePlan")) | Out-Null
+                $OutputArray.Add($(New-PreflightObject -ExceptionMessage $ErrorMsg -Target "AppServicePlan")) | Out-Null
             }
             else {
                 Write-Host -ForegroundColor "Green" "[⎷] Created a new App Service Plan with name: '$($AppServicePlan.Name)'."
@@ -491,7 +499,7 @@ if ($Response -match "^[Yy]$") {
         #         Write-Host -ForegroundColor "Cyan" "Attempting to create a new App Service."
         #         $params = @{
         #             ResourceGroupName = $ResourceGroupName
-        #             Name              = ("app-$($AppName)-$(Get-Random)").ToLower()
+        #             Name              = ("app-$($AppName)-$($UniqueString)").ToLower()
         #             Location          = $ResourceGroup.Location
         #             AppServicePlan    = $AppServicePlan
         #             Tag               = $Tags
@@ -511,7 +519,7 @@ if ($Response -match "^[Yy]$") {
         # Refer to Automation limits: https://learn.microsoft.com/en-us/azure/azure-resource-manager/management/azure-subscription-service-limits#automation-limits"
         if ($CreateAutomationAccount) {
             try {
-                $AutomationAccountName = "aa-$($AppName)-$(Get-Random)-$($ResourceGroup.Location)"
+                $AutomationAccountName = "aa-$($AppName)-$($UniqueString)-$($ResourceGroup.Location)"
                 Write-Host -ForegroundColor "Cyan" "Attempting to create a new Automation Account with name: $($AutomationAccountName)."
                 $params = @{
                     ResourceGroupName          = $ResourceGroupName
@@ -542,7 +550,7 @@ if ($Response -match "^[Yy]$") {
 
         # Attempt to create a new Key Vault
         try {
-            $KeyVaultName = "kv-Nme-$(Get-Random)-$($ResourceGroup.Location)".Substring(0, 24)
+            $KeyVaultName = "kv-Nme-$($UniqueString)-$($ResourceGroup.Location)".Substring(0, 24)
             Write-Host -ForegroundColor "Cyan" "Attempting to create a new Key Vault with name: $KeyVaultName."
             $params = @{
                 ResourceGroupName = $ResourceGroupName
@@ -622,7 +630,7 @@ if ($Response -match "^[Yy]$") {
                 Write-Host -ForegroundColor "Cyan" "Removing Key Vault: '$($KeyVault.VaultName)'."
                 Remove-AzKeyVault -ResourceGroupName $ResourceGroupName -VaultName $KeyVault.VaultName -Force -ErrorAction "Continue"
             }
-            Write-Host -ForegroundColor "Cyan" "Finished removing resources. Check resource group to confirm."
+            Write-Host -ForegroundColor "Cyan" "Finished removing resources. Check resource group to confirm: '$ResourceGroupName'"
         }
     }
     #endregion
