@@ -55,7 +55,7 @@ param (
 
     [Parameter(Mandatory = $false)]
     [ValidateNotNullOrEmpty()]
-    [System.String] $OutFile = $(Join-Path -Path $PSScriptRoot -ChildPath "NerdioManagerPreflightOutput.json")
+    [System.String] $OutFile = $(if ($Env:AZD_IN_CLOUDSHELL -eq 1) { $(Join-Path -Path $PWD -ChildPath "NerdioManagerPreflightOutput.json") } else { $(Join-Path -Path $PSScriptRoot -ChildPath "NerdioManagerPreflightOutput.json") })
 )
 
 try {
@@ -183,6 +183,15 @@ if ([System.String]::IsNullOrEmpty($ResourceGroupName)) {
     }
     while ($ResourceGroupName -notmatch "^[a-zA-Z0-9_\-\(\)\.]{1,90}$")
     Write-Host "Target resource group: $ResourceGroupName"
+
+    # Let's import the Microsoft.PowerShell.ConsoleGuiTools module and throw if it's not available
+    # This ensures we can use the Out-ConsoleGridView cmdlet and avoid Requires not working in Cloud Shell
+    try {
+        Import-Module -Name "Microsoft.PowerShell.ConsoleGuiTools" -ErrorAction "Stop"
+    }
+    catch {
+        throw $_
+    }
 
     Write-Host "Retrieving available locations for the resource group..."
     $Region = Get-AzLocation | Where-Object { $_.RegionType -match "Physical" } | `
