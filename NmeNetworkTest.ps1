@@ -24,7 +24,7 @@ $ProgressPreference = 'SilentlyContinue'
 - Ensure that the script is executed in the Debug console of the Azure App Service hosting the Nerdio Manager app.
 - This script is intended for diagnostic purposes to identify potential connectivity issues.
 - The script will output the results to a file named NmeNetworkTestOutput.txt in the current directory.
-- For further assistance, please contact Nerdio support.
+- For further assistance, please contact Nerdio support and supply the output of this test.
 
 .AUTHOR
 Nick Wagner
