@@ -12,13 +12,19 @@ It also allows for additional URIs to be tested by passing them as parameters.
 An array of additional URIs to test connectivity against. This is useful for testing custom endpoints or services.
 
 .EXAMPLE
-# Run the script in the Azure App Service debug console, setting the $ProgressPreference to 'SilentlyContinue' before executing.
+To access the Kudu console, select the app service in the Azure portal, go to Development Tools, select Advanced Tools, and then select Go. 
+In the Kudu service page, select Tools > Debug Console > PowerShell.
+
+Upload this script to the debug console. Set the $ProgressPreference to 'SilentlyContinue' before executing.
+
 $ProgressPreference = 'SilentlyContinue'
 .\NmeNetworkTest.ps1
 
 .NOTES
-- Ensure that the script is executed in the context of the Azure App Service hosting the Nerdio Manager app.
+- Ensure that the script is executed in the Debug console of the Azure App Service hosting the Nerdio Manager app.
 - This script is intended for diagnostic purposes to identify potential connectivity issues.
+- The script will output the results to a file named NmeNetworkTestOutput.txt in the current directory.
+- For further assistance, please contact Nerdio support.
 
 .AUTHOR
 Nick Wagner
