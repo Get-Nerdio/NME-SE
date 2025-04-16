@@ -121,6 +121,12 @@ foreach ($endpoint in $ApiEndpoints) {
         $endpoint | Add-Member -MemberType NoteProperty -Name SSLCertificateIssuer -Value $servicePoint.Certificate.Issuer
         $endpoint.Exceptions += "SSL Check: $($_.Exception.Message)"
     }
+    $nameResolverOutput = nameresolver $endpoint.uri
+    # Parse the Server field from the output
+    $serverAddress = ($nameResolverOutput | Select-String -Pattern "Server:\s*(\S+)" | ForEach-Object { $_.Matches.Groups[1].Value }) -join ''
+    if ($serverAddress) {
+        $endpoint | Add-Member -MemberType NoteProperty -Name DnsServer -Value $serverAddress
+    }
 }
-$ApiEndpoints | Select-Object URI, Port, Purpose, RemoteAddress, TcpTestSucceeded, NextHops, SSLCertificateSubject, SSLCertificateIssuer, Exceptions | Format-List > NmeNetworkTestOutput.txt
-$ApiEndpoints | Select-Object URI, Port, Purpose, RemoteAddress, TcpTestSucceeded, NextHops, SSLCertificateSubject, SSLCertificateIssuer, Exceptions 
+$ApiEndpoints | Select-Object URI, Port, Purpose, RemoteAddress, DnsServer, TcpTestSucceeded, NextHops, SSLCertificateSubject, SSLCertificateIssuer, Exceptions | Format-List > NmeNetworkTestOutput.txt
+$ApiEndpoints | Select-Object URI, Port, Purpose, RemoteAddress, DnsServer, TcpTestSucceeded, NextHops, SSLCertificateSubject, SSLCertificateIssuer, Exceptions 
