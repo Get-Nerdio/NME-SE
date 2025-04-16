@@ -100,7 +100,9 @@ foreach ($endpoint in $ApiEndpoints) {
     try {
         $testResult = $null
         $testResult = Test-NetConnection -ComputerName $endpoint.URI -TraceRoute -Hops 3 -WarningAction SilentlyContinue 
-        $endpoint | Add-Member -MemberType NoteProperty -Name NextHops -Value $testResult.TraceRoute
+        if ($testresult.traceroute[0] -notmatch '\.\.\.'){
+            $endpoint | Add-Member -MemberType NoteProperty -Name NextHops -Value $testResult.TraceRoute
+        } 
     } catch {}
     try {
         $uri = "https://$($endpoint.URI)"
