@@ -109,12 +109,10 @@ foreach ($endpoint in $ApiEndpoints) {
     try{
         # use resolve-dnsname to get the ip address of the endpoint
         $dnsResult = Resolve-DnsName -Name $endpoint.URI -Server $endpoint.DnsServer -Type A -ErrorAction Stop
-        $endpoint | Add-Member -MemberType NoteProperty -Name DnsServer -Value $DnsServer
         $endpoint | Add-Member -MemberType NoteProperty -Name RemoteAddress -Value $dnsResult.IP4Address
     }
     catch {
         $endpoint | Add-Member -MemberType NoteProperty -Name RemoteAddress -Value $dnsResult.IP4Address
-        $endpoint | Add-Member -MemberType NoteProperty -Name DnsServer -Value $DnsServer
         $endpoint.Exceptions += $_.Exception.Message
     }
     try {
