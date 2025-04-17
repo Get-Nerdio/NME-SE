@@ -150,7 +150,7 @@ foreach ($endpoint in $ApiEndpoints) {
         $endpoint | Add-Member -MemberType NoteProperty -Name DnsServer -Value $serverAddress
     }
     #>
-    $Endpoint  | Select-Object URI, Port, Purpose, RemoteAddress, DnsServer, TcpTestSucceeded, NextHops, SSLCertificateSubject, SSLCertificateIssuer, Exceptions 
+    $Endpoint  | Select-Object URI, Port, Purpose, RemoteAddress, DnsServer, SSLCertificateSubject, SSLCertificateIssuer, Exceptions 
 }
-$ApiEndpoints | Select-Object URI, Port, Purpose, RemoteAddress, DnsServer, TcpTestSucceeded, NextHops, SSLCertificateSubject, SSLCertificateIssuer, Exceptions | Format-List > NmeNetworkTestOutput.txt
+$ApiEndpoints | Select-Object URI, Port, Purpose, RemoteAddress, DnsServer, NextHops, SSLCertificateSubject, SSLCertificateIssuer, Exceptions | Format-List > NmeNetworkTestOutput.txt
 #$ApiEndpoints | Select-Object URI, Port, Purpose, RemoteAddress, DnsServer, TcpTestSucceeded, NextHops, SSLCertificateSubject, SSLCertificateIssuer, Exceptions 
