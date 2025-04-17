@@ -51,16 +51,19 @@ $ErrorActionPreference = 'Stop'
 
 $DnsServers = $Env:WEBSITE_DNS_SERVER_FROM_VNET -split ','
 if ($DnsServers){
-    $LocalDns = $DnsServers[0]
+    if ($DnsServers[0] -eq '168.63.129.16'){
+        $LocalDns = 'AzureDefaultDns'
+    }
+    else {$LocalDns = $DnsServers[0]}
 }
 else {
-    $LocalDns = '168.63.129.16'
+    $LocalDns = 'AzureDefaultDns'
 }
 if ($Env:WEBSITE_VNET_ROUTE_ALL) {
     $RemoteDns = $LocalDns
 }
 else {
-    $RemoteDns = '168.63.129.16'
+    $RemoteDns = 'AzureDefaultDns'
 }
 
 # set powershell tls version to $TlsVersion
@@ -107,8 +110,10 @@ foreach ($uri in $AdditionalTestUris) {
 
 foreach ($endpoint in $ApiEndpoints) {
     try{
+        $dnsresult = $null
+        
         # use resolve-dnsname to get the ip address of the endpoint
-        if ($endpoint.DnsServer -eq '168.63.129.16') {
+        if ($endpoint.DnsServer -eq 'AzureDefaultDns') {
             $dnsResult = Resolve-DnsName -Name $endpoint.URI -Type A -QuickTimeout -ErrorAction Stop
         }
         else {$dnsResult = Resolve-DnsName -Name $endpoint.URI -Server $endpoint.DnsServer -Type A -QuickTimeout -ErrorAction Stop}
@@ -118,21 +123,6 @@ foreach ($endpoint in $ApiEndpoints) {
         $endpoint | Add-Member -MemberType NoteProperty -Name RemoteAddress -Value $dnsResult.IP4Address
         $endpoint.Exceptions += $_.Exception.Message
     }
-    try {
-        $testResult = $null
-        $testResult = Test-NetConnection -ComputerName $endpoint.URI -Port $endpoint.Port -WarningAction Stop 
-        $endpoint | Add-Member -MemberType NoteProperty -Name TcpTestSucceeded -Value $testResult.TcpTestSucceeded
-    } catch {
-        $endpoint | Add-Member -MemberType NoteProperty -Name TcpTestSucceeded -Value $testResult.TcpTestSucceeded
-        $endpoint.Exceptions += $_.Exception.Message
-    }
-    try {
-        $testResult = $null
-        $testResult = Test-NetConnection -ComputerName $endpoint.URI -TraceRoute -Hops 3 -WarningAction SilentlyContinue 
-        if ($testresult.traceroute[0] -notmatch '\.\.\.'){
-            $endpoint | Add-Member -MemberType NoteProperty -Name NextHops -Value $testResult.TraceRoute
-        } 
-    } catch {}
     try {
         $uri = "https://$($endpoint.URI)"
         $servicePoint = $null 
@@ -160,6 +150,7 @@ foreach ($endpoint in $ApiEndpoints) {
         $endpoint | Add-Member -MemberType NoteProperty -Name DnsServer -Value $serverAddress
     }
     #>
+    $Endpoint  | Select-Object URI, Port, Purpose, RemoteAddress, DnsServer, TcpTestSucceeded, NextHops, SSLCertificateSubject, SSLCertificateIssuer, Exceptions 
 }
 $ApiEndpoints | Select-Object URI, Port, Purpose, RemoteAddress, DnsServer, TcpTestSucceeded, NextHops, SSLCertificateSubject, SSLCertificateIssuer, Exceptions | Format-List > NmeNetworkTestOutput.txt
-$ApiEndpoints | Select-Object URI, Port, Purpose, RemoteAddress, DnsServer, TcpTestSucceeded, NextHops, SSLCertificateSubject, SSLCertificateIssuer, Exceptions 
+#$ApiEndpoints | Select-Object URI, Port, Purpose, RemoteAddress, DnsServer, TcpTestSucceeded, NextHops, SSLCertificateSubject, SSLCertificateIssuer, Exceptions 
