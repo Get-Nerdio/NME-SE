@@ -11,6 +11,10 @@ It also allows for additional URIs to be tested by passing them as parameters.
 .PARAMETER AdditionalTestUris
 An array of additional URIs to test connectivity against. This is useful for testing custom endpoints or services.
 
+.PARAMETER TlsVersion
+The TLS version to use for the connection tests. Default is 'Tls12'. Use 'Tls13' as needed.
+
+
 .EXAMPLE
 To access the Kudu console, select the app service in the Azure portal, go to Development Tools, select Advanced Tools, and then select Go. 
 In the Kudu service page, select Tools > Debug Console > PowerShell.
@@ -32,7 +36,8 @@ Nick Wagner
 #>
 
 param(
-    [string[]]$AdditionalTestUris = @()
+    [string[]]$AdditionalTestUris = @(),
+    [string]$TlsVersion = 'Tls12'
 )
 
 if ($ProgressPreference -ne 'SilentlyContinue') {
@@ -42,58 +47,82 @@ if ($ProgressPreference -ne 'SilentlyContinue') {
 }
 $WarningPreference = 'SilentlyContinue'
 $ErrorActionPreference = 'Stop'
-$TlsVersion = "Tls12"
+
+
+$DnsServers = $Env:WEBSITE_DNS_SERVER_FROM_VNET -split ','
+if ($DnsServers){
+    $LocalDns = $DnsServers[0]
+}
+else {
+    $LocalDns = '168.63.129.16'
+}
+if ($Env:WEBSITE_VNET_ROUTE_ALL) {
+    $RemoteDns = $LocalDns
+}
+else {
+    $RemoteDns = '168.63.129.16'
+}
 
 # set powershell tls version to $TlsVersion
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::$TlsVersion
 $ApiEndpoints = @(
-    [PSCustomObject]@{ URI = "nwp-web-app.azurewebsites.net"; Port = 443; Purpose = "Nerdio Licensing Servers"; Exceptions = @() },
-    [PSCustomObject]@{ URI = "login.microsoftonline.com"; Port = 443; Purpose = "Microsoft API Authentication"; Exceptions = @() },
-    [PSCustomObject]@{ URI = "graph.microsoft.com"; Port = 443; Purpose = "Graph API Authentication"; Exceptions = @() },
-    [PSCustomObject]@{ URI = "login.windows.net"; Port = 443; Purpose = "Entra ID SQL Authentication"; Exceptions = @() },
-    [PSCustomObject]@{ URI = "management.azure.com"; Port = 443; Purpose = "Azure API"; Exceptions = @() },
-    [PSCustomObject]@{ URI = "api.github.com"; Port = 443; Purpose = "Scripted Actions"; Exceptions = @() },
-    [PSCustomObject]@{ URI = "api.loganalytics.io"; Port = 443; Purpose = "API Access for Log Analytics"; Exceptions = @() },
-    [PSCustomObject]@{ URI = "api.applicationinsights.io"; Port = 443; Purpose = "API Access for Application Insights"; Exceptions = @() }
+    [PSCustomObject]@{ URI = "nwp-web-app.azurewebsites.net"; Port = 443; Purpose = "Nerdio Licensing Servers"; Exceptions = @(); DnsServer = $RemoteDns },
+    [PSCustomObject]@{ URI = "login.microsoftonline.com"; Port = 443; Purpose = "Microsoft API Authentication"; Exceptions = @(); DnsServer = $RemoteDns },
+    [PSCustomObject]@{ URI = "graph.microsoft.com"; Port = 443; Purpose = "Graph API Authentication"; Exceptions = @(); DnsServer = $RemoteDns },
+    [PSCustomObject]@{ URI = "login.windows.net"; Port = 443; Purpose = "Entra ID SQL Authentication"; Exceptions = @(); DnsServer = $RemoteDns },
+    [PSCustomObject]@{ URI = "management.azure.com"; Port = 443; Purpose = "Azure API"; Exceptions = @(); DnsServer = $RemoteDns },
+    [PSCustomObject]@{ URI = "api.github.com"; Port = 443; Purpose = "Scripted Actions"; Exceptions = @(); DnsServer = $RemoteDns },
+    [PSCustomObject]@{ URI = "api.loganalytics.io"; Port = 443; Purpose = "API Access for Log Analytics"; Exceptions = @(); DnsServer = $RemoteDns },
+    [PSCustomObject]@{ URI = "api.applicationinsights.io"; Port = 443; Purpose = "API Access for Application Insights"; Exceptions = @(); DnsServer = $RemoteDns }
 )
 
 # check if $Env:WEBSITE_HOSTNAME starts with 'nmw-app' and ends with '.azurewebsites.net'
 if ($Env:WEBSITE_HOSTNAME -notmatch '^nmw-app.*\.azurewebsites\.net$') {
     # prompt user for fqdns to test
     $KeyVaultUri = Read-Host -Prompt "Enter the FQDN for the Nerdio Manager Key Vault (e.g. nmw-app-kv-<unique string>.vault.azure.net)"
-    $ApiEndpoints += [PSCustomObject]@{ URI = $KeyVaultUri; Port = 443; Purpose = "Nerdio Manager Key Vault"; Exceptions = @() } # key vault uri
+    $ApiEndpoints += [PSCustomObject]@{ URI = $KeyVaultUri; Port = 443; Purpose = "Nerdio Manager Key Vault"; Exceptions = @(); DnsServer = $LocalDns } # key vault uri
     $SqlServerUri = Read-Host -Prompt "Enter the FQDN for the Nerdio Manager SQL Server (e.g. nmw-app-sql-<unique string>.database.windows.net)"
-    $ApiEndpoints += [PSCustomObject]@{ URI = $SqlServerUri; Port = 1433; Purpose = "Nerdio Manager SQL Server"; Exceptions = @() } # sql server uri
+    $ApiEndpoints += [PSCustomObject]@{ URI = $SqlServerUri; Port = 1433; Purpose = "Nerdio Manager SQL Server"; Exceptions = @(); DnsServer = $LocalDns } # sql server uri
     $DpsStorageAccountUri = Read-Host -Prompt "Enter the FQDN for the Nerdio Manager DPS Storage Account (e.g. dps<unique string>.blob.core.windows.net)"
-    $ApiEndpoints += [PSCustomObject]@{ URI = $DpsStorageAccountUri; Port = 443; Purpose = "Nerdio Manager DPS Storage Account"; Exceptions = @() } # dps storage account uri
+    $ApiEndpoints += [PSCustomObject]@{ URI = $DpsStorageAccountUri; Port = 443; Purpose = "Nerdio Manager DPS Storage Account"; Exceptions = @(); DnsServer = $LocalDns } # dps storage account uri
 
 }
 else {
     # transform the $Env:WEBSITE_HOSTNAME from format like nmw-app-<unique string>.azurewebsites.net to a list of FQDNs for each app resource to test
     # key vault uri
     $KeyVaultUri = "nmw-app-kv-$((($Env:WEBSITE_HOSTNAME -split '-')[2] -split '\.')[0]).vault.azure.net"
-    $ApiEndpoints += [PSCustomObject]@{ URI = $KeyVaultUri; Port = 443; Purpose = "Nerdio Manager Key Vault"; Exceptions = @() } # key vault uri
+    $ApiEndpoints += [PSCustomObject]@{ URI = $KeyVaultUri; Port = 443; Purpose = "Nerdio Manager Key Vault"; Exceptions = @(); DnsServer = $LocalDns } # key vault uri
     # sql server uri
     $SqlServerUri = "nmw-app-sql-$((($Env:WEBSITE_HOSTNAME -split '-')[2] -split '\.')[0]).database.windows.net"
-    $ApiEndpoints += [PSCustomObject]@{ URI = $SqlServerUri; Port = 1433; Purpose = "Nerdio Manager SQL Server"; Exceptions = @() } # sql server uri
+    $ApiEndpoints += [PSCustomObject]@{ URI = $SqlServerUri; Port = 1433; Purpose = "Nerdio Manager SQL Server"; Exceptions = @(); DnsServer = $LocalDns } # sql server uri
     # dps storage account uri
     $DpsStorageAccountUri = "dps$((($Env:WEBSITE_HOSTNAME -split '-')[2] -split '\.')[0]).blob.core.windows.net"
-    $ApiEndpoints += [PSCustomObject]@{ URI = $DpsStorageAccountUri; Port = 443; Purpose = "Nerdio Manager DPS Storage Account"; Exceptions = @() } # dps storage account uri
+    $ApiEndpoints += [PSCustomObject]@{ URI = $DpsStorageAccountUri; Port = 443; Purpose = "Nerdio Manager DPS Storage Account"; Exceptions = @(); DnsServer = $LocalDns } # dps storage account uri
 
 }
-
 foreach ($uri in $AdditionalTestUris) {
-    $ApiEndpoints += [PSCustomObject]@{ URI = $uri; Port = 443; Purpose = "Additional Test URI"; Exceptions = @() }
+    $ApiEndpoints += [PSCustomObject]@{ URI = $uri; Port = 443; Purpose = "Additional Test URI"; Exceptions = @(); DnsServer = $RemoteDns }
 }
+
 
 foreach ($endpoint in $ApiEndpoints) {
+    try{
+        # use resolve-dnsname to get the ip address of the endpoint
+        if ($endpoint.DnsServer -eq '168.63.129.16') {
+            $dnsResult = Resolve-DnsName -Name $endpoint.URI -Type A -QuickTimeout -ErrorAction Stop
+        }
+        else {$dnsResult = Resolve-DnsName -Name $endpoint.URI -Server $endpoint.DnsServer -Type A -QuickTimeout -ErrorAction Stop}
+        $endpoint | Add-Member -MemberType NoteProperty -Name RemoteAddress -Value $dnsResult.IP4Address
+    }
+    catch {
+        $endpoint | Add-Member -MemberType NoteProperty -Name RemoteAddress -Value $dnsResult.IP4Address
+        $endpoint.Exceptions += $_.Exception.Message
+    }
     try {
         $testResult = $null
         $testResult = Test-NetConnection -ComputerName $endpoint.URI -Port $endpoint.Port -WarningAction Stop 
-        $endpoint | Add-Member -MemberType NoteProperty -Name RemoteAddress -Value $testResult.RemoteAddress
         $endpoint | Add-Member -MemberType NoteProperty -Name TcpTestSucceeded -Value $testResult.TcpTestSucceeded
     } catch {
-        $endpoint | Add-Member -MemberType NoteProperty -Name RemoteAddress -Value $testResult.RemoteAddress
         $endpoint | Add-Member -MemberType NoteProperty -Name TcpTestSucceeded -Value $testResult.TcpTestSucceeded
         $endpoint.Exceptions += $_.Exception.Message
     }
@@ -123,12 +152,14 @@ foreach ($endpoint in $ApiEndpoints) {
         $endpoint | Add-Member -MemberType NoteProperty -Name SSLCertificateIssuer -Value $servicePoint.Certificate.Issuer
         $endpoint.Exceptions += "SSL Check: $($_.Exception.Message)"
     }
+    <#
     $nameResolverOutput = nameresolver $endpoint.uri
     # Parse the Server field from the output
     $serverAddress = ($nameResolverOutput | Select-String -Pattern "Server:\s*(\S+)" | ForEach-Object { $_.Matches.Groups[1].Value }) -join ''
     if ($serverAddress) {
         $endpoint | Add-Member -MemberType NoteProperty -Name DnsServer -Value $serverAddress
     }
+    #>
 }
 $ApiEndpoints | Select-Object URI, Port, Purpose, RemoteAddress, DnsServer, TcpTestSucceeded, NextHops, SSLCertificateSubject, SSLCertificateIssuer, Exceptions | Format-List > NmeNetworkTestOutput.txt
 $ApiEndpoints | Select-Object URI, Port, Purpose, RemoteAddress, DnsServer, TcpTestSucceeded, NextHops, SSLCertificateSubject, SSLCertificateIssuer, Exceptions 
