@@ -106,7 +106,7 @@ foreach ($uri in $AdditionalTestUris) {
 
 
 foreach ($endpoint in $ApiEndpoints) {
-    tr{
+    try{
         # use resolve-dnsname to get the ip address of the endpoint
         $dnsResult = Resolve-DnsName -Name $endpoint.URI -Server $endpoint.DnsServer -Type A -ErrorAction Stop
         $endpoint | Add-Member -MemberType NoteProperty -Name DnsServer -Value $DnsServer
