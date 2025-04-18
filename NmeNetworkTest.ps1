@@ -68,44 +68,89 @@ else {
 
 # set powershell tls version to $TlsVersion
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::$TlsVersion
-$ApiEndpoints = @(
-    [PSCustomObject]@{ URI = "nwp-web-app.azurewebsites.net"; Port = 443; Purpose = "Nerdio Licensing Servers"; Exceptions = @(); DnsServer = $RemoteDns },
-    [PSCustomObject]@{ URI = "login.microsoftonline.com"; Port = 443; Purpose = "Microsoft API Authentication"; Exceptions = @(); DnsServer = $RemoteDns },
-    [PSCustomObject]@{ URI = "graph.microsoft.com"; Port = 443; Purpose = "Graph API Authentication"; Exceptions = @(); DnsServer = $RemoteDns },
-    [PSCustomObject]@{ URI = "login.windows.net"; Port = 443; Purpose = "Entra ID SQL Authentication"; Exceptions = @(); DnsServer = $RemoteDns },
-    [PSCustomObject]@{ URI = "management.azure.com"; Port = 443; Purpose = "Azure API"; Exceptions = @(); DnsServer = $RemoteDns },
-    [PSCustomObject]@{ URI = "api.github.com"; Port = 443; Purpose = "Scripted Actions"; Exceptions = @(); DnsServer = $RemoteDns },
-    [PSCustomObject]@{ URI = "api.loganalytics.io"; Port = 443; Purpose = "API Access for Log Analytics"; Exceptions = @(); DnsServer = $RemoteDns },
-    [PSCustomObject]@{ URI = "api.applicationinsights.io"; Port = 443; Purpose = "API Access for Application Insights"; Exceptions = @(); DnsServer = $RemoteDns }
-)
+if ($Env:WEBSITE_HOSTNAME -match 'azurewebsites\.net') 
+{
+    # Azure environment is azure commercial
+    $ApiEndpoints = @(
+        [PSCustomObject]@{ URI = "nwp-web-app.azurewebsites.net"; Port = 443; Purpose = "Nerdio Licensing Servers"; Exceptions = @(); DnsServer = $RemoteDns },
+        [PSCustomObject]@{ URI = "login.microsoftonline.com"; Port = 443; Purpose = "Microsoft API Authentication"; Exceptions = @(); DnsServer = $RemoteDns },
+        [PSCustomObject]@{ URI = "graph.microsoft.com"; Port = 443; Purpose = "Graph API Authentication"; Exceptions = @(); DnsServer = $RemoteDns },
+        [PSCustomObject]@{ URI = "login.windows.net"; Port = 443; Purpose = "Entra ID SQL Authentication"; Exceptions = @(); DnsServer = $RemoteDns },
+        [PSCustomObject]@{ URI = "management.azure.com"; Port = 443; Purpose = "Azure API"; Exceptions = @(); DnsServer = $RemoteDns },
+        [PSCustomObject]@{ URI = "api.github.com"; Port = 443; Purpose = "Scripted Actions"; Exceptions = @(); DnsServer = $RemoteDns },
+        [PSCustomObject]@{ URI = "api.loganalytics.io"; Port = 443; Purpose = "API Access for Log Analytics"; Exceptions = @(); DnsServer = $RemoteDns },
+        [PSCustomObject]@{ URI = "api.applicationinsights.io"; Port = 443; Purpose = "API Access for Application Insights"; Exceptions = @(); DnsServer = $RemoteDns }
+    )
 
-# check if $Env:WEBSITE_HOSTNAME starts with 'nmw-app' and ends with '.azurewebsites.net'
-if ($Env:WEBSITE_HOSTNAME -notmatch '^nmw-app.*\.azurewebsites\.net$') {
-    # prompt user for fqdns to test
-    $KeyVaultUri = Read-Host -Prompt "Enter the FQDN for the Nerdio Manager Key Vault (e.g. nmw-app-kv-<unique string>.vault.azure.net)"
-    $ApiEndpoints += [PSCustomObject]@{ URI = $KeyVaultUri; Port = 443; Purpose = "Nerdio Manager Key Vault"; Exceptions = @(); DnsServer = $LocalDns } # key vault uri
-    $SqlServerUri = Read-Host -Prompt "Enter the FQDN for the Nerdio Manager SQL Server (e.g. nmw-app-sql-<unique string>.database.windows.net)"
-    $ApiEndpoints += [PSCustomObject]@{ URI = $SqlServerUri; Port = 1433; Purpose = "Nerdio Manager SQL Server"; Exceptions = @(); DnsServer = $LocalDns } # sql server uri
-    $DpsStorageAccountUri = Read-Host -Prompt "Enter the FQDN for the Nerdio Manager DPS Storage Account (e.g. dps<unique string>.blob.core.windows.net)"
-    $ApiEndpoints += [PSCustomObject]@{ URI = $DpsStorageAccountUri; Port = 443; Purpose = "Nerdio Manager DPS Storage Account"; Exceptions = @(); DnsServer = $LocalDns } # dps storage account uri
+    # check if $Env:WEBSITE_HOSTNAME starts with 'nmw-app' and ends with '.azurewebsites.net'
+    if ($Env:WEBSITE_HOSTNAME -notmatch '^nmw-app.*\.azurewebsites\.net$') {
+        # prompt user for fqdns to test
+        $KeyVaultUri = Read-Host -Prompt "Enter the FQDN for the Nerdio Manager Key Vault (e.g. nmw-app-kv-<unique string>.vault.azure.net)"
+        $ApiEndpoints += [PSCustomObject]@{ URI = $KeyVaultUri; Port = 443; Purpose = "Nerdio Manager Key Vault"; Exceptions = @(); DnsServer = $LocalDns } # key vault uri
+        $SqlServerUri = Read-Host -Prompt "Enter the FQDN for the Nerdio Manager SQL Server (e.g. nmw-app-sql-<unique string>.database.windows.net)"
+        $ApiEndpoints += [PSCustomObject]@{ URI = $SqlServerUri; Port = 1433; Purpose = "Nerdio Manager SQL Server"; Exceptions = @(); DnsServer = $LocalDns } # sql server uri
+        $DpsStorageAccountUri = Read-Host -Prompt "Enter the FQDN for the Nerdio Manager DPS Storage Account (e.g. dps<unique string>.blob.core.windows.net)"
+        $ApiEndpoints += [PSCustomObject]@{ URI = $DpsStorageAccountUri; Port = 443; Purpose = "Nerdio Manager DPS Storage Account"; Exceptions = @(); DnsServer = $LocalDns } # dps storage account uri
 
+    }
+    else {
+        # transform the $Env:WEBSITE_HOSTNAME from format like nmw-app-<unique string>.azurewebsites.net to a list of FQDNs for each app resource to test
+        # key vault uri
+        $KeyVaultUri = "nmw-app-kv-$((($Env:WEBSITE_HOSTNAME -split '-')[2] -split '\.')[0]).vault.azure.net"
+        $ApiEndpoints += [PSCustomObject]@{ URI = $KeyVaultUri; Port = 443; Purpose = "Nerdio Manager Key Vault"; Exceptions = @(); DnsServer = $LocalDns } # key vault uri
+        # sql server uri
+        $SqlServerUri = "nmw-app-sql-$((($Env:WEBSITE_HOSTNAME -split '-')[2] -split '\.')[0]).database.windows.net"
+        $ApiEndpoints += [PSCustomObject]@{ URI = $SqlServerUri; Port = 1433; Purpose = "Nerdio Manager SQL Server"; Exceptions = @(); DnsServer = $LocalDns } # sql server uri
+        # dps storage account uri
+        $DpsStorageAccountUri = "dps$((($Env:WEBSITE_HOSTNAME -split '-')[2] -split '\.')[0]).blob.core.windows.net"
+        $ApiEndpoints += [PSCustomObject]@{ URI = $DpsStorageAccountUri; Port = 443; Purpose = "Nerdio Manager DPS Storage Account"; Exceptions = @(); DnsServer = $LocalDns } # dps storage account uri
+
+    }
 }
-else {
-    # transform the $Env:WEBSITE_HOSTNAME from format like nmw-app-<unique string>.azurewebsites.net to a list of FQDNs for each app resource to test
-    # key vault uri
-    $KeyVaultUri = "nmw-app-kv-$((($Env:WEBSITE_HOSTNAME -split '-')[2] -split '\.')[0]).vault.azure.net"
-    $ApiEndpoints += [PSCustomObject]@{ URI = $KeyVaultUri; Port = 443; Purpose = "Nerdio Manager Key Vault"; Exceptions = @(); DnsServer = $LocalDns } # key vault uri
-    # sql server uri
-    $SqlServerUri = "nmw-app-sql-$((($Env:WEBSITE_HOSTNAME -split '-')[2] -split '\.')[0]).database.windows.net"
-    $ApiEndpoints += [PSCustomObject]@{ URI = $SqlServerUri; Port = 1433; Purpose = "Nerdio Manager SQL Server"; Exceptions = @(); DnsServer = $LocalDns } # sql server uri
-    # dps storage account uri
-    $DpsStorageAccountUri = "dps$((($Env:WEBSITE_HOSTNAME -split '-')[2] -split '\.')[0]).blob.core.windows.net"
-    $ApiEndpoints += [PSCustomObject]@{ URI = $DpsStorageAccountUri; Port = 443; Purpose = "Nerdio Manager DPS Storage Account"; Exceptions = @(); DnsServer = $LocalDns } # dps storage account uri
 
+if ($Env:WEBSITE_HOSTNAME -match 'azurewebsites\.us') {
+    # Azure environment is azure government
+    $ApiEndpoints = @(
+        [PSCustomObject]@{ URI = "nwp-web-app.azurewebsites.net"; Port = 443; Purpose = "Nerdio Licensing Servers"; Exceptions = @(); DnsServer = $RemoteDns },
+        [PSCustomObject]@{ URI = "login.microsoftonline.us"; Port = 443; Purpose = "Microsoft API Authentication"; Exceptions = @(); DnsServer = $RemoteDns },
+        [PSCustomObject]@{ URI = "graph.microsoft.us"; Port = 443; Purpose = "Graph API Authentication"; Exceptions = @(); DnsServer = $RemoteDns },
+        [PSCustomObject]@{ URI = "graph.microsoft.com"; Port = 443; Purpose = "Graph API Authentication"; Exceptions = @(); DnsServer = $RemoteDns },
+        [PSCustomObject]@{ URI = "login.windows.net"; Port = 443; Purpose = "Entra ID SQL Authentication"; Exceptions = @(); DnsServer = $RemoteDns },
+        [PSCustomObject]@{ URI = "management.usgovcloudapi.net"; Port = 443; Purpose = "Azure API"; Exceptions = @(); DnsServer = $RemoteDns },
+        [PSCustomObject]@{ URI = "api.github.com"; Port = 443; Purpose = "Scripted Actions"; Exceptions = @(); DnsServer = $RemoteDns },
+        [PSCustomObject]@{ URI = "api.loganalytics.us"; Port = 443; Purpose = "API Access for Log Analytics"; Exceptions = @(); DnsServer = $RemoteDns },
+        [PSCustomObject]@{ URI = "api.applicationinsights.us"; Port = 443; Purpose = "API Access for Application Insights"; Exceptions = @(); DnsServer = $RemoteDns }
+    )
+    if ($Env:WEBSITE_HOSTNAME -notmatch '^nmw-app.*\.azurewebsites\.us$') {
+        # prompt user for fqdns to test
+        $KeyVaultUri = Read-Host -Prompt "Enter the FQDN for the Nerdio Manager Key Vault (e.g. nmw-app-kv-<unique string>.vault.usgovcloudapi.net)"
+        $ApiEndpoints += [PSCustomObject]@{ URI = $KeyVaultUri; Port = 443; Purpose = "Nerdio Manager Key Vault"; Exceptions = @(); DnsServer = $LocalDns } # key vault uri
+        $SqlServerUri = Read-Host -Prompt "Enter the FQDN for the Nerdio Manager SQL Server (e.g. nmw-app-sql-<unique string>.database.usgovcloudapi.net)"
+        $ApiEndpoints += [PSCustomObject]@{ URI = $SqlServerUri; Port = 1433; Purpose = "Nerdio Manager SQL Server"; Exceptions = @(); DnsServer = $LocalDns } # sql server uri
+        $DpsStorageAccountUri = Read-Host -Prompt "Enter the FQDN for the Nerdio Manager DPS Storage Account (e.g. dps<unique string>.blob.core.usgovcloudapi.net)"
+        $ApiEndpoints += [PSCustomObject]@{ URI = $DpsStorageAccountUri; Port = 443; Purpose = "Nerdio Manager DPS Storage Account"; Exceptions = @(); DnsServer = $LocalDns } # dps storage account uri
+
+    }
+    else {
+        # transform the $Env:WEBSITE_HOSTNAME from format like nmw-app-<unique string>.azurewebsites.net to a list of FQDNs for each app resource to test
+        # key vault uri
+        $KeyVaultUri = "nmw-app-kv-$((($Env:WEBSITE_HOSTNAME -split '-')[2] -split '\.')[0]).vault.usgovcloudapi.net"
+        $ApiEndpoints += [PSCustomObject]@{ URI = $KeyVaultUri; Port = 443; Purpose = "Nerdio Manager Key Vault"; Exceptions = @(); DnsServer = $LocalDns } # key vault uri
+        # sql server uri
+        $SqlServerUri = "nmw-app-sql-$((($Env:WEBSITE_HOSTNAME -split '-')[2] -split '\.')[0]).database.usgovcloudapi.net"
+        $ApiEndpoints += [PSCustomObject]@{ URI = $SqlServerUri; Port = 1433; Purpose = "Nerdio Manager SQL Server"; Exceptions = @(); DnsServer = $LocalDns } # sql server uri
+        # dps storage account uri
+        $DpsStorageAccountUri = "dps$((($Env:WEBSITE_HOSTNAME -split '-')[2] -split '\.')[0]).blob.core.usgovcloudapi.net"
+        $ApiEndpoints += [PSCustomObject]@{ URI = $DpsStorageAccountUri; Port = 443; Purpose = "Nerdio Manager DPS Storage Account"; Exceptions = @(); DnsServer = $LocalDns } # dps storage account uri
+
+    }
+    
 }
+
 foreach ($uri in $AdditionalTestUris) {
     $ApiEndpoints += [PSCustomObject]@{ URI = $uri; Port = 443; Purpose = "Additional Test URI"; Exceptions = @(); DnsServer = $RemoteDns }
 }
+
 
 
 foreach ($endpoint in $ApiEndpoints) {
