@@ -121,7 +121,7 @@ foreach ($endpoint in $ApiEndpoints) {
     }
     catch {
         $endpoint | Add-Member -MemberType NoteProperty -Name RemoteAddress -Value $dnsResult.IP4Address
-        $endpoint.Exceptions += $_.Exception.Message
+        $endpoint.Exceptions += "Resolve-DnsName: $($_.Exception.Message)"
     }
     try {
         $uri = "https://$($endpoint.URI)"
