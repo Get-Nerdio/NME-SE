@@ -9,7 +9,7 @@ If the script detects a custom name for the app service, it will prompt the user
 It also allows for additional URIs to be tested by passing them as parameters.
 
 .PARAMETER AdditionalTestUris
-An array of additional URIs to test connectivity against. This is useful for testing custom endpoints or services.
+An array of additional URIs to test connectivity against. This is useful for testing custom endpoints or services. Required if the app service name is not standard.
 
 .PARAMETER TlsVersion
 The TLS version to use for the connection tests. Default is 'Tls12'. Use 'Tls13' as needed.
@@ -19,10 +19,14 @@ The TLS version to use for the connection tests. Default is 'Tls12'. Use 'Tls13'
 To access the Kudu console, select the app service in the Azure portal, go to Development Tools, select Advanced Tools, and then select Go. 
 In the Kudu service page, select Tools > Debug Console > PowerShell.
 
-Upload this script to the debug console. Set the $ProgressPreference to 'SilentlyContinue' before executing.
+If GitHub is reachable from the app service, you can run this script with a single command:
 
-$ProgressPreference = 'SilentlyContinue'
-.\NmeNetworkTest.ps1
+$ProgressPreference = 'SilentlyContinue';& ([ScriptBlock]::Create((New-Object System.Net.WebClient).DownloadString('https://raw.githubusercontent.com/Get-Nerdio/NME-SE/refs/heads/main/NmeNetworkTest.ps1'))) 
+
+If GitHub is disallowed, you will need to download this script, then upload to the Kudu debug console as 'NmeNetworkTest.ps1'
+Then run the following command:
+
+$ProgressPreference = 'SilentlyContinue'; .\NmeNetworkTest.ps1
 
 .NOTES
 - Ensure that the script is executed in the Debug console of the Azure App Service hosting the Nerdio Manager app.
@@ -188,4 +192,5 @@ foreach ($endpoint in $ApiEndpoints) {
     $Endpoint  | Select-Object URI, Port, Purpose, RemoteAddress, DnsServer, SSLCertificateSubject, SSLCertificateIssuer, Exceptions 
 }
 $ApiEndpoints | Select-Object URI, Port, Purpose, RemoteAddress, DnsServer, NextHops, SSLCertificateSubject, SSLCertificateIssuer, Exceptions | Format-List > NmeNetworkTestOutput.txt
-#$ApiEndpoints | Select-Object URI, Port, Purpose, RemoteAddress, DnsServer, TcpTestSucceeded, NextHops, SSLCertificateSubject, SSLCertificateIssuer, Exceptions 
+Write-Output "Network test results saved to NmeNetworkTestOutput.txt"
+Write-Output "Please contact Nerdio support and provide the output of this test for further assistance."
