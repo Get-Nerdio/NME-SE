@@ -83,15 +83,10 @@ if ($Env:WEBSITE_HOSTNAME -match 'azurewebsites\.net')
     )
 
     # check if $Env:WEBSITE_HOSTNAME starts with 'nmw-app' and ends with '.azurewebsites.net'
-    if ($Env:WEBSITE_HOSTNAME -notmatch '^nmw-app.*\.azurewebsites\.net$') {
-        # prompt user for fqdns to test
-        $KeyVaultUri = Read-Host -Prompt "Enter the FQDN for the Nerdio Manager Key Vault (e.g. nmw-app-kv-<unique string>.vault.azure.net)"
-        $ApiEndpoints += [PSCustomObject]@{ URI = $KeyVaultUri; Port = 443; Purpose = "Nerdio Manager Key Vault"; Exceptions = @(); DnsServer = $LocalDns } # key vault uri
-        $SqlServerUri = Read-Host -Prompt "Enter the FQDN for the Nerdio Manager SQL Server (e.g. nmw-app-sql-<unique string>.database.windows.net)"
-        $ApiEndpoints += [PSCustomObject]@{ URI = $SqlServerUri; Port = 1433; Purpose = "Nerdio Manager SQL Server"; Exceptions = @(); DnsServer = $LocalDns } # sql server uri
-        $DpsStorageAccountUri = Read-Host -Prompt "Enter the FQDN for the Nerdio Manager DPS Storage Account (e.g. dps<unique string>.blob.core.windows.net)"
-        $ApiEndpoints += [PSCustomObject]@{ URI = $DpsStorageAccountUri; Port = 443; Purpose = "Nerdio Manager DPS Storage Account"; Exceptions = @(); DnsServer = $LocalDns } # dps storage account uri
-
+    if ($Env:WEBSITE_HOSTNAME -notmatch '^nmw-app.*\.azurewebsites\.net$' -and !$AdditionalTestUris) {
+        # if not using standard nme app name, request user to provide $AdditionalTestUris pramater
+        Write-Output "Detected custom naming for NME components. Please provide the FQDN for the Nerdio Manager Key Vault, SQL Server, and DPS Storage Account in the `$AdditionalTestUris parameter."
+        Exit
     }
     else {
         # transform the $Env:WEBSITE_HOSTNAME from format like nmw-app-<unique string>.azurewebsites.net to a list of FQDNs for each app resource to test
@@ -121,15 +116,10 @@ if ($Env:WEBSITE_HOSTNAME -match 'azurewebsites\.us') {
         [PSCustomObject]@{ URI = "api.loganalytics.us"; Port = 443; Purpose = "API Access for Log Analytics"; Exceptions = @(); DnsServer = $RemoteDns },
         [PSCustomObject]@{ URI = "api.applicationinsights.us"; Port = 443; Purpose = "API Access for Application Insights"; Exceptions = @(); DnsServer = $RemoteDns }
     )
-    if ($Env:WEBSITE_HOSTNAME -notmatch '^nmw-app.*\.azurewebsites\.us$') {
-        # prompt user for fqdns to test
-        $KeyVaultUri = Read-Host -Prompt "Enter the FQDN for the Nerdio Manager Key Vault (e.g. nmw-app-kv-<unique string>.vault.usgovcloudapi.net)"
-        $ApiEndpoints += [PSCustomObject]@{ URI = $KeyVaultUri; Port = 443; Purpose = "Nerdio Manager Key Vault"; Exceptions = @(); DnsServer = $LocalDns } # key vault uri
-        $SqlServerUri = Read-Host -Prompt "Enter the FQDN for the Nerdio Manager SQL Server (e.g. nmw-app-sql-<unique string>.database.usgovcloudapi.net)"
-        $ApiEndpoints += [PSCustomObject]@{ URI = $SqlServerUri; Port = 1433; Purpose = "Nerdio Manager SQL Server"; Exceptions = @(); DnsServer = $LocalDns } # sql server uri
-        $DpsStorageAccountUri = Read-Host -Prompt "Enter the FQDN for the Nerdio Manager DPS Storage Account (e.g. dps<unique string>.blob.core.usgovcloudapi.net)"
-        $ApiEndpoints += [PSCustomObject]@{ URI = $DpsStorageAccountUri; Port = 443; Purpose = "Nerdio Manager DPS Storage Account"; Exceptions = @(); DnsServer = $LocalDns } # dps storage account uri
-
+    if ($Env:WEBSITE_HOSTNAME -notmatch '^nmw-app.*\.azurewebsites\.us$' -and !$AdditionalTestUris) {
+        # if not using standard nme app name, request user to provide $AdditionalTestUris pramater
+        Write-Output "Detected custom naming for NME components. Please provide the FQDN for the Nerdio Manager Key Vault, SQL Server, and DPS Storage Account in the `$AdditionalTestUris parameter."
+        exit
     }
     else {
         # transform the $Env:WEBSITE_HOSTNAME from format like nmw-app-<unique string>.azurewebsites.net to a list of FQDNs for each app resource to test
