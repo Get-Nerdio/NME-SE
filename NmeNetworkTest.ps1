@@ -150,17 +150,14 @@ foreach ($uri in $AdditionalTestUris) {
 foreach ($endpoint in $ApiEndpoints) {
     try{
         $dnsresult = $null
-        
-        # use resolve-dnsname to get the ip address of the endpoint
-        if ($endpoint.DnsServer -eq 'AzureDefaultDns') {
-            $dnsResult = Resolve-DnsName -Name $endpoint.URI -Type A -QuickTimeout -ErrorAction Stop
-        }
-        else {$dnsResult = Resolve-DnsName -Name $endpoint.URI -Server $endpoint.DnsServer -Type A -QuickTimeout -ErrorAction Stop}
-        $endpoint | Add-Member -MemberType NoteProperty -Name RemoteAddress -Value $dnsResult.IP4Address
+        $nameResolverOutput = nameresolver $endpoint.uri
+        # Parse the Server field from the output
+        $ipAddresses =( $nameresolveroutput -split "`n" | Where-Object { $_ -notmatch "Server:" -and $_ -match "\s*\d{1,3}(\.\d{1,3}){3}\s*$" } | ForEach-Object { $_.Trim()} ) -replace "Addresses:\s*", "" 
+        $endpoint | Add-Member -MemberType NoteProperty -Name RemoteAddress -Value ($ipAddresses -join ', ')
     }
     catch {
         $endpoint | Add-Member -MemberType NoteProperty -Name RemoteAddress -Value $dnsResult.IP4Address
-        $endpoint.Exceptions += "Resolve-DnsName: $($_.Exception.Message)"
+        $endpoint.Exceptions += "Error resolving dns: $($_.Exception.Message)"
     }
     try {
         $uri = "https://$($endpoint.URI)"
