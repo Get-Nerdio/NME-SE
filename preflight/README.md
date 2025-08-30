@@ -1,6 +1,6 @@
 # Nerdio Manager Preflight tools
 
-[[toc]]
+Listed here are scripts and queries to use a preflight tools to validate the target environment before attempting to deploy Nerdio Manager.
 
 ## Script
 
@@ -101,7 +101,7 @@ Use the following resource types in the policy assignment:
 
 Here's a KQL query that should list Azure policies that are configured with a **Deny** effect. Export the list polices and review for potential issues before attempting to deploy Nerdio Manager.
 
-Run this in the Azure Resource Graph Explorer - the user running the query will need the **Resource Policy Reader** role, or **Reader** on the target subscription or management group. No other permissions in Azure should be required and no resources need to be deployed for testing.
+Run this in the **Azure Resource Graph Explorer** - the user running the query will need the **Resource Policy Reader** role, or **Reader** on the target subscription or management group. No other permissions in Azure should be required and no resources need to be deployed for testing.
 
 ```kql
 policyresources
