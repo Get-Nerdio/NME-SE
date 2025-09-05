@@ -62,12 +62,11 @@ function Write-Log {
     [ValidateSet('INFO','WARN','ERROR','DEBUG')]
     [string] $Level = 'INFO'
   )
-  $stamp = (Get-Date).ToString('u')
   switch ($Level) {
-    'INFO'  { Write-Output    "[$stamp] [INFO]  $Message" }
-    'WARN'  { Write-Warning   "[$stamp] [WARN]  $Message" }
-    'ERROR' { Write-Error     "[$stamp] [ERROR] $Message" }
-    'DEBUG' { Write-Verbose   "[$stamp] [DEBUG] $Message" }
+    'INFO'  { Write-Output    "[INFO]  $Message" }
+    'WARN'  { Write-Warning   "[WARN]  $Message" }
+    'ERROR' { Write-Error     "[ERROR] $Message" }
+    'DEBUG' { Write-Verbose   "[DEBUG] $Message" }
   }
 }
 
@@ -128,7 +127,7 @@ function Get-DeletionPriority {
 }
 
 function Remove-ResourceLocksIfRequested {
-  param([string] $ResourceId, [switch] $DoIt)
+  param([string] $ResourceId, [string] $ResourceGroupName, [switch] $DoIt)
 
   if (-not $DoIt) { return }
 
@@ -139,14 +138,14 @@ function Remove-ResourceLocksIfRequested {
   }
 
   foreach ($l in $locks) {
-    Write-Log "Removing lock '$($l.Name)' from $ResourceId" 'INFO'
+    Write-Log "[$ResourceGroupName] Removing lock '$($l.Name)' from $ResourceId" 'INFO'
     if ($PreviewOnly) {
-      Write-Log "PreviewOnly: would remove lockId $($l.LockId)" 'DEBUG'
+      Write-Log "[$ResourceGroupName] PreviewOnly: would remove lockId $($l.LockId)" 'DEBUG'
     } else {
       try {
         Remove-AzResourceLock -LockId $l.LockId -Force -ErrorAction Stop
       } catch {
-        Write-Log "Failed to remove lock on $ResourceId`: $($_.Exception.Message)" 'WARN'
+        Write-Log "[$ResourceGroupName] Failed to remove lock on $ResourceId`: $($_.Exception.Message)" 'WARN'
       }
     }
   }
@@ -205,13 +204,13 @@ foreach ($sub in $subs) {
   Write-Log "Found $($rgNames.Count) resource groups with 'AutoClean' tag: $(($rgNames -join ', '))" 'INFO'
 
   foreach ($rgName in $rgNames) {
-    Write-Log "Scanning resource group '$rgName' for resources tagged DestroyAfter < $($nowUtc.ToString('u'))" 'INFO'
+    Write-Log "[$rgName] Scanning for resources tagged DestroyAfter < $($nowUtc.ToString('u'))" 'INFO'
 
     # Fetch all resources in RG
     try {
       $resources = Get-AzResource -ResourceGroupName $rgName -ErrorAction Stop
     } catch {
-      Write-Log "Failed to list resources in '$rgName': $($_.Exception.Message)" 'WARN'
+      Write-Log "[$rgName] Failed to list resources: $($_.Exception.Message)" 'WARN'
       continue
     }
 
@@ -222,7 +221,7 @@ foreach ($sub in $subs) {
       
       # Skip resources with DoNotDestroy tag
       if ($r.Tags.ContainsKey('DoNotDestroy')) {
-        Write-Log "Skipping $($r.ResourceType) '$($r.Name)' - has DoNotDestroy tag" 'DEBUG'
+        Write-Log "[$rgName] Skipping $($r.ResourceType) '$($r.Name)' - has DoNotDestroy tag" 'DEBUG'
         continue
       }
       
@@ -231,7 +230,7 @@ foreach ($sub in $subs) {
       if ($resourceTypeLower -eq 'microsoft.desktopvirtualization/hostpools' -or 
           $resourceTypeLower -eq 'microsoft.desktopvirtualization/applicationgroups' -or
           $resourceTypeLower -eq 'microsoft.desktopvirtualization/workspaces') {
-        Write-Log "Skipping $($r.ResourceType) '$($r.Name)' - AVD resource type protected" 'DEBUG'
+        Write-Log "[$rgName] Skipping $($r.ResourceType) '$($r.Name)' - AVD resource type protected" 'DEBUG'
         continue
       }
       
@@ -240,7 +239,7 @@ foreach ($sub in $subs) {
       $raw = $r.Tags['DestroyAfter']
       $dto = Parse-DestroyAfter -Value $raw
       if (-not $dto) {
-        Write-Log "Could not parse DestroyAfter='$raw' on $($r.ResourceType) '$($r.Name)'. Skipping." 'WARN'
+        Write-Log "[$rgName] Could not parse DestroyAfter='$raw' on $($r.ResourceType) '$($r.Name)'. Skipping." 'WARN'
         continue
       }
 
@@ -254,7 +253,7 @@ foreach ($sub in $subs) {
     }
 
     if (-not $candidates -or $candidates.Count -eq 0) {
-      Write-Log "No deletable resources found in '$rgName'." 'INFO'
+      Write-Log "[$rgName] No deletable resources found." 'INFO'
       continue
     }
 
@@ -267,20 +266,20 @@ foreach ($sub in $subs) {
       Write-Log $msg 'INFO'
 
       # Optional: remove locks
-      Remove-ResourceLocksIfRequested -ResourceId $res.ResourceId -DoIt:$RemoveLocks
+      Remove-ResourceLocksIfRequested -ResourceId $res.ResourceId -ResourceGroupName $rgName -DoIt:$RemoveLocks
 
       if ($PreviewOnly) {
-        Write-Log "PreviewOnly: would run Remove-AzResource -ResourceId $($res.ResourceId) -Force" 'DEBUG'
+        Write-Log "[$rgName] PreviewOnly: would run Remove-AzResource -ResourceId $($res.ResourceId) -Force" 'DEBUG'
         continue
       }
 
       # Attempt deletion
       try {
         Remove-AzResource -ResourceId $res.ResourceId -Force -ErrorAction Stop
-        Write-Log "Deleted $($res.ResourceType) '$($res.Name)'" 'INFO'
+        Write-Log "[$rgName] Deleted $($res.ResourceType) '$($res.Name)'" 'INFO'
       } catch {
         # Common dependency errors happen if ordering wasn't sufficient for some exotic types.
-        Write-Log "Failed to delete $($res.ResourceType) '$($res.Name)': $($_.Exception.Message)" 'ERROR'
+        Write-Log "[$rgName] Failed to delete $($res.ResourceType) '$($res.Name)': $($_.Exception.Message)" 'ERROR'
       }
     }
   }
