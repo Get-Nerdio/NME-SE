@@ -81,7 +81,11 @@ function Add-TagToVM {
 
     # Check if tag already exists
     if ($tags.ContainsKey($TagName)) {
-      Write-Log "VM '$($VM.Name)' already has tag '$TagName'" 'DEBUG'
+      if ($PreviewOnly) {
+        Write-Log "[PREVIEW] VM '$($VM.Name)' already has tag '$TagName' - no change needed" 'INFO'
+      } else {
+        Write-Log "VM '$($VM.Name)' already has tag '$TagName'" 'DEBUG'
+      }
       return $true
     }
 
@@ -202,7 +206,11 @@ foreach ($sub in $subs) {
   $totalVMs += $vms.Count
 
   foreach ($vm in $vms) {
-    Write-Log "Evaluating VM '$($vm.Name)' in resource group '$($vm.ResourceGroupName)'" 'DEBUG'
+    if ($PreviewOnly) {
+      Write-Log "[PREVIEW] Evaluating VM '$($vm.Name)' in resource group '$($vm.ResourceGroupName)'" 'INFO'
+    } else {
+      Write-Log "Evaluating VM '$($vm.Name)' in resource group '$($vm.ResourceGroupName)'" 'DEBUG'
+    }
 
     # Check if VM has the protection tag
     if ($vm.Tags -and $vm.Tags.ContainsKey('DoNotRestrictAutoscale')) {
