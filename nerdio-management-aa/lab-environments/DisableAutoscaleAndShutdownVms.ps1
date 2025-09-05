@@ -73,7 +73,10 @@ function Add-TagToVM {
     # Get current tags or create new hashtable
     $tags = @{}
     if ($VM.Tags) {
-      $tags = $VM.Tags.Clone()
+      # Copy existing tags to new hashtable
+      foreach ($key in $VM.Tags.Keys) {
+        $tags[$key] = $VM.Tags[$key]
+      }
     }
 
     # Check if tag already exists
