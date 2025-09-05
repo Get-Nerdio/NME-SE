@@ -82,9 +82,9 @@ function Add-TagToVM {
     # Check if tag already exists
     if ($tags.ContainsKey($TagName)) {
       if ($PreviewOnly) {
-        Write-Log "[PREVIEW] VM '$($VM.Name)' already has tag '$TagName' - no change needed" 'INFO'
+        Write-Log "[PREVIEW] [$($VM.Name)] Already has tag '$TagName' - no change needed" 'INFO'
       } else {
-        Write-Log "VM '$($VM.Name)' already has tag '$TagName'" 'DEBUG'
+        Write-Log "[$($VM.Name)] Already has tag '$TagName'" 'DEBUG'
       }
       return $true
     }
@@ -93,17 +93,17 @@ function Add-TagToVM {
     $tags[$TagName] = $TagValue
 
     if ($PreviewOnly) {
-      Write-Log "[PREVIEW] Would add tag '$TagName'='$TagValue' to VM '$($VM.Name)'" 'INFO'
+      Write-Log "[PREVIEW] [$($VM.Name)] Would add tag '$TagName'='$TagValue'" 'INFO'
       return $true
     }
 
     # Update the VM tags
     Update-AzVM -ResourceGroupName $VM.ResourceGroupName -VM $VM -Tag $tags | Out-Null
-    Write-Log "Added tag '$TagName'='$TagValue' to VM '$($VM.Name)'" 'INFO'
+    Write-Log "[$($VM.Name)] Added tag '$TagName'='$TagValue'" 'INFO'
     return $true
 
   } catch {
-    Write-Log "Failed to add tag to VM '$($VM.Name)': $($_.Exception.Message)" 'ERROR'
+    Write-Log "[$($VM.Name)] Failed to add tag: $($_.Exception.Message)" 'ERROR'
     return $false
   }
 }
@@ -120,21 +120,25 @@ function Stop-VMIfRunning {
 
     if ($powerState -eq "VM running") {
       if ($PreviewOnly) {
-        Write-Log "[PREVIEW] Would deallocate running VM '$($VM.Name)'" 'INFO'
+        Write-Log "[PREVIEW] [$($VM.Name)] Would deallocate running VM" 'INFO'
         return $true
       }
 
-      Write-Log "Deallocating running VM '$($VM.Name)'" 'INFO'
+      Write-Log "[$($VM.Name)] Deallocating running VM" 'INFO'
       Stop-AzVM -ResourceGroupName $VM.ResourceGroupName -Name $VM.Name -Force | Out-Null
-      Write-Log "Successfully deallocated VM '$($VM.Name)'" 'INFO'
+      Write-Log "[$($VM.Name)] Successfully deallocated VM" 'INFO'
       return $true
     } else {
-      Write-Log "VM '$($VM.Name)' is not running (Status: $powerState)" 'DEBUG'
+      if ($PreviewOnly) {
+        Write-Log "[PREVIEW] [$($VM.Name)] Not running (Status: $powerState) - no deallocation needed" 'INFO'
+      } else {
+        Write-Log "[$($VM.Name)] Not running (Status: $powerState)" 'DEBUG'
+      }
       return $true
     }
 
   } catch {
-    Write-Log "Failed to deallocate VM '$($VM.Name)': $($_.Exception.Message)" 'ERROR'
+    Write-Log "[$($VM.Name)] Failed to check/deallocate VM: $($_.Exception.Message)" 'ERROR'
     return $false
   }
 }
@@ -206,15 +210,9 @@ foreach ($sub in $subs) {
   $totalVMs += $vms.Count
 
   foreach ($vm in $vms) {
-    if ($PreviewOnly) {
-      Write-Log "[PREVIEW] Evaluating VM '$($vm.Name)' in resource group '$($vm.ResourceGroupName)'" 'INFO'
-    } else {
-      Write-Log "Evaluating VM '$($vm.Name)' in resource group '$($vm.ResourceGroupName)'" 'DEBUG'
-    }
-
     # Check if VM has the protection tag
     if ($vm.Tags -and $vm.Tags.ContainsKey('DoNotRestrictAutoscale')) {
-      Write-Log "Skipping VM '$($vm.Name)' - has 'DoNotRestrictAutoscale' tag" 'INFO'
+      Write-Log "[$($vm.Name)] Skipping - has 'DoNotRestrictAutoscale' tag" 'INFO'
       $skippedVMs++
       continue
     }
@@ -230,7 +228,11 @@ foreach ($sub in $subs) {
         $vmSuccess = $false
       }
     } else {
-      Write-Log "VM '$($vm.Name)' already has 'NMW_AUTOSCALE_RESTRICTION' tag - no action needed" 'INFO'
+      if ($PreviewOnly) {
+        Write-Log "[PREVIEW] VM '$($vm.Name)' already has 'NMW_AUTOSCALE_RESTRICTION' tag - no change needed" 'INFO'
+      } else {
+        Write-Log "VM '$($vm.Name)' already has 'NMW_AUTOSCALE_RESTRICTION' tag - no action needed" 'INFO'
+      }
       # Still count as "tagged" since it has the desired state
       $taggedVMs++
     }
