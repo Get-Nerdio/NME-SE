@@ -225,15 +225,6 @@ foreach ($sub in $subs) {
         continue
       }
       
-      # Skip AVD resources (Host Pools, Session Hosts, Workspaces)
-      $resourceTypeLower = $r.ResourceType.ToLowerInvariant()
-      if ($resourceTypeLower -eq 'microsoft.desktopvirtualization/hostpools' -or 
-          $resourceTypeLower -eq 'microsoft.desktopvirtualization/applicationgroups' -or
-          $resourceTypeLower -eq 'microsoft.desktopvirtualization/workspaces') {
-        Write-Log "[$rgName] Skipping $($r.ResourceType) '$($r.Name)' - AVD resource type protected" 'DEBUG'
-        continue
-      }
-      
       if (-not $r.Tags.ContainsKey('DestroyAfter')) { continue }
 
       $raw = $r.Tags['DestroyAfter']
