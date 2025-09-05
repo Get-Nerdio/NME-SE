@@ -221,7 +221,7 @@ foreach ($sub in $subs) {
     $vmSuccess = $true
 
     # Add the autoscale restriction tag
-    if (-not ($vm.Tags -and $vm.Tags.ContainsKey('NMW_AUTOSCALE_RESTRICTION'))) {
+    if (-not $vm.Tags -or -not $vm.Tags.ContainsKey('NMW_AUTOSCALE_RESTRICTION')) {
       if (Add-TagToVM -VM $vm -TagName 'NMW_AUTOSCALE_RESTRICTION' -TagValue 'true') {
         $taggedVMs++
       } else {
