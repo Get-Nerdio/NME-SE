@@ -14,10 +14,10 @@ $tenantId = $context.Tenant.Id
 # Get all resources in the tenant
 $resources = Get-AzResource -ErrorAction SilentlyContinue
 if ($resources -eq $null) {
-    Write-Host "No resources found in the tenant."
+    Write-Output "No resources found in the tenant."
     exit
 }
-Write-Host "Total resources found: $($resources.Count)"
+Write-Output "Total resources found: $($resources.Count)"
 $deletedResourcesCount = 0
 $skippedResourcesCount = 0
 $errorsCount = 0
@@ -31,21 +31,21 @@ foreach ($resource in $resources) {
     # Get the tags for the resource
     $tags = (Get-AzResource -ResourceId $resourceId -ErrorAction SilentlyContinue).Tags
     if ($tags -eq $null) {
-        Write-Host "Resource '$resourceName' of type '$resourceType' in resource group '$resourceGroupName' has no tags. Skipping."
+        Write-Output "Resource '$resourceName' of type '$resourceType' in resource group '$resourceGroupName' has no tags. Skipping."
         $skippedResourcesCount++
         continue
     }
 
     # Check if the DoNotDestroy tag is present
     if ($tags.ContainsKey("DoNotDestroy")) {
-        Write-Host "Resource '$resourceName' of type '$resourceType' in resource group '$resourceGroupName' has the 'DoNotDestroy' tag. Skipping."
+        Write-Output "Resource '$resourceName' of type '$resourceType' in resource group '$resourceGroupName' has the 'DoNotDestroy' tag. Skipping."
         $skippedResourcesCount++
         continue
     }
 
     # Check if the DestroyAfter tag is present
     if (-not $tags.ContainsKey("DestroyAfter")) {
-        Write-Host "Resource '$resourceName' of type '$resourceType' in resource group '$resourceGroupName' does not have the 'DestroyAfter' tag. Skipping."
+        Write-Output "Resource '$resourceName' of type '$resourceType' in resource group '$resourceGroupName' does not have the 'DestroyAfter' tag. Skipping."
         $skippedResourcesCount++
         continue
     }
@@ -55,7 +55,7 @@ foreach ($resource in $resources) {
     try {
         $destroyAfterDate = [DateTime]::Parse($destroyAfterDateString)
     } catch {
-        Write-Host "Resource '$resourceName' of type '$resourceType' in resource group '$resourceGroupName' has an invalid 'DestroyAfter' date format: '$destroyAfterDateString'. Skipping."
+        Write-Output "Resource '$resourceName' of type '$resourceType' in resource group '$resourceGroupName' has an invalid 'DestroyAfter' date format: '$destroyAfterDateString'. Skipping."
         $skippedResourcesCount++
         continue
     }
@@ -64,23 +64,23 @@ foreach ($resource in $resources) {
     if ($destroyAfterDate -lt $date) {
         try {
             if ($whatIf) {
-                Write-Host "[WhatIf] Would delete resource '$resourceName' of type '$resourceType' in resource group '$resourceGroupName'."
+                Write-Output "[WhatIf] Would delete resource '$resourceName' of type '$resourceType' in resource group '$resourceGroupName'."
             } else {
                 # Remove-AzResource -ResourceId $resourceId -Force -ErrorAction Stop
-                Write-Host "Deleted resource '$resourceName' of type '$resourceType' in resource group '$resourceGroupName'."
+                Write-Output "Deleted resource '$resourceName' of type '$resourceType' in resource group '$resourceGroupName'."
             
             }
             $deletedResourcesCount++
         } catch {
-            Write-Host "Failed to delete resource '$resourceName' of type '$resourceType' in resource group '$resourceGroupName'. Error: $_"
+            Write-Output "Failed to delete resource '$resourceName' of type '$resourceType' in resource group '$resourceGroupName'. Error: $_"
             $errorsCount++
         }
     }
 }
 
 # Write the final counts to the console
-Write-Host "Cleanup completed."
-Write-Host "Total resources found: $($resources.Count)"
-Write-Host "Total resources deleted: $deletedResourcesCount"
-Write-Host "Total resources skipped: $skippedResourcesCount"
-Write-Host "Total errors encountered: $errorsCount"
+Write-Output "Cleanup completed."
+Write-Output "Total resources found: $($resources.Count)"
+Write-Output "Total resources deleted: $deletedResourcesCount"
+Write-Output "Total resources skipped: $skippedResourcesCount"
+Write-Output "Total errors encountered: $errorsCount"
