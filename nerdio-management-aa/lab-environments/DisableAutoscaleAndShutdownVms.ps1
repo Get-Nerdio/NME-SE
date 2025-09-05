@@ -222,26 +222,28 @@ foreach ($sub in $subs) {
         $vmSuccess = $false
       }
     } else {
-      Write-Log "VM '$($vm.Name)' already has 'NMW_AUTOSCALE_RESTRICTION' tag" 'DEBUG'
+      Write-Log "VM '$($vm.Name)' already has 'NMW_AUTOSCALE_RESTRICTION' tag - no action needed" 'INFO'
+      # Still count as "tagged" since it has the desired state
+      $taggedVMs++
     }
 
     # Deallocate VM if running (unless skipping deallocation)
     if (-not $SkipDeallocation) {
-      if (-not (Stop-VMIfRunning -VM $vm)) {
-        $vmSuccess = $false
-      } else {
-        # Check if we actually deallocated it
+      if (Stop-VMIfRunning -VM $vm) {
+        # Check if we actually would deallocate or did deallocate it
         try {
           $vmStatus = Get-AzVM -ResourceGroupName $vm.ResourceGroupName -Name $vm.Name -Status
           $powerState = ($vmStatus.Statuses | Where-Object { $_.Code -like "PowerState/*" }).DisplayStatus
-          if ($powerState -eq "VM running" -and -not $PreviewOnly) {
-            # VM was running and we attempted to stop it
+          if ($powerState -eq "VM running") {
+            # VM was running and we attempted to stop it (or would stop it in preview)
             $deallocatedVMs++
           }
         } catch {
           # Don't fail the whole operation if we can't check status
           Write-Log "Could not verify final status of VM '$($vm.Name)'" 'WARN'
         }
+      } else {
+        $vmSuccess = $false
       }
     }
 
