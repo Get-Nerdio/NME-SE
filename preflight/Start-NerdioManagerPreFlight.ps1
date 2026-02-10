@@ -316,7 +316,6 @@ if ($Response -match "^[Yy]$") {
 
     # Wrap script in try/catch/finally block so that we ensure cleanup is performed
     try {
-
         # Generate a unique string for the resource names
         $UniqueString = New-UniqueString -InputString $ResourceGroup.ResourceId
 
@@ -588,7 +587,6 @@ if ($Response -match "^[Yy]$") {
     catch {
     }
     finally {
-
         # Write the output array to the console
         Write-Host ""
         Write-Host -ForegroundColor "Cyan" "Writing output to file: '$OutFile'."
@@ -608,12 +606,12 @@ if ($Response -match "^[Yy]$") {
         }
 
         if ($RemoveResources -eq $true) {
-            # Remove the services we just created
+            #region Remove the services we just created
             Write-Host ""
             Write-Host -ForegroundColor "Cyan" "Removing resources created during preflight check in resource group: '$ResourceGroupName'."
             if (-not[System.String]::IsNullOrEmpty($LogAnalytics.Name)) {
                 Write-Host -ForegroundColor "Cyan" "Removing Log Analytics workspace: '$($LogAnalytics.Name)'."
-                Remove-AzOperationalInsightsWorkspace -ResourceGroupName $ResourceGroupName -Name $LogAnalytics.Name -Confirm:$false -Force -ErrorAction "Continue"
+                Remove-AzOperationalInsightsWorkspace -ResourceGroupName $ResourceGroupName -Name $LogAnalytics.Name -Confirm:$false -Force -ForceDelete -ErrorAction "Continue"
             }
             if (-not[System.String]::IsNullOrEmpty($StorageAccount.StorageAccountName)) {
                 Write-Host -ForegroundColor "Cyan" "Removing storage account: '$($StorageAccount.StorageAccountName)'."
@@ -638,8 +636,11 @@ if ($Response -match "^[Yy]$") {
             if (-not[System.String]::IsNullOrEmpty($KeyVault.VaultName)) {
                 Write-Host -ForegroundColor "Cyan" "Removing Key Vault: '$($KeyVault.VaultName)'."
                 Remove-AzKeyVault -ResourceGroupName $ResourceGroupName -VaultName $KeyVault.VaultName -Force -ErrorAction "Continue"
+                Write-Host -ForegroundColor "Cyan" "Purging Key Vault: '$($KeyVault.VaultName)'. This will take several minutes to complete."
+                Remove-AzKeyVault -VaultName $KeyVault.VaultName -Location $ResourceGroup.Location -InRemovedState -Force -ErrorAction "Continue"
             }
-            Write-Host -ForegroundColor "Cyan" "Finished removing resources. Check resource group to confirm: '$ResourceGroupName'"
+            Write-Host -ForegroundColor "Cyan" "Finished removing and purging resources. Check resource group to confirm: '$ResourceGroupName'"
+            #endregion
         }
     }
     #endregion
