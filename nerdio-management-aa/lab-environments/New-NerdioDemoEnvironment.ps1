@@ -20,9 +20,6 @@
 .PARAMETER UserDefaultPassword
   Default password for created users.
 
-.PARAMETER ResourceGroupName
-  Name of an existing NME-linked resource group where the workspace will be created.
-
 .PARAMETER AzureRegion
   Azure region for the workspace.
 
@@ -33,8 +30,8 @@
   Prefix for automation account variables. Defaults to 'CustomerDemo'.
 
 .EXAMPLE
-  .\New-NerdioDemoEnvironment.ps1 -CustomerAbbreviation 'ACME' -UserCount 5 -ResourceGroupName 'demo-autoclean-us'
-  .\New-NerdioDemoEnvironment.ps1 -CustomerAbbreviation 'CNTO' -UserCount 3 -ResourceGroupName 'demo-autoclean-eu' -VariablePrefix 'Prod'
+  .\New-NerdioDemoEnvironment.ps1 -CustomerAbbreviation 'ACME' -UserCount 5
+  .\New-NerdioDemoEnvironment.ps1 -CustomerAbbreviation 'CNTO' -UserCount 3 -VariablePrefix 'Prod'
 #>
 
 [CmdletBinding()]
@@ -42,7 +39,6 @@ param(
     [Parameter(Mandatory=$true)][ValidatePattern('^[a-zA-Z0-9]{2,4}$')][string]$CustomerAbbreviation,
     [Parameter(Mandatory=$true)][int]$UserCount,
     [string]$UserDefaultPassword = 'Nerdio123!',
-    [Parameter(Mandatory=$true)][ValidateSet('demo-autoclean-us','demo-autoclean-eu','demo-autoclean-apac')][string]$ResourceGroupName,
     [string]$AzureRegion = 'centralus',
     [Parameter(Mandatory=$true)][datetime]$DestroyOnUTC,
     [string]$VariablePrefix = 'CustomerDemo'
@@ -79,6 +75,7 @@ $NmeUri          = Get-AutomationVariable -Name "${VariablePrefix}Uri"
 $NmeAppObjectId  = Get-AutomationVariable -Name "${VariablePrefix}AppObjectId"
 $SubscriptionId  = Get-AutomationVariable -Name "${VariablePrefix}SubscriptionId"
 $TenantDomain    = Get-AutomationVariable -Name "${VariablePrefix}TenantDomain"
+$ResourceGroupName     = 'autoclean-rg'
 $automationAccountName = 'nerdio-management-aa'
 $AutomationRg          = 'nerdio-management-rg'
 
