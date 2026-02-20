@@ -7,21 +7,21 @@
   1. Removes the NME workspace
   2. Removes the Entra ID users (identified by CompanyName matching the environment name)
 
-.PARAMETER DemoAbbreviation
-  Short abbreviation used when the demo environment was created.
+.PARAMETER CustomerAbbreviation
+  Short customer abbreviation used when the demo environment was created.
 
-.PARAMETER NmeVariablePrefix
-  Prefix for NME API credentials in Automation Account variables.
+.PARAMETER VariablePrefix
+  Prefix for automation account variables. Defaults to 'CustomerDemo'.
 
 .EXAMPLE
-  .\Cleanup-NerdioDemoEnvironment.ps1 -DemoAbbreviation 'D01'
-  .\Cleanup-NerdioDemoEnvironment.ps1 -DemoAbbreviation 'POC1' -NmeVariablePrefix 'Prod'
+  .\Cleanup-NerdioDemoEnvironment.ps1 -CustomerAbbreviation 'ACME'
+  .\Cleanup-NerdioDemoEnvironment.ps1 -CustomerAbbreviation 'CNTO' -VariablePrefix 'Prod'
 #>
 
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory=$true)][ValidatePattern('^[a-zA-Z0-9]{2,4}$')][string]$DemoAbbreviation,
-    [string]$NmeVariablePrefix
+    [Parameter(Mandatory=$true)][ValidatePattern('^[a-zA-Z0-9]{2,4}$')][string]$CustomerAbbreviation,
+    [string]$VariablePrefix = 'CustomerDemo'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -47,16 +47,15 @@ function Write-Log {
 #region Variables
 
 # NME API credentials from automation account variables
-$NmeTenantId     = Get-AutomationVariable -Name "${NmeVariablePrefix}TenantId"
-$NmeClientId     = Get-AutomationVariable -Name "${NmeVariablePrefix}ClientId"
-$NmeClientSecret = Get-AutomationVariable -Name "${NmeVariablePrefix}ClientSecret"
-$NmeScope        = Get-AutomationVariable -Name "${NmeVariablePrefix}Scope"
-$NmeUri          = Get-AutomationVariable -Name "${NmeVariablePrefix}Uri"
-$SubscriptionId  = Get-AutomationVariable -Name "${NmeVariablePrefix}SubscriptionId"
+$NmeTenantId     = Get-AutomationVariable -Name "${VariablePrefix}TenantId"
+$NmeClientId     = Get-AutomationVariable -Name "${VariablePrefix}ClientId"
+$NmeClientSecret = Get-AutomationVariable -Name "${VariablePrefix}ClientSecret"
+$NmeScope        = Get-AutomationVariable -Name "${VariablePrefix}Scope"
+$NmeUri          = Get-AutomationVariable -Name "${VariablePrefix}Uri"
+$SubscriptionId  = Get-AutomationVariable -Name "${VariablePrefix}SubscriptionId"
 
 # Naming conventions (must match New-NerdioDemoEnvironment.ps1)
-$Year = (Get-Date).Year.ToString().Substring(2, 2)
-$EnvironmentName = "Demo-$DemoAbbreviation$Year"
+$EnvironmentName = "$CustomerAbbreviation-Demo"
 $NewWorkspaceName = "$EnvironmentName-workspace"
 
 Write-Log "Cleaning up demo environment: $EnvironmentName"

@@ -11,8 +11,8 @@
   Intended for quick demo/POC setups. A corresponding Cleanup-NerdioDemoEnvironment.ps1
   will be created to remove the resources created here.
 
-.PARAMETER DemoAbbreviation
-  Short abbreviation (2-4 alphanumeric characters) used to name resources and users.
+.PARAMETER CustomerAbbreviation
+  Short customer abbreviation (2-4 alphanumeric characters) used to name resources and users.
 
 .PARAMETER UserCount
   Number of demo users to create.
@@ -29,23 +29,23 @@
 .PARAMETER DestroyOnUTC
   UTC datetime when the demo environment should be cleaned up.
 
-.PARAMETER NmeVariablePrefix
-  Prefix for NME API credentials in Automation Account variables.
+.PARAMETER VariablePrefix
+  Prefix for automation account variables. Defaults to 'CustomerDemo'.
 
 .EXAMPLE
-  .\New-NerdioDemoEnvironment.ps1 -DemoAbbreviation 'D01' -UserCount 5 -ResourceGroupName 'demo-rg'
-  .\New-NerdioDemoEnvironment.ps1 -DemoAbbreviation 'POC1' -UserCount 3 -ResourceGroupName 'demo-rg' -NmeVariablePrefix 'Prod'
+  .\New-NerdioDemoEnvironment.ps1 -CustomerAbbreviation 'ACME' -UserCount 5 -ResourceGroupName 'demo-autoclean-us'
+  .\New-NerdioDemoEnvironment.ps1 -CustomerAbbreviation 'CNTO' -UserCount 3 -ResourceGroupName 'demo-autoclean-eu' -VariablePrefix 'Prod'
 #>
 
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory=$true)][ValidatePattern('^[a-zA-Z0-9]{2,4}$')][string]$DemoAbbreviation,
+    [Parameter(Mandatory=$true)][ValidatePattern('^[a-zA-Z0-9]{2,4}$')][string]$CustomerAbbreviation,
     [Parameter(Mandatory=$true)][int]$UserCount,
     [string]$UserDefaultPassword = 'Nerdio123!',
-    [Parameter(Mandatory=$true)][string]$ResourceGroupName,
+    [Parameter(Mandatory=$true)][ValidateSet('demo-autoclean-us','demo-autoclean-eu','demo-autoclean-apac')][string]$ResourceGroupName,
     [string]$AzureRegion = 'centralus',
     [Parameter(Mandatory=$true)][datetime]$DestroyOnUTC,
-    [string]$NmeVariablePrefix
+    [string]$VariablePrefix = 'CustomerDemo'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -71,22 +71,21 @@ function Write-Log {
 #region Variables
 
 # NME API credentials from automation account variables
-$NmeTenantId     = Get-AutomationVariable -Name "${NmeVariablePrefix}TenantId"
-$NmeClientId     = Get-AutomationVariable -Name "${NmeVariablePrefix}ClientId"
-$NmeClientSecret = Get-AutomationVariable -Name "${NmeVariablePrefix}ClientSecret"
-$NmeScope        = Get-AutomationVariable -Name "${NmeVariablePrefix}Scope"
-$NmeUri          = Get-AutomationVariable -Name "${NmeVariablePrefix}Uri"
-$NmeAppObjectId  = Get-AutomationVariable -Name "${NmeVariablePrefix}AppObjectId"
-$SubscriptionId  = Get-AutomationVariable -Name "${NmeVariablePrefix}SubscriptionId"
-$TenantDomain    = Get-AutomationVariable -Name "${NmeVariablePrefix}TenantDomain"
+$NmeTenantId     = Get-AutomationVariable -Name "${VariablePrefix}TenantId"
+$NmeClientId     = Get-AutomationVariable -Name "${VariablePrefix}ClientId"
+$NmeClientSecret = Get-AutomationVariable -Name "${VariablePrefix}ClientSecret"
+$NmeScope        = Get-AutomationVariable -Name "${VariablePrefix}Scope"
+$NmeUri          = Get-AutomationVariable -Name "${VariablePrefix}Uri"
+$NmeAppObjectId  = Get-AutomationVariable -Name "${VariablePrefix}AppObjectId"
+$SubscriptionId  = Get-AutomationVariable -Name "${VariablePrefix}SubscriptionId"
+$TenantDomain    = Get-AutomationVariable -Name "${VariablePrefix}TenantDomain"
 $automationAccountName = 'nerdio-management-aa'
 $AutomationRg          = 'nerdio-management-rg'
 
 # Naming conventions
-$Year = (Get-Date).Year.ToString().Substring(2, 2)
-$EnvironmentName = "Demo-$DemoAbbreviation$Year"
+$EnvironmentName = "$CustomerAbbreviation-Demo"
 $NewWorkspaceName = "$EnvironmentName-workspace"
-$BaseUserName = "$DemoAbbreviation-User"
+$BaseUserName = "$CustomerAbbreviation-User"
 
 Write-Log "Environment name: $EnvironmentName"
 
@@ -110,6 +109,23 @@ $Application = Get-MgApplicationById -Ids $NmeAppObjectId -ErrorAction Stop
 Import-Module NerdioManagerPowerShell -Force
 Connect-Nme -ClientId $NmeClientId -ClientSecret $NmeClientSecret -TenantId $NmeTenantId -ApiScope $NmeScope -NmeUri $NmeUri | Out-Null
 Write-Log "Connected to NME API at $NmeUri."
+
+#endregion
+
+#region Validate environment name is not already in use
+
+$existingUsers = Get-MgUser -Property DisplayName,CompanyName -All | Where-Object { $_.CompanyName -eq $EnvironmentName }
+$existingWorkspace = Get-NmeWorkspace -ErrorAction SilentlyContinue | Where-Object { $_.id.name -eq $NewWorkspaceName }
+
+if ($existingUsers -or $existingWorkspace) {
+    $conflicts = @()
+    if ($existingUsers) { $conflicts += "$($existingUsers.Count) user(s) with CompanyName '$EnvironmentName'" }
+    if ($existingWorkspace) { $conflicts += "workspace '$NewWorkspaceName'" }
+    Write-Log "Customer abbreviation '$CustomerAbbreviation' is already in use: $($conflicts -join '; '). Choose a different abbreviation or clean up the existing environment first." 'ERROR'
+    exit 1
+}
+
+Write-Log "Validated: no existing resources found for '$EnvironmentName'."
 
 #endregion
 
@@ -229,8 +245,8 @@ if ($null -ne $Schedule) {
 
 $Schedule = New-AzAutomationSchedule -Name $ScheduleName -StartTime $DestroyOnUTC -OneTime -ResourceGroupName $AutomationRg -AutomationAccountName $automationAccountName -ErrorAction Stop
 $RunbookParams = @{
-    DemoAbbreviation = $DemoAbbreviation
-    NmeVariablePrefix = $NmeVariablePrefix
+    CustomerAbbreviation = $CustomerAbbreviation
+    VariablePrefix = $VariablePrefix
 }
 Register-AzAutomationScheduledRunbook -ResourceGroupName $AutomationRg -AutomationAccountName $automationAccountName -RunbookName $RunbookName -ScheduleName $ScheduleName -Parameters $RunbookParams -ErrorAction Stop | Out-Null
 Write-Log "Cleanup scheduled for $DestroyOnUTC (UTC)."
