@@ -48,7 +48,7 @@ param(
     [string]$UserDefaultPassword = 'Nerdio123!',
     [string]$AzureRegion = 'centralus',
     [Parameter(Mandatory=$true)][datetime]$DestroyOnUTC,
-    [switch]$UpdateExistingDemoEnv,
+    [bool]$UpdateExistingDemoEnv = $false,
     [string]$VariablePrefix = 'CustomerDemo'
 )
 
@@ -145,7 +145,8 @@ if ($null -eq $Workspace) {
         -id (New-NmeWvdObjectId -subscriptionId $SubscriptionId -resourceGroup $ResourceGroupName -name $NewWorkspaceName) `
         -location $AzureRegion `
         -friendlyName "Demo Workspace" `
-        -description "Workspace for demo $EnvironmentName"
+        -description "Workspace for demo $EnvironmentName" `
+        -tags @{ DestroyAfter = $DestroyOnUTC.ToString('o') }
     $WorkspaceResult = New-NmeWorkspace -NmeCreateWorkspaceRequest $WorkspaceRequest
 
     # Wait for workspace creation job to complete
@@ -164,6 +165,11 @@ if ($null -eq $Workspace) {
     $Workspace = Get-NmeWorkspace -ErrorAction Stop | Where-Object { $_.id.name -eq $NewWorkspaceName }
 } else {
     Write-Log "Workspace $NewWorkspaceName already exists."
+
+    # Update DestroyAfter tag if re-running with a potentially different date
+    $workspaceResourceId = "/subscriptions/$($Workspace.id.subscriptionid)/resourceGroups/$($Workspace.id.resourceGroup)/providers/Microsoft.DesktopVirtualization/workspaces/$($Workspace.id.name)"
+    Update-AzTag -Tag @{ DestroyAfter = $DestroyOnUTC.ToString('o') } -Operation Merge -ResourceId $workspaceResourceId -ErrorAction Stop | Out-Null
+    Write-Log "Updated DestroyAfter tag on workspace to $($DestroyOnUTC.ToString('o'))."
 }
 
 #endregion
