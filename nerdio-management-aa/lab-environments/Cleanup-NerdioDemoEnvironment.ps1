@@ -20,7 +20,7 @@
 
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory=$true)][ValidatePattern('^[a-zA-Z0-9]{2,4}$')][string]$CustomerAbbreviation,
+    [Parameter(Mandatory=$true)][string]$CustomerAbbreviation,
     [string]$VariablePrefix = 'CustomerDemo'
 )
 
