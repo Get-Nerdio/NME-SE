@@ -4,12 +4,14 @@
 
 .DESCRIPTION
   This runbook creates a simplified Nerdio demo environment:
-  1. Creates Entra ID users with a default password
-  2. Creates an NME workspace in the specified resource group
-  3. Assigns users to the workspace with the WVD Admin role
+  1. Creates an NME workspace (skips if it already exists)
+  2. Creates Entra ID users with a default password (skips existing users)
+  3. Assigns users to the workspace with the WVD Admin role (skips if already assigned)
+  4. Schedules the Cleanup-NerdioDemoEnvironment runbook
 
-  Intended for quick demo/POC setups. A corresponding Cleanup-NerdioDemoEnvironment.ps1
-  will be created to remove the resources created here.
+  This script is idempotent. Running it again with the same parameters will
+  skip already-completed steps and finish any remaining work. If UserCount is
+  increased, only the additional users are created.
 
 .PARAMETER CustomerAbbreviation
   Short customer abbreviation (2-4 alphanumeric characters) used to name resources and users.
@@ -26,6 +28,11 @@
 .PARAMETER DestroyOnUTC
   UTC datetime when the demo environment should be cleaned up.
 
+.PARAMETER UpdateExistingDemoEnv
+  If specified, allows updating an existing demo environment instead of
+  blocking when one already exists. Existing resources are skipped and
+  only missing items (users, role assignments, etc.) are created.
+
 .PARAMETER VariablePrefix
   Prefix for automation account variables. Defaults to 'CustomerDemo'.
 
@@ -41,6 +48,7 @@ param(
     [string]$UserDefaultPassword = 'Nerdio123!',
     [string]$AzureRegion = 'centralus',
     [Parameter(Mandatory=$true)][datetime]$DestroyOnUTC,
+    [switch]$UpdateExistingDemoEnv,
     [string]$VariablePrefix = 'CustomerDemo'
 )
 
@@ -109,20 +117,22 @@ Write-Log "Connected to NME API at $NmeUri."
 
 #endregion
 
-#region Validate environment name is not already in use
+#region Validate environment does not already exist
 
 $existingUsers = Get-MgUser -Property DisplayName,CompanyName -All | Where-Object { $_.CompanyName -eq $EnvironmentName }
 $existingWorkspace = Get-NmeWorkspace -ErrorAction SilentlyContinue | Where-Object { $_.id.name -eq $NewWorkspaceName }
 
-if ($existingUsers -or $existingWorkspace) {
+if (($existingUsers -or $existingWorkspace) -and -not $UpdateExistingDemoEnv) {
     $conflicts = @()
     if ($existingUsers) { $conflicts += "$($existingUsers.Count) user(s) with CompanyName '$EnvironmentName'" }
     if ($existingWorkspace) { $conflicts += "workspace '$NewWorkspaceName'" }
-    Write-Log "Customer abbreviation '$CustomerAbbreviation' is already in use: $($conflicts -join '; '). Choose a different abbreviation or clean up the existing environment first." 'ERROR'
+    Write-Log "Customer abbreviation '$CustomerAbbreviation' is already in use: $($conflicts -join '; '). Use -UpdateExistingDemoEnv to update the existing environment." 'ERROR'
     exit 1
 }
 
-Write-Log "Validated: no existing resources found for '$EnvironmentName'."
+if ($UpdateExistingDemoEnv) {
+    Write-Log "UpdateExistingDemoEnv specified. Will skip existing resources and complete any remaining work."
+}
 
 #endregion
 
@@ -175,37 +185,55 @@ $ServicePrincipal = Get-MgServicePrincipal -Filter "Id eq '$NmeAppObjectId'" -Er
 
 #region 3. Create users and assign to workspace
 
-Write-Log "Creating $UserCount user(s) with base name '$BaseUserName'..."
+Write-Log "Ensuring $UserCount user(s) with base name '$BaseUserName'..."
 $UserUpns = @()
+$usersCreated = 0
+$usersExisting = 0
 
 for ($i = 1; $i -le $UserCount; $i++) {
     $UserName = "$BaseUserName$i"
     $UserUpn = "$UserName@$TenantDomain"
 
-    # Create user in Entra ID
-    Write-Log "Creating user $UserUpn..."
-    $passwordProfile = @{ ForceChangePasswordNextSignIn = $false; Password = $UserDefaultPassword }
-    $User = New-MgUser `
-        -DisplayName $UserName `
-        -MailNickname $UserName `
-        -PasswordProfile $passwordProfile `
-        -UserPrincipalName $UserUpn `
-        -CompanyName $EnvironmentName `
-        -AccountEnabled `
-        -ErrorAction Stop
+    # Check if user already exists
+    $User = Get-MgUser -Filter "userPrincipalName eq '$UserUpn'" -ErrorAction SilentlyContinue
 
-    # Assign WVD Admin role on the NME app registration
-    New-MgUserAppRoleAssignment `
-        -UserId $User.Id `
-        -AppRoleId $AdminRoleId `
-        -ResourceId $ServicePrincipal.Id `
-        -PrincipalId $User.Id `
-        -PrincipalType "User" `
-        -ErrorAction Stop | Out-Null
+    if ($User) {
+        Write-Log "User $UserUpn already exists, skipping creation."
+        $usersExisting++
+    } else {
+        Write-Log "Creating user $UserUpn..."
+        $passwordProfile = @{ ForceChangePasswordNextSignIn = $false; Password = $UserDefaultPassword }
+        $User = New-MgUser `
+            -DisplayName $UserName `
+            -MailNickname $UserName `
+            -PasswordProfile $passwordProfile `
+            -UserPrincipalName $UserUpn `
+            -CompanyName $EnvironmentName `
+            -AccountEnabled `
+            -ErrorAction Stop
+        $usersCreated++
+    }
 
     $UserUpns += $UserUpn
 
-    # Assign user to workspace with retry (Entra ID replication delay)
+    # Ensure WVD Admin role assignment (skip if already assigned)
+    $existingAppRole = Get-MgUserAppRoleAssignment -UserId $User.Id -ErrorAction SilentlyContinue |
+        Where-Object { $_.AppRoleId -eq $AdminRoleId -and $_.ResourceId -eq $ServicePrincipal.Id }
+
+    if (-not $existingAppRole) {
+        New-MgUserAppRoleAssignment `
+            -UserId $User.Id `
+            -AppRoleId $AdminRoleId `
+            -ResourceId $ServicePrincipal.Id `
+            -PrincipalId $User.Id `
+            -PrincipalType "User" `
+            -ErrorAction Stop | Out-Null
+        Write-Log "Assigned WVD Admin role to $UserName."
+    } else {
+        Write-Log "User $UserName already has WVD Admin role."
+    }
+
+    # Ensure workspace assignment with retry (Entra ID replication delay)
     $retryCount = 0
     $maxRetries = 12
     $retryInterval = 5
@@ -213,7 +241,7 @@ for ($i = 1; $i -le $UserCount; $i++) {
     while ($retryCount -lt $maxRetries) {
         try {
             Set-NmeRbacRolesAssignment -objectId $User.Id -NmeRbacAssignmentUpdateRestModel $RbacAssignmentUpdateRestModel | Out-Null
-            Write-Log "Assigned user $UserName to workspace $NewWorkspaceName."
+            Write-Log "Ensured user $UserName is assigned to workspace $NewWorkspaceName."
             break
         } catch {
             $retryCount++
@@ -224,6 +252,8 @@ for ($i = 1; $i -le $UserCount; $i++) {
         }
     }
 }
+
+Write-Log "Users: $usersCreated created, $usersExisting already existed."
 
 #endregion
 
@@ -253,11 +283,13 @@ Write-Log "Cleanup scheduled for $DestroyOnUTC (UTC)."
 #region Summary
 
 Write-Log ""
-Write-Log "=== DEMO ENVIRONMENT CREATED ==="
-Write-Log "Environment:  $EnvironmentName"
-Write-Log "Workspace:    $NewWorkspaceName"
+Write-Log "=== DEMO ENVIRONMENT READY ==="
+Write-Log "Environment:    $EnvironmentName"
+Write-Log "Workspace:      $NewWorkspaceName"
 Write-Log "Resource group: $ResourceGroupName"
-Write-Log "Users created: $UserCount"
+Write-Log "Users created:  $usersCreated"
+Write-Log "Users existing: $usersExisting"
+Write-Log "Total users:    $UserCount"
 Write-Log ""
 Write-Log "Users:"
 foreach ($upn in $UserUpns) {
