@@ -94,7 +94,8 @@ function Get-NmeSqlConnection {
     $DbName = (Get-AzSqlDatabase -ResourceGroupName $ResourceGroupName -ServerName $SqlServer.ServerName |
         Where-Object { $_.DatabaseName -ne 'master' }).DatabaseName
 
-    Write-Log "Found NME SQL server: $($SqlServer.ServerName), database: $DbName"
+    # Log via Write-Warning to avoid polluting the output pipeline (Write-Output would become part of the return value)
+    Write-Warning "Found NME SQL server: $($SqlServer.ServerName), database: $DbName"
 
     # Get access token for Azure SQL using managed identity
     $token = (Get-AzAccessToken -ResourceUrl 'https://database.windows.net/').Token
