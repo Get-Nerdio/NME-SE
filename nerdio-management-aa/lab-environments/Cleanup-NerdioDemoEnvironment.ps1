@@ -414,7 +414,7 @@ AppTraces
     $appResult = Invoke-AzOperationalInsightsQuery -WorkspaceId $LawWorkspaceId -Query $appQuery -ErrorAction SilentlyContinue
     if ($appResult.Results) {
         # Check both one-time and recurrent policies
-        $oneTimePolicies = Get-NmeAppManagementOneTimePolicy -ErrorAction SilentlyContinue
+        $oneTimePolicies = Get-NmeAppManagementOneTimePolicy -CreatedSince '2020-01-01' -ErrorAction SilentlyContinue
         $recurrentPolicies = Get-NmeAppManagementRecurrentPolicy -ErrorAction SilentlyContinue
 
         foreach ($appRow in $appResult.Results) {
