@@ -348,6 +348,7 @@ $userRows
 
     <p><strong>Login URL:</strong> <a href="$NmeUri">$NmeUri</a></p>
 
+    <p><strong>Environment Expiration:</strong> This demo environment will be automatically destroyed on <strong>$($DestroyOnUTC.ToString('dddd, MMMM dd, yyyy a\t h:mm tt')) UTC</strong>.</p>
 
     <h3>Recommended First Steps</h3>
     <ol>
