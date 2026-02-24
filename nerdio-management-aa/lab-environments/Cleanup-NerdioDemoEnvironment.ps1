@@ -337,22 +337,17 @@ AppTraces
         Write-Log "Discovered $($discoveredHostPools.Count) host pool(s) from LAW."
     }
 
-    # Fallback: also find host pools in the resource group via Azure
-    $azHostPools = Get-AzWvdHostPool -ResourceGroupName $ResourceGroupName -SubscriptionId $SubscriptionId -ErrorAction SilentlyContinue
-    if ($azHostPools) {
-        foreach ($azHp in $azHostPools) {
-            $hpName = $azHp.Name
-            $alreadyDiscovered = $discoveredHostPools | Where-Object { $_.HostPoolName -eq $hpName }
-            if (-not $alreadyDiscovered) {
-                Write-Log "Found additional host pool '$hpName' in resource group $ResourceGroupName."
-                $discoveredHostPools += [PSCustomObject]@{
-                    HostPoolSub  = $SubscriptionId
-                    HostPoolRg   = $ResourceGroupName
-                    HostPoolName = $hpName
-                }
-            }
+    # Verify discovered host pools still exist in Azure (filter out already-deleted ones)
+    $verifiedHostPools = @()
+    foreach ($hp in $discoveredHostPools) {
+        $azHp = Get-AzWvdHostPool -ResourceGroupName $hp.HostPoolRg -Name $hp.HostPoolName -SubscriptionId $hp.HostPoolSub -ErrorAction SilentlyContinue
+        if ($azHp) {
+            $verifiedHostPools += $hp
+        } else {
+            Write-Log "Host pool '$($hp.HostPoolName)' discovered in LAW but no longer exists in Azure, skipping."
         }
     }
+    $discoveredHostPools = $verifiedHostPools
 }
 
 #endregion
@@ -547,31 +542,39 @@ AppTraces
 if ($Users.Count -gt 0) {
     Write-Log "Checking for FSLogix profile VHDs on file share..."
 
-    # Mount the profile share using the storage account key
-    $sharePath = "\\$FslStorageAccountName.file.core.windows.net\$FslShareName"
-
     try {
-        # Create a PSDrive to access the share with the storage account key
-        $secureKey = ConvertTo-SecureString $FslStorageAccountKey -AsPlainText -Force
-        $credential = New-Object System.Management.Automation.PSCredential("Azure\$FslStorageAccountName", $secureKey)
-        New-PSDrive -Name 'FslShare' -PSProvider FileSystem -Root $sharePath -Credential $credential -ErrorAction Stop | Out-Null
-        Write-Log "Mounted FSLogix profile share at $sharePath."
+        # Use the Azure Storage SDK to list and delete profile directories.
+        # This avoids SMB mount issues and lets us force-close open file handles
+        # (e.g. VHDs still mounted by session hosts).
+        $storageContext = New-AzStorageContext -StorageAccountName $FslStorageAccountName -StorageAccountKey $FslStorageAccountKey
+        $share = Get-AzStorageShare -Name $FslShareName -Context $storageContext -ErrorAction Stop
 
-        # Get all directories in the share
-        $profileDirs = Get-ChildItem -Path 'FslShare:\' -Directory -ErrorAction Stop
+        # List top-level directories in the share
+        $profileDirs = Get-AzStorageFile -ShareName $FslShareName -Context $storageContext -ErrorAction Stop |
+            Where-Object { $_.GetType().Name -eq 'AzureStorageFileDirectory' }
 
         # Match profile directories for demo users
         # Directory naming: S-1-12-1-*_<DisplayName> (e.g. S-1-12-1-3441947837-1330913454-3785854094-1796405929_NJW-User2)
         $userDisplayNames = @($Users | ForEach-Object { $_.DisplayName })
 
         foreach ($dir in $profileDirs) {
-            # Extract the username suffix after the last underscore
             if ($dir.Name -match '^S-1-\d+-\d+-.+_(.+)$') {
                 $dirUserName = $Matches[1]
                 if ($dirUserName -in $userDisplayNames) {
                     try {
                         Write-Log "Removing FSLogix profile directory '$($dir.Name)'..."
-                        Remove-Item -Path $dir.FullName -Recurse -Force -ErrorAction Stop
+
+                        # Close any open SMB file handles (e.g. mounted VHDs) before deleting
+                        $openHandles = Get-AzStorageFileHandle -ShareName $FslShareName -Path $dir.Name -Recursive -Context $storageContext -ErrorAction SilentlyContinue
+                        if ($openHandles) {
+                            Write-Log "Closing $($openHandles.Count) open file handle(s) in '$($dir.Name)'..."
+                            Close-AzStorageFileHandle -ShareName $FslShareName -Path $dir.Name -Recursive -CloseAll -Context $storageContext -ErrorAction SilentlyContinue
+                            # Brief pause for handle closure to propagate
+                            Start-Sleep -Seconds 2
+                        }
+
+                        # Remove the directory and all contents
+                        Remove-AzStorageDirectory -ShareName $FslShareName -Path $dir.Name -Context $storageContext -ErrorAction Stop
                         Write-Log "FSLogix profile directory '$($dir.Name)' removed."
                         $fslVhdsRemoved++
                     } catch {
@@ -581,11 +584,8 @@ if ($Users.Count -gt 0) {
                 }
             }
         }
-
-        # Clean up the PSDrive
-        Remove-PSDrive -Name 'FslShare' -Force -ErrorAction SilentlyContinue
     } catch {
-        Write-Log "Failed to access FSLogix profile share at $sharePath`: $($_.Exception.Message)" 'WARN'
+        Write-Log "Failed to access FSLogix profile share '$FslShareName' on '$FslStorageAccountName': $($_.Exception.Message)" 'WARN'
         $errors++
     }
 } else {
@@ -1153,7 +1153,7 @@ foreach ($cleanupType in $sqlCleanupTypes) {
             $checkQuery = "SELECT COUNT(*) AS Cnt FROM ProvisionJob WHERE UserId IN (SELECT Id FROM JobUser WHERE Username IN ({0})) AND JobType = @JobType"
             $checkQuery = $checkQuery -f ($upnPlaceholders -join ', ')
             $checkResult = Invoke-NmeSql -Connection $SqlConnection -Query $checkQuery -Parameters $upnParams -AsDataTable
-            if ($checkResult.Rows[0].Cnt -gt 0) {
+            if ($checkResult -and $checkResult.Rows.Count -gt 0 -and $checkResult.Rows[0].Cnt -gt 0) {
                 # Get all non-default configs — in a demo environment these are demo-user-created
                 $directQuery = "SELECT [$($mapEntry.NameColumn)] AS ResourceName FROM [$($mapEntry.Table)] WHERE Id > 1"
                 $directResult = Invoke-NmeSql -Connection $SqlConnection -Query $directQuery -Parameters @{} -AsDataTable
