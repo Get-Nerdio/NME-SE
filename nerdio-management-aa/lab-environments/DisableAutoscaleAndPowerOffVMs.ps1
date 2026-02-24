@@ -164,8 +164,9 @@ foreach ($hp in $allHostPools) {
       $vmName = ($hostName -split '\.')[0]
 
       try {
-        # Use the PowerState from the NME API response
-        $powerState = $sh.PowerState
+        # NME API returns PowerState as "PowerState/running", "PowerState/deallocated", etc.
+        # Normalize to just the state name for comparison.
+        $powerState = ($sh.PowerState -replace '^PowerState/', '').ToLower()
 
         if ($powerState -eq 'deallocated') {
           Write-Log "[$hpLabel] Session host '$vmName' already deallocated."
