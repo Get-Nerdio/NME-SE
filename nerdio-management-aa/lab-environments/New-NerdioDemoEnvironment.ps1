@@ -88,7 +88,7 @@ $NmeUri          = Get-AutomationVariable -Name "${VariablePrefix}Uri"
 $NmeAppObjectId  = Get-AutomationVariable -Name "${VariablePrefix}AppObjectId"
 $SubscriptionId  = Get-AutomationVariable -Name "${VariablePrefix}SubscriptionId"
 $TenantDomain    = Get-AutomationVariable -Name "${VariablePrefix}TenantDomain"
-$ResourceGroupName     = 'autoclean-rg'
+$ResourceGroupName     = Get-AutomationVariable -Name "${VariablePrefix}DefaultRG"
 $automationAccountName = 'nerdio-management-aa'
 $AutomationRg          = 'nerdio-management-rg'
 
