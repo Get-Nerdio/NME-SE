@@ -20,6 +20,7 @@
   12. Removes resources without API removal functions directly from the NME database:
       AD configs, RDP properties configs, scripted actions profiles,
       capacity extender profiles, deployment models, shell apps, custom views
+  13. Removes the scheduled cleanup runbook if it exists (prevents duplicate runs)
 
   PREREQUISITES
   =============
@@ -206,6 +207,10 @@ $LawWorkspaceId  = Get-AutomationVariable -Name "${VariablePrefix}LawWorkspaceId
 
 $ResourceGroupName = 'autoclean-rg'
 $NmeResourceGroupName = Get-AutomationVariable -Name "${VariablePrefix}NmeResourceGroup"
+
+# Automation account constants (must match New-NerdioDemoEnvironment.ps1)
+$automationAccountName = 'nerdio-management-aa'
+$AutomationRg          = 'nerdio-management-rg'
 
 # Naming conventions (must match New-NerdioDemoEnvironment.ps1)
 $EnvironmentName = "$CustomerAbbreviation-Demo"
@@ -1013,6 +1018,25 @@ foreach ($cleanupType in $sqlCleanupTypes) {
     }
 }
 
+
+#endregion
+
+#region 13. Remove cleanup schedule
+
+$ScheduleName = "$EnvironmentName-destroy-schedule"
+$Schedule = Get-AzAutomationSchedule -Name $ScheduleName -ResourceGroupName $AutomationRg -AutomationAccountName $automationAccountName -ErrorAction SilentlyContinue
+if ($null -ne $Schedule) {
+    try {
+        Write-Log "Removing cleanup schedule '$ScheduleName'..."
+        Remove-AzAutomationSchedule -Name $ScheduleName -ResourceGroupName $AutomationRg -AutomationAccountName $automationAccountName -Force -ErrorAction Stop
+        Write-Log "Cleanup schedule '$ScheduleName' removed."
+    } catch {
+        Write-Log "Failed to remove cleanup schedule '$ScheduleName': $($_.Exception.Message)" 'WARN'
+        $errors++
+    }
+} else {
+    Write-Log "No cleanup schedule '$ScheduleName' found."
+}
 
 #endregion
 
