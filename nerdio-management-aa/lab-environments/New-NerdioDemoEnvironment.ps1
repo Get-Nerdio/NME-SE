@@ -333,9 +333,9 @@ if ($DestEmailAddress) {
 <body style="font-family: Arial, sans-serif; color: #333; line-height: 1.6;">
     <p>Greetings,</p>
 
-    <p>Welcome to Nerdio Manager for Enterprise! Your demo environment is ready and waiting for you.</p>
+    <p>Welcome to Nerdio Manager for Enterprise! Your sandbox demo environment is ready and waiting for you.</p>
 
-    <p>You'll be prompted to set a new password and register for MFA on your first sign-in.</p>
+    <p>You'll be prompted to set a new password on your first sign-in.</p>
 
     <h3>Your Login Credentials</h3>
     <table style="border-collapse: collapse; margin-bottom: 16px;">
