@@ -322,41 +322,58 @@ if ($DestEmailAddress) {
     $SendGridApiKey = Get-AutomationVariable -Name 'SendGridKey'
     $fromEmailAddress = 'team@nerdio.net'
 
-    # Build user credentials list
-    $userList = ""
+    # Build user credentials table rows
+    $userRows = ""
     foreach ($upn in $UserUpns) {
-        $userList += "  Username: $upn`n  Password: $UserDefaultPassword`n`n"
+        $userRows += "              <tr><td style='padding: 6px 12px; border: 1px solid #e0e0e0;'>$upn</td><td style='padding: 6px 12px; border: 1px solid #e0e0e0;'>$UserDefaultPassword</td></tr>`n"
     }
 
     $content = @"
-Hi there!
+<html>
+<body style="font-family: Arial, sans-serif; color: #333; line-height: 1.6;">
+    <p>Hi there!</p>
 
-Welcome to Nerdio Manager! Your demo environment is ready and waiting for you.
+    <p>Welcome to <strong>Nerdio Manager</strong>! Your demo environment is ready and waiting for you.</p>
 
-Here are your login credentials:
+    <h3>Your Login Credentials</h3>
+    <table style="border-collapse: collapse; margin-bottom: 16px;">
+        <tr style="background-color: #f5f5f5;">
+            <th style="padding: 8px 12px; border: 1px solid #e0e0e0; text-align: left;">Username</th>
+            <th style="padding: 8px 12px; border: 1px solid #e0e0e0; text-align: left;">Password</th>
+        </tr>
+$userRows
+    </table>
 
-$userList
-Login URL: $NmeUri
+    <p><strong>Login URL:</strong> <a href="$NmeUri">$NmeUri</a></p>
 
-You'll be prompted to set a new password and register for MFA on your first sign-in.
+    <p>You'll be prompted to set a new password and register for MFA on your first sign-in.</p>
 
-To help you get started, here are some recommended first steps:
+    <h3>Recommended First Steps</h3>
+    <ol>
+        <li><strong>Create your first desktop image</strong>
+            <ul>
+                <li><a href="https://nmehelp.getnerdio.com/hc/en-us/articles/26124301690637-Desktop-Images">Desktop Images overview</a></li>
+                <li><a href="https://nmehelp.getnerdio.com/hc/en-us/articles/26124381963149-Desktop-images-set-as-image">Set as image</a></li>
+            </ul>
+        </li>
+        <li><strong>Create a host pool</strong>
+            <ul>
+                <li><a href="https://nmehelp.getnerdio.com/hc/en-us/articles/26124329605517-Overview-of-host-pools">Host pools overview</a></li>
+                <li><a href="https://nmehelp.getnerdio.com/hc/en-us/articles/26124319282061-Resize-re-image-a-host-pool">Resize and re-image a host pool</a></li>
+            </ul>
+        </li>
+        <li><strong>Enable Auto-scale</strong>
+            <ul>
+                <li><a href="https://nmehelp.getnerdio.com/hc/en-us/articles/26124304193037-Enable-dynamic-host-pool-Auto-scaling">Dynamic host pool auto-scaling</a></li>
+            </ul>
+        </li>
+    </ol>
 
-1. Create your first desktop image
-   - Desktop Images overview: https://nmehelp.getnerdio.com/hc/en-us/articles/26124301690637-Desktop-Images
-   - Set as image: https://nmehelp.getnerdio.com/hc/en-us/articles/26124381963149-Desktop-images-set-as-image
+    <p>If you have any questions, don't hesitate to reach out. We're excited to have you on board!</p>
 
-2. Create a host pool
-   - Host pools overview: https://nmehelp.getnerdio.com/hc/en-us/articles/26124329605517-Overview-of-host-pools
-   - Resize and re-image a host pool: https://nmehelp.getnerdio.com/hc/en-us/articles/26124319282061-Resize-re-image-a-host-pool
-
-3. Enable Auto-scale
-   - Dynamic host pool auto-scaling: https://nmehelp.getnerdio.com/hc/en-us/articles/26124304193037-Enable-dynamic-host-pool-Auto-scaling
-
-If you have any questions, don't hesitate to reach out. We're excited to have you on board!
-
-Best regards,
-The Nerdio Team
+    <p>Best regards,<br>The Nerdio Team</p>
+</body>
+</html>
 "@
 
     $subject = "Welcome to Nerdio Manager - Your Demo Environment is Ready!"
@@ -381,7 +398,7 @@ The Nerdio Team
         subject = $subject
         content = @(
             @{
-                type  = "text/plain"
+                type  = "text/html"
                 value = $content
             }
         )
