@@ -151,7 +151,7 @@ if ($null -eq $Workspace) {
         -location $AzureRegion `
         -friendlyName "$NewWorkspaceName" `
         -description "Workspace for demo $EnvironmentName" `
-        -tags @{ DestroyAfter = $DestroyOnUTC.ToString('o') }
+        -tags @{ DestroyAfter = $DestroyOnUTC.ToString('o'); DoNotDestroy = 'true' }
     $WorkspaceResult = New-NmeWorkspace -NmeCreateWorkspaceRequest $WorkspaceRequest
 
     # Wait for workspace creation job to complete
