@@ -331,9 +331,11 @@ if ($DestEmailAddress) {
     $content = @"
 <html>
 <body style="font-family: Arial, sans-serif; color: #333; line-height: 1.6;">
-    <p>Hi there!</p>
+    <p>Greetings,</p>
 
-    <p>Welcome to <strong>Nerdio Manager</strong>! Your demo environment is ready and waiting for you.</p>
+    <p>Welcome to Nerdio Manager for Enterprise! Your demo environment is ready and waiting for you.</p>
+
+    <p>You'll be prompted to set a new password and register for MFA on your first sign-in.</p>
 
     <h3>Your Login Credentials</h3>
     <table style="border-collapse: collapse; margin-bottom: 16px;">
@@ -346,7 +348,6 @@ $userRows
 
     <p><strong>Login URL:</strong> <a href="$NmeUri">$NmeUri</a></p>
 
-    <p>You'll be prompted to set a new password and register for MFA on your first sign-in.</p>
 
     <h3>Recommended First Steps</h3>
     <ol>
