@@ -350,6 +350,8 @@ $userRows
 
     <p><strong>Environment Expiration:</strong> This demo environment will be automatically destroyed on <strong>$($DestroyOnUTC.ToString('dddd, MMMM dd, yyyy a\t h:mm tt')) UTC</strong>.</p>
 
+    <p>To prevent excess cost, AutoScale will be deactivated and all running hosts powered off once per day.</>
+
     <h3>Recommended First Steps</h3>
     <ol>
         <li><strong>Create your first desktop image</strong>
