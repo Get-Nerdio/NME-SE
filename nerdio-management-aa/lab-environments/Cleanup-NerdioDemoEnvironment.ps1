@@ -311,9 +311,9 @@ AppTraces
 | mv-expand TaskResultArray
 | extend PayloadStr = tostring(TaskResultArray.payload)
 | where PayloadStr contains "/hostPools/" or RequestPath contains "/hostpool/dynamic/"
-| extend HpFromPayload = extract("/hostPools/([^/\"]+)", 1, PayloadStr)
-| extend RgFromPayload = extract("/resourceGroups/([^/\"]+)", 1, PayloadStr)
-| extend SubFromPayload = extract("/subscriptions/([^/\"]+)", 1, PayloadStr)
+| extend HpFromPayload = extract("/hostPools/([a-zA-Z0-9_-]+)", 1, PayloadStr)
+| extend RgFromPayload = extract("/resourceGroups/([a-zA-Z0-9._-]+)", 1, PayloadStr)
+| extend SubFromPayload = extract("/subscriptions/([a-fA-F0-9-]+)", 1, PayloadStr)
 | parse RequestPath with "/api/arm/hostpool/dynamic/" HpSubFromPath "/" HpRgFromPath "/" HpNameFromPath
 | extend HostPoolName = coalesce(HpFromPayload, HpNameFromPath)
 | extend HostPoolRg = coalesce(RgFromPayload, HpRgFromPath)
@@ -979,6 +979,7 @@ AppTraces
 | distinct ResourceName
 "@ }
     @{ JobType = 'CreateRdpPropertiesConfig';              NameField = 'Name'
+       ParseQuery = Build-ChangelogNameQuery 'CreateRdpPropertiesConfig' 'Name'
        SqlFallback = $true }
     @{ JobType = 'CreateHostPoolScriptedActionsProfile';   NameField = 'Name'
        ParseQuery = Build-ChangelogNameQuery 'CreateHostPoolScriptedActionsProfile' 'Name' }
@@ -1046,9 +1047,20 @@ foreach ($cleanupType in $sqlCleanupTypes) {
     $mapEntry = $sqlCleanupMap[$jobType]
     $resourceNames = @()
 
-    if ($cleanupType.SqlFallback) {
-        # Some job types don't include the resource name in LAW logs.
-        # Fall back to querying the NME ProvisionJob table by demo user ID and job description.
+    # Try LAW query first if available
+    if ($cleanupType.ParseQuery) {
+        $lawResult = Invoke-AzOperationalInsightsQuery -WorkspaceId $LawWorkspaceId -Query $cleanupType.ParseQuery -ErrorAction SilentlyContinue
+        if ($lawResult.Results) {
+            foreach ($row in $lawResult.Results) {
+                if (-not [string]::IsNullOrWhiteSpace($row.ResourceName)) {
+                    $resourceNames += $row.ResourceName
+                }
+            }
+        }
+    }
+
+    # Fall back to SQL ProvisionJob table if LAW returned nothing and SqlFallback is enabled
+    if ($resourceNames.Count -eq 0 -and $cleanupType.SqlFallback) {
         $jobQuery = "SELECT DISTINCT Resources FROM ProvisionJob WHERE UserId IN (SELECT Id FROM JobUser WHERE Username IN ({0})) AND JobType = @JobType AND Resources IS NOT NULL AND Resources <> ''"
         $upnParams = @{}
         $upnPlaceholders = @()
@@ -1062,13 +1074,8 @@ foreach ($cleanupType in $sqlCleanupTypes) {
         }
         $jobResult = Invoke-NmeSql -Connection $SqlConnection -Query $jobQuery -Parameters $upnParams -AsDataTable
         foreach ($row in $jobResult.Rows) {
-            $resourceNames += $row.Resources
-        }
-    } else {
-        $lawResult = Invoke-AzOperationalInsightsQuery -WorkspaceId $LawWorkspaceId -Query $cleanupType.ParseQuery -ErrorAction SilentlyContinue
-        if ($lawResult.Results) {
-            foreach ($row in $lawResult.Results) {
-                $resourceNames += $row.ResourceName
+            if (-not [string]::IsNullOrWhiteSpace($row.Resources)) {
+                $resourceNames += $row.Resources
             }
         }
     }
@@ -1079,6 +1086,7 @@ foreach ($cleanupType in $sqlCleanupTypes) {
     }
 
     foreach ($resourceName in $resourceNames) {
+        if ([string]::IsNullOrWhiteSpace($resourceName)) { continue }
         try {
             # Run pre-cleanup to remove FK references
             foreach ($preQuery in $mapEntry.PreCleanup) {
