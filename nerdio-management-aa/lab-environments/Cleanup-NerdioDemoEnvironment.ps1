@@ -10,11 +10,15 @@
   3. Removes FSLogix profiles created by demo users
   4. Removes auto-scale profiles created by demo users
   5. Removes app management policies created by demo users
-  6. Removes the NME workspace
-  7. Removes the Entra ID users (identified by CompanyName matching the environment name)
-  8. Removes resources without API removal functions directly from the NME database:
-     AD configs, RDP properties configs, scripted actions profiles,
-     capacity extender profiles, deployment models, shell apps, custom views
+  6. Removes scripted actions created by demo users (via NME API)
+  7. Removes desktop image VMs created by demo users (Azure VM, NIC, OS disk)
+  8. Removes the NME workspace
+  9. Removes RBAC assignments for demo users from the NME database
+  10. Removes the Entra ID users (identified by CompanyName matching the environment name)
+  11. Removes resources without API removal functions directly from the NME database:
+      AD configs, RDP properties configs, scripted actions profiles,
+      capacity extender profiles, deployment models, shell apps, custom views,
+      desktop images, RBAC role definitions
 
 .PARAMETER CustomerAbbreviation
   Short customer abbreviation used when the demo environment was created.
@@ -190,6 +194,8 @@ $hostPoolsRemoved = 0
 $fslProfilesRemoved = 0
 $asProfilesRemoved = 0
 $appPoliciesRemoved = 0
+$scriptedActionsRemoved = 0
+$desktopImagesRemoved = 0
 $dbResourcesRemoved = 0
 $usersRemoved = 0
 $workspaceRemoved = $false
@@ -450,7 +456,122 @@ AppTraces
 
 #endregion
 
-#region 6. Remove workspace
+#region 6. Remove scripted actions created by demo users
+
+if ($discoveredJobTypes | Where-Object { $_.JobType -eq 'CreateWindowsScriptedAction' }) {
+    Write-Log "Checking for scripted actions created by demo users..."
+    $saQuery = @"
+AppTraces
+| extend Props = parse_json(Properties)
+| where Props.Username in ($upnFilter)
+| where Props.TaskStatus == "Success"
+| where Props.JobType == "CreateWindowsScriptedAction"
+| extend TaskResultRaw = tostring(Props.TaskResult)
+| extend TaskResultArray = parse_json(TaskResultRaw)
+| mv-expand TaskResultArray
+| where TaskResultArray.type == 5
+| extend Payload = parse_json(tostring(TaskResultArray.payload))
+| extend ConfigJson = parse_json(tostring(Payload.message))
+| extend ScriptedActionName = tostring(ConfigJson.name)
+| where isnotempty(ScriptedActionName)
+| distinct ScriptedActionName
+"@
+
+    $saResult = Invoke-AzOperationalInsightsQuery -WorkspaceId $LawWorkspaceId -Query $saQuery -ErrorAction SilentlyContinue
+    if ($saResult.Results) {
+        $allScriptedActions = Get-NmeScriptedActions -ErrorAction SilentlyContinue
+        $deleteRequest = New-NmeDeleteScriptedActionRequest -Force $true
+        foreach ($saRow in $saResult.Results) {
+            $actionName = $saRow.ScriptedActionName
+            $matchingAction = $allScriptedActions | Where-Object { $_.Name -eq $actionName }
+            if ($matchingAction) {
+                try {
+                    Write-Log "Removing scripted action '$actionName' (Id: $($matchingAction.Id))..."
+                    Remove-NmeScriptedAction -Id $matchingAction.Id -NmeDeleteScriptedActionRequest $deleteRequest -ErrorAction Stop | Out-Null
+                    Write-Log "Scripted action '$actionName' removed."
+                    $scriptedActionsRemoved++
+                } catch {
+                    Write-Log "Failed to remove scripted action '$actionName': $($_.Exception.Message)" 'WARN'
+                    $errors++
+                }
+            }
+        }
+    }
+}
+
+#endregion
+
+#region 7. Remove desktop images created by demo users
+
+if ($discoveredJobTypes | Where-Object { $_.JobType -eq 'CreateDesktopImage' }) {
+    Write-Log "Checking for desktop image VMs created by demo users..."
+    $diQuery = @"
+AppTraces
+| extend Props = parse_json(Properties)
+| where Props.Username in ($upnFilter)
+| where Props.TaskStatus == "Success"
+| where Props.JobType == "CreateDesktopImage"
+| where Props.TaskName == "Create network interface"
+| extend TaskResultRaw = tostring(Props.TaskResult)
+| extend TaskResultArray = parse_json(TaskResultRaw)
+| mv-expand TaskResultArray
+| where TaskResultArray.type == 0
+| extend NicResourceId = tostring(TaskResultArray.payload)
+| where NicResourceId contains "/networkInterfaces/"
+| parse NicResourceId with "/subscriptions/" DiSub "/resourceGroups/" DiRg "/providers/Microsoft.Network/networkInterfaces/" NicName
+| extend ImageName = replace_string(NicName, "-nic", "")
+| where isnotempty(ImageName)
+| distinct DiSub, DiRg, ImageName, NicResourceId
+"@
+
+    $diResult = Invoke-AzOperationalInsightsQuery -WorkspaceId $LawWorkspaceId -Query $diQuery -ErrorAction SilentlyContinue
+    if ($diResult.Results) {
+        foreach ($diRow in $diResult.Results) {
+            $imageName = $diRow.ImageName
+            $diSub = $diRow.DiSub
+            $diRg = $diRow.DiRg
+
+            # Remove the VM
+            try {
+                Write-Log "Removing desktop image VM '$imageName' in $diRg..."
+                Remove-AzVM -ResourceGroupName $diRg -Name $imageName -ForceDeletion $true -Force -ErrorAction Stop | Out-Null
+                Write-Log "Desktop image VM '$imageName' removed."
+                $desktopImagesRemoved++
+            } catch {
+                Write-Log "Failed to remove desktop image VM '$imageName': $($_.Exception.Message)" 'WARN'
+                $errors++
+            }
+
+            # Remove the NIC
+            try {
+                $nicName = "$imageName-nic"
+                Write-Log "Removing NIC '$nicName' in $diRg..."
+                Remove-AzNetworkInterface -ResourceGroupName $diRg -Name $nicName -Force -ErrorAction Stop | Out-Null
+                Write-Log "NIC '$nicName' removed."
+            } catch {
+                Write-Log "Failed to remove NIC '$nicName': $($_.Exception.Message)" 'WARN'
+                $errors++
+            }
+
+            # Remove the OS disk (named after the VM by Azure convention)
+            try {
+                $osDisk = Get-AzDisk -ResourceGroupName $diRg -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "$imageName*" }
+                foreach ($disk in $osDisk) {
+                    Write-Log "Removing OS disk '$($disk.Name)' in $diRg..."
+                    Remove-AzDisk -ResourceGroupName $diRg -DiskName $disk.Name -Force -ErrorAction Stop | Out-Null
+                    Write-Log "OS disk '$($disk.Name)' removed."
+                }
+            } catch {
+                Write-Log "Failed to remove OS disk for '$imageName': $($_.Exception.Message)" 'WARN'
+                $errors++
+            }
+        }
+    }
+}
+
+#endregion
+
+#region 8. Remove workspace
 
 $Workspace = Get-NmeWorkspace -ErrorAction SilentlyContinue | Where-Object { $_.id.name -eq $NewWorkspaceName }
 if ($null -ne $Workspace) {
@@ -469,7 +590,28 @@ if ($null -ne $Workspace) {
 
 #endregion
 
-#region 7. Remove users from Entra ID
+#region 9. Remove RBAC assignments for demo users
+
+if ($Users) {
+    Write-Log "Removing RBAC assignments for demo users from NME database..."
+    foreach ($user in $Users) {
+        try {
+            $rbacQuery = "DELETE FROM RbacAssignments WHERE ObjectId = @ObjectId"
+            $rowsDeleted = Invoke-NmeSql -Connection $SqlConnection -Query $rbacQuery -Parameters @{ '@ObjectId' = $user.Id }
+            if ($rowsDeleted -gt 0) {
+                Write-Log "Removed $rowsDeleted RBAC assignment(s) for $($user.UserPrincipalName)."
+                $dbResourcesRemoved += $rowsDeleted
+            }
+        } catch {
+            Write-Log "Failed to remove RBAC assignments for $($user.UserPrincipalName): $($_.Exception.Message)" 'WARN'
+            $errors++
+        }
+    }
+}
+
+#endregion
+
+#region 10. Remove users from Entra ID
 
 if ($Users) {
     Write-Log "Found $($Users.Count) user(s) with CompanyName '$EnvironmentName'."
@@ -489,7 +631,7 @@ if ($Users) {
 
 #endregion
 
-#region 8. Remove resources via direct SQL (no API removal function)
+#region 11. Remove resources via direct SQL (no API removal function)
 
 # Map of JobType to the LAW query that extracts the resource name and the SQL cleanup logic
 $sqlCleanupTypes = @(
@@ -605,6 +747,24 @@ AppTraces
 | where isnotempty(ResourceName)
 | distinct ResourceName
 "@ }
+    @{ JobType = 'CreateDesktopImage';                     NameField = 'Name'; ParseQuery = @"
+AppTraces
+| extend Props = parse_json(Properties)
+| where Props.Username in ($upnFilter)
+| where Props.TaskStatus == "Success"
+| where Props.JobType == "CreateDesktopImage"
+| where Props.TaskName == "Create network interface"
+| extend TaskResultRaw = tostring(Props.TaskResult)
+| extend TaskResultArray = parse_json(TaskResultRaw)
+| mv-expand TaskResultArray
+| where TaskResultArray.type == 0
+| extend NicResourceId = tostring(TaskResultArray.payload)
+| where NicResourceId contains "/networkInterfaces/"
+| parse NicResourceId with * "/networkInterfaces/" NicName
+| extend ResourceName = replace_string(NicName, "-nic", "")
+| where isnotempty(ResourceName)
+| distinct ResourceName
+"@ }
 )
 
 # SQL cleanup definitions: table name, name column, and any child tables that must be deleted first
@@ -650,6 +810,12 @@ $sqlCleanupMap = @{
         Table = 'CustomViews'; NameColumn = 'Name'
         PreCleanup = @()
     }
+    'CreateDesktopImage' = @{
+        Table = 'DesktopImages'; NameColumn = 'Name'
+        PreCleanup = @(
+            "DELETE FROM DesktopImageScheduledTasks WHERE DesktopImageId IN (SELECT Id FROM DesktopImages WHERE Name = @Name)"
+        )
+    }
 }
 
 foreach ($cleanupType in $sqlCleanupTypes) {
@@ -691,6 +857,25 @@ foreach ($cleanupType in $sqlCleanupTypes) {
     }
 }
 
+# Handle CreateRoleDefinition separately — the LAW logs don't include the role name,
+# so we query the DB directly for custom (non-system) role definitions when this job type is detected.
+if ($discoveredJobTypes | Where-Object { $_.JobType -eq 'CreateRoleDefinition' }) {
+    Write-Log "Checking for custom RBAC role definitions created by demo users..."
+    try {
+        $roleQuery = "DELETE FROM CustomRoleDefinitions WHERE IsSystem = 0"
+        $rolesDeleted = Invoke-NmeSql -Connection $SqlConnection -Query $roleQuery
+        if ($rolesDeleted -gt 0) {
+            Write-Log "Removed $rolesDeleted custom RBAC role definition(s) from CustomRoleDefinitions."
+            $dbResourcesRemoved += $rolesDeleted
+        } else {
+            Write-Log "No custom RBAC role definitions found to remove."
+        }
+    } catch {
+        Write-Log "Failed to remove custom RBAC role definitions: $($_.Exception.Message)" 'WARN'
+        $errors++
+    }
+}
+
 #endregion
 
 #region Summary
@@ -708,6 +893,8 @@ Write-Log "Host pools removed:   $hostPoolsRemoved"
 Write-Log "FSLogix profiles:     $fslProfilesRemoved"
 Write-Log "Auto-scale profiles:  $asProfilesRemoved"
 Write-Log "App policies:         $appPoliciesRemoved"
+Write-Log "Scripted actions:     $scriptedActionsRemoved"
+Write-Log "Desktop images:       $desktopImagesRemoved"
 Write-Log "DB resources removed: $dbResourcesRemoved"
 Write-Log "Workspace removed:    $workspaceRemoved"
 Write-Log "Users removed:        $usersRemoved"
