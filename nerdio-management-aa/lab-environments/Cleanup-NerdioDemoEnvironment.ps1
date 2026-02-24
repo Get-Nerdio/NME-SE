@@ -99,7 +99,7 @@ function Write-Log {
     $stamp = (Get-Date).ToString('u')
     switch ($Level) {
         'INFO'  { Write-Output  "[$stamp] [INFO]  $Message" }
-        'WARN'  { Write-Warning "[$stamp] [WARN]  $Message" }
+        'WARN'  { Write-Output  "[$stamp] [WARN]  $Message"; Write-Warning "[$stamp] [WARN]  $Message" }
         'ERROR' { Write-Error   "[$stamp] [ERROR] $Message" }
     }
 }
