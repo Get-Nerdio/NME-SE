@@ -11,6 +11,7 @@
   3. Cleans up any orphaned RBAC data from the NME SQL database
   4. Removes host pools created by demo users (via NME API)
   5. Removes FSLogix profiles created by demo users
+  5b. Removes FSLogix profile VHDs from the file share for demo users
   6. Removes auto-scale profiles created by demo users
   7. Removes app management policies created by demo users
   8. Removes scripted actions created by demo users (via NME API)
@@ -49,6 +50,9 @@
     - {Prefix}TenantDomain      Entra ID tenant domain (e.g. contoso.onmicrosoft.com)
     - {Prefix}LawWorkspaceId    Log Analytics Workspace ID for NME analytics
     - {Prefix}NmeResourceGroup  Resource group containing the NME deployment (SQL server, etc.)
+    - {Prefix}-SAKey            Storage account key for the FSLogix profile share
+    - {Prefix}-FslStorageAccount Storage account name for FSLogix profiles
+    - {Prefix}-FslShareName      File share name for FSLogix profiles
 
   Managed Identity Permissions:
     - Azure RBAC: Contributor on the subscription (or scoped to the demo resource groups) for
@@ -205,6 +209,10 @@ $SubscriptionId  = Get-AutomationVariable -Name "${VariablePrefix}SubscriptionId
 $TenantDomain    = Get-AutomationVariable -Name "${VariablePrefix}TenantDomain"
 $LawWorkspaceId  = Get-AutomationVariable -Name "${VariablePrefix}LawWorkspaceId"
 
+$FslStorageAccountName = Get-AutomationVariable -Name "${VariablePrefix}-FslStorageAccount"
+$FslShareName          = Get-AutomationVariable -Name "${VariablePrefix}-FslShareName"
+$FslStorageAccountKey  = Get-AutomationVariable -Name "${VariablePrefix}-SAKey"
+
 $ResourceGroupName = 'autoclean-rg'
 $NmeResourceGroupName = Get-AutomationVariable -Name "${VariablePrefix}NmeResourceGroup"
 
@@ -245,6 +253,7 @@ $SqlConnection = Get-NmeSqlConnection -ResourceGroupName $NmeResourceGroupName
 # Counters for summary
 $hostPoolsRemoved = 0
 $fslProfilesRemoved = 0
+$fslVhdsRemoved = 0
 $asProfilesRemoved = 0
 $appPoliciesRemoved = 0
 $scriptedActionsRemoved = 0
@@ -529,6 +538,58 @@ AppTraces
             }
         }
     }
+}
+
+#endregion
+
+#region 5b. Remove FSLogix profile VHDs from the file share
+
+if ($Users.Count -gt 0) {
+    Write-Log "Checking for FSLogix profile VHDs on file share..."
+
+    # Mount the profile share using the storage account key
+    $sharePath = "\\$FslStorageAccountName.file.core.windows.net\$FslShareName"
+
+    try {
+        # Create a PSDrive to access the share with the storage account key
+        $secureKey = ConvertTo-SecureString $FslStorageAccountKey -AsPlainText -Force
+        $credential = New-Object System.Management.Automation.PSCredential("Azure\$FslStorageAccountName", $secureKey)
+        New-PSDrive -Name 'FslShare' -PSProvider FileSystem -Root $sharePath -Credential $credential -ErrorAction Stop | Out-Null
+        Write-Log "Mounted FSLogix profile share at $sharePath."
+
+        # Get all directories in the share
+        $profileDirs = Get-ChildItem -Path 'FslShare:\' -Directory -ErrorAction Stop
+
+        # Match profile directories for demo users
+        # Directory naming: S-1-12-1-*_<DisplayName> (e.g. S-1-12-1-3441947837-1330913454-3785854094-1796405929_NJW-User2)
+        $userDisplayNames = @($Users | ForEach-Object { $_.DisplayName })
+
+        foreach ($dir in $profileDirs) {
+            # Extract the username suffix after the last underscore
+            if ($dir.Name -match '^S-1-\d+-\d+-.+_(.+)$') {
+                $dirUserName = $Matches[1]
+                if ($dirUserName -in $userDisplayNames) {
+                    try {
+                        Write-Log "Removing FSLogix profile directory '$($dir.Name)'..."
+                        Remove-Item -Path $dir.FullName -Recurse -Force -ErrorAction Stop
+                        Write-Log "FSLogix profile directory '$($dir.Name)' removed."
+                        $fslVhdsRemoved++
+                    } catch {
+                        Write-Log "Failed to remove FSLogix profile directory '$($dir.Name)': $($_.Exception.Message)" 'WARN'
+                        $errors++
+                    }
+                }
+            }
+        }
+
+        # Clean up the PSDrive
+        Remove-PSDrive -Name 'FslShare' -Force -ErrorAction SilentlyContinue
+    } catch {
+        Write-Log "Failed to access FSLogix profile share at $sharePath`: $($_.Exception.Message)" 'WARN'
+        $errors++
+    }
+} else {
+    Write-Log "No demo users found, skipping FSLogix profile VHD cleanup."
 }
 
 #endregion
@@ -1174,6 +1235,7 @@ Write-Log "Environment:          $EnvironmentName"
 Write-Log "RBAC assignments:     $rbacAssignmentsCleared cleared"
 Write-Log "Host pools removed:   $hostPoolsRemoved"
 Write-Log "FSLogix profiles:     $fslProfilesRemoved"
+Write-Log "FSLogix profile VHDs: $fslVhdsRemoved"
 Write-Log "Auto-scale profiles:  $asProfilesRemoved"
 Write-Log "App policies:         $appPoliciesRemoved"
 Write-Log "Scripted actions:     $scriptedActionsRemoved"
