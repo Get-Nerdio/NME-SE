@@ -208,7 +208,7 @@ for ($i = 1; $i -le $UserCount; $i++) {
         $usersExisting++
     } else {
         Write-Log "Creating user $UserUpn..."
-        $passwordProfile = @{ ForceChangePasswordNextSignIn = $false; Password = $UserDefaultPassword }
+        $passwordProfile = @{ ForceChangePasswordNextSignIn = $true; ForceChangePasswordNextSignInWithMfa = $true; Password = $UserDefaultPassword }
         $User = New-MgUser `
             -DisplayName $UserName `
             -MailNickname $UserName `
