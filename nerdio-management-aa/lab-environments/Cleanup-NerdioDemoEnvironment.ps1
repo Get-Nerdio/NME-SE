@@ -726,8 +726,8 @@ AppTraces
 | mv-expand TaskResultArray
 | where TaskResultArray.type == 0
 | extend PayloadStr = tostring(TaskResultArray.payload)
-| extend StorageAccountName = extract("^StorageAccountName: (.+)$", 1, PayloadStr)
-| extend StorageRg = extract("^ResourceGroupName: (.+)$", 1, PayloadStr)
+| extend StorageAccountName = extract("^StorageAccountName: ([^\",]+)", 1, PayloadStr)
+| extend StorageRg = extract("^ResourceGroupName: ([^\",]+)", 1, PayloadStr)
 | summarize StorageAccountName = max(StorageAccountName), StorageRg = max(StorageRg) by TaskId = tostring(Props.TaskId)
 | where isnotempty(StorageAccountName) and isnotempty(StorageRg)
 | distinct StorageAccountName, StorageRg
