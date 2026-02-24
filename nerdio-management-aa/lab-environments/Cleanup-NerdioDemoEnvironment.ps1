@@ -6,9 +6,9 @@
 .DESCRIPTION
   This runbook removes resources created by New-NerdioDemoEnvironment.ps1 and by demo users:
   1. Queries NME analytics LAW to discover resources created by demo users
-  2. Revokes sign-in sessions and deletes demo users from Entra ID
-     (done first to immediately invalidate tokens and prevent new resource creation)
-  3. Removes RBAC assignments and orphaned custom role definitions from the NME database
+  2. Clears RBAC workspace assignments via the NME API (must happen before user deletion),
+     then revokes sign-in sessions and deletes demo users from Entra ID
+  3. Cleans up any orphaned RBAC data from the NME SQL database
   4. Removes host pools created by demo users (via NME API)
   5. Removes FSLogix profiles created by demo users
   6. Removes auto-scale profiles created by demo users
@@ -294,23 +294,37 @@ AppTraces
         Write-Log "No activity found in LAW for demo users."
     }
 
-    # Find host pools from UpdateDynamicScaleSettings request paths
-    # Path format: /api/arm/hostpool/dynamic/{subscriptionId}/{resourceGroup}/{hostPoolName}
+    # Find host pools from CreateHostPool and UpdateDynamicScaleSettings request paths
+    # CreateHostPool path: /api/arm/workspace/{sub}/{rg}/{ws}/hostpool/dynamic
+    #   -> host pool name is in the "Create host pool" task result
+    # UpdateDynamicScaleSettings path: /api/arm/hostpool/dynamic/{sub}/{rg}/{hostPoolName}
     $hpQuery = @"
 AppTraces
 | extend Props = parse_json(Properties)
 | where Props.Username in ($upnFilter)
 | where Props.TaskStatus == "Success"
-| where Props.JobType == "UpdateDynamicScaleSettings"
+| where Props.JobType in ("CreateHostPool", "UpdateDynamicScaleSettings")
 | extend RequestPath = tostring(Props.RequestPath)
-| parse RequestPath with "/api/arm/hostpool/dynamic/" HostPoolSub "/" HostPoolRg "/" HostPoolName
+| extend TaskResultRaw = tostring(Props.TaskResult)
+| extend TaskName = tostring(Props.TaskName)
+| extend TaskResultArray = parse_json(TaskResultRaw)
+| mv-expand TaskResultArray
+| extend PayloadStr = tostring(TaskResultArray.payload)
+| where PayloadStr contains "/hostPools/" or RequestPath contains "/hostpool/dynamic/"
+| extend HpFromPayload = extract("/hostPools/([^/\"]+)", 1, PayloadStr)
+| extend RgFromPayload = extract("/resourceGroups/([^/\"]+)", 1, PayloadStr)
+| extend SubFromPayload = extract("/subscriptions/([^/\"]+)", 1, PayloadStr)
+| parse RequestPath with "/api/arm/hostpool/dynamic/" HpSubFromPath "/" HpRgFromPath "/" HpNameFromPath
+| extend HostPoolName = coalesce(HpFromPayload, HpNameFromPath)
+| extend HostPoolRg = coalesce(RgFromPayload, HpRgFromPath)
+| extend HostPoolSub = coalesce(SubFromPayload, HpSubFromPath)
 | where isnotempty(HostPoolName)
 | distinct HostPoolSub, HostPoolRg, HostPoolName
 "@
 
     $hpResult = Invoke-AzOperationalInsightsQuery -WorkspaceId $LawWorkspaceId -Query $hpQuery -ErrorAction SilentlyContinue
     if ($hpResult.Results) {
-        $discoveredHostPools = $hpResult.Results
+        $discoveredHostPools = @($hpResult.Results)
         Write-Log "Discovered $($discoveredHostPools.Count) host pool(s) from LAW."
     }
 
@@ -334,9 +348,34 @@ AppTraces
 
 #endregion
 
-#region 2. Remove Entra ID users to revoke NME access
+#region 2. Clear RBAC workspace assignments and remove Entra ID users
 
-# Delete demo users from Entra ID first to invalidate their sessions and prevent them
+# Clear RBAC workspace assignments via the NME API BEFORE deleting users from Entra ID.
+# Set-NmeRbacRolesAssignment uses PUT to overwrite (not append), so sending an empty
+# AvdWorkspaces array removes all workspace-scoped access for the user.
+# This must happen while the user still exists in Entra ID.
+$rbacAssignmentsCleared = 0
+if ($Users) {
+    Write-Log "Clearing RBAC workspace assignments for $($Users.Count) demo user(s)..."
+
+    # Build an empty assignment model to overwrite each user's workspace access
+    $EmptyRbacAssignment = New-Object -TypeName psobject -Property @{ AvdWorkspaces = @() }
+    $EmptyRbacAssignment.PSObject.TypeNames.Insert(0, 'NmeRbacAssignmentUpdateRestModel')
+
+    foreach ($user in $Users) {
+        try {
+            Set-NmeRbacRolesAssignment -ObjectId $user.Id -NmeRbacAssignmentUpdateRestModel $EmptyRbacAssignment -ErrorAction Stop | Out-Null
+            Write-Log "Cleared RBAC workspace assignments for $($user.UserPrincipalName)."
+            $rbacAssignmentsCleared++
+        } catch {
+            Write-Log "Failed to clear RBAC assignments for $($user.UserPrincipalName): $($_.Exception.Message)" 'WARN'
+            $errors++
+        }
+    }
+    Write-Log "Cleared RBAC workspace assignments for $rbacAssignmentsCleared of $($Users.Count) user(s)."
+}
+
+# Delete demo users from Entra ID to invalidate their sessions and prevent them
 # from creating new resources while cleanup is in progress. Revoking sign-in sessions
 # before deletion ensures refresh tokens are immediately invalidated.
 if ($Users) {
@@ -363,48 +402,53 @@ if ($Users) {
 
 #endregion
 
-#region 3. Remove RBAC assignments and orphaned role definitions
+#region 3. Clean up orphaned RBAC data from SQL
 
+# Safety net: remove any residual RBAC data from the NME database.
+# The API call in region 2 handles workspace-scoped assignments, but custom role
+# definitions or SQL-backed assignments may also need cleanup.
 if ($Users) {
-    Write-Log "Cleaning up RBAC assignments and custom role definitions for demo users..."
-
-    # First, collect the RoleIds assigned to demo users so we can clean up custom role definitions afterward
+    # Collect RoleIds assigned to demo users
     $demoRoleIds = @()
     foreach ($user in $Users) {
         try {
-            $roleIdQuery = "SELECT RoleId FROM RoleAssignments WHERE PrincipalId = @PrincipalId"
-            $roleIdResult = Invoke-NmeSql -Connection $SqlConnection -Query $roleIdQuery -Parameters @{ '@PrincipalId' = $user.Id } -AsDataTable
+            $roleIdResult = Invoke-NmeSql -Connection $SqlConnection `
+                -Query "SELECT RoleId FROM RoleAssignments WHERE PrincipalId = @PrincipalId" `
+                -Parameters @{ '@PrincipalId' = $user.Id } -AsDataTable
             foreach ($row in $roleIdResult.Rows) {
                 $demoRoleIds += $row.RoleId
             }
         } catch {
-            Write-Log "Failed to query RBAC assignments for $($user.UserPrincipalName): $($_.Exception.Message)" 'WARN'
+            # Table may be empty or not contain entries for these users - that's expected
         }
     }
     $demoRoleIds = $demoRoleIds | Sort-Object -Unique
 
-    # Delete the RBAC assignments
+    # Delete any SQL-backed RBAC assignments for demo users
     foreach ($user in $Users) {
         try {
-            $rbacQuery = "DELETE FROM RoleAssignments WHERE PrincipalId = @PrincipalId"
-            $rowsDeleted = Invoke-NmeSql -Connection $SqlConnection -Query $rbacQuery -Parameters @{ '@PrincipalId' = $user.Id }
+            $rowsDeleted = Invoke-NmeSql -Connection $SqlConnection `
+                -Query "DELETE FROM RoleAssignments WHERE PrincipalId = @PrincipalId" `
+                -Parameters @{ '@PrincipalId' = $user.Id }
             if ($rowsDeleted -gt 0) {
-                Write-Log "Removed $rowsDeleted RBAC assignment(s) for $($user.UserPrincipalName)."
+                Write-Log "Removed $rowsDeleted SQL RBAC assignment(s) for $($user.UserPrincipalName)."
                 $dbResourcesRemoved += $rowsDeleted
             }
         } catch {
-            Write-Log "Failed to remove RBAC assignments for $($user.UserPrincipalName): $($_.Exception.Message)" 'WARN'
-            $errors++
+            Write-Log "Failed to remove SQL RBAC assignments for $($user.UserPrincipalName): $($_.Exception.Message)" 'WARN'
         }
     }
 
-    # Delete custom role definitions that were assigned to demo users and are now orphaned
+    # Delete orphaned custom role definitions
     foreach ($roleId in $demoRoleIds) {
         try {
-            # Only delete if no other assignments reference this role
-            $refCheck = Invoke-NmeSql -Connection $SqlConnection -Query "SELECT COUNT(*) AS Cnt FROM RoleAssignments WHERE RoleId = @RoleId" -Parameters @{ '@RoleId' = $roleId } -AsDataTable
+            $refCheck = Invoke-NmeSql -Connection $SqlConnection `
+                -Query "SELECT COUNT(*) AS Cnt FROM RoleAssignments WHERE RoleId = @RoleId" `
+                -Parameters @{ '@RoleId' = $roleId } -AsDataTable
             if ($refCheck.Rows[0].Cnt -eq 0) {
-                $rowsDeleted = Invoke-NmeSql -Connection $SqlConnection -Query "DELETE FROM RoleDefinitions WHERE Id = @RoleId" -Parameters @{ '@RoleId' = $roleId }
+                $rowsDeleted = Invoke-NmeSql -Connection $SqlConnection `
+                    -Query "DELETE FROM RoleDefinitions WHERE Id = @RoleId" `
+                    -Parameters @{ '@RoleId' = $roleId }
                 if ($rowsDeleted -gt 0) {
                     Write-Log "Removed orphaned RBAC role definition (Id: $roleId)."
                     $dbResourcesRemoved++
@@ -412,7 +456,6 @@ if ($Users) {
             }
         } catch {
             Write-Log "Failed to remove RBAC role definition (Id: $roleId): $($_.Exception.Message)" 'WARN'
-            $errors++
         }
     }
 }
@@ -919,9 +962,24 @@ AppTraces
 
 $sqlCleanupTypes = @(
     @{ JobType = 'CreateActiveDirectoryConfig';            NameField = 'FriendlyName'
-       ParseQuery = Build-ChangelogNameQuery 'CreateActiveDirectoryConfig' 'FriendlyName' }
+       ParseQuery = @"
+AppTraces
+| extend Props = parse_json(Properties)
+| where Props.Username in ($upnFilter)
+| where Props.TaskStatus == "Success"
+| where Props.JobType == "CreateActiveDirectoryConfig"
+| extend TaskResultRaw = tostring(Props.TaskResult)
+| extend TaskResultArray = parse_json(TaskResultRaw)
+| mv-expand TaskResultArray
+| where TaskResultArray.type == 5
+| extend Payload = parse_json(tostring(TaskResultArray.payload))
+| extend ConfigJson = parse_json(tostring(Payload.message))
+| extend ResourceName = tostring(ConfigJson.friendlyName)
+| where isnotempty(ResourceName)
+| distinct ResourceName
+"@ }
     @{ JobType = 'CreateRdpPropertiesConfig';              NameField = 'Name'
-       ParseQuery = Build-ChangelogNameQuery 'CreateRdpPropertiesConfig' 'Name' }
+       SqlFallback = $true }
     @{ JobType = 'CreateHostPoolScriptedActionsProfile';   NameField = 'Name'
        ParseQuery = Build-ChangelogNameQuery 'CreateHostPoolScriptedActionsProfile' 'Name' }
     @{ JobType = 'CreateHostPoolCapacityExtenderProfile';  NameField = 'Name'
@@ -985,16 +1043,42 @@ foreach ($cleanupType in $sqlCleanupTypes) {
 
     Write-Log "Checking for $jobType resources created by demo users..."
 
-    $lawResult = Invoke-AzOperationalInsightsQuery -WorkspaceId $LawWorkspaceId -Query $cleanupType.ParseQuery -ErrorAction SilentlyContinue
-    if (-not $lawResult.Results) {
-        Write-Log "No $jobType resources found in LAW."
+    $mapEntry = $sqlCleanupMap[$jobType]
+    $resourceNames = @()
+
+    if ($cleanupType.SqlFallback) {
+        # Some job types don't include the resource name in LAW logs.
+        # Fall back to querying the NME ProvisionJob table by demo user ID and job description.
+        $jobQuery = "SELECT DISTINCT Resources FROM ProvisionJob WHERE UserId IN (SELECT Id FROM JobUser WHERE Username IN ({0})) AND JobType = @JobType AND Resources IS NOT NULL AND Resources <> ''"
+        $upnParams = @{}
+        $upnPlaceholders = @()
+        for ($u = 0; $u -lt $userUpns.Count; $u++) {
+            $upnParams["@upn$u"] = $userUpns[$u]
+            $upnPlaceholders += "@upn$u"
+        }
+        $jobQuery = $jobQuery -f ($upnPlaceholders -join ', ')
+        $upnParams['@JobType'] = switch ($jobType) {
+            'CreateRdpPropertiesConfig' { 2800 }
+        }
+        $jobResult = Invoke-NmeSql -Connection $SqlConnection -Query $jobQuery -Parameters $upnParams -AsDataTable
+        foreach ($row in $jobResult.Rows) {
+            $resourceNames += $row.Resources
+        }
+    } else {
+        $lawResult = Invoke-AzOperationalInsightsQuery -WorkspaceId $LawWorkspaceId -Query $cleanupType.ParseQuery -ErrorAction SilentlyContinue
+        if ($lawResult.Results) {
+            foreach ($row in $lawResult.Results) {
+                $resourceNames += $row.ResourceName
+            }
+        }
+    }
+
+    if ($resourceNames.Count -eq 0) {
+        Write-Log "No $jobType resources found."
         continue
     }
 
-    $mapEntry = $sqlCleanupMap[$jobType]
-
-    foreach ($row in $lawResult.Results) {
-        $resourceName = $row.ResourceName
+    foreach ($resourceName in $resourceNames) {
         try {
             # Run pre-cleanup to remove FK references
             foreach ($preQuery in $mapEntry.PreCleanup) {
@@ -1051,6 +1135,7 @@ if ($SqlConnection -and $SqlConnection.State -eq 'Open') {
 Write-Log ""
 Write-Log "=== CLEANUP COMPLETED ==="
 Write-Log "Environment:          $EnvironmentName"
+Write-Log "RBAC assignments:     $rbacAssignmentsCleared cleared"
 Write-Log "Host pools removed:   $hostPoolsRemoved"
 Write-Log "FSLogix profiles:     $fslProfilesRemoved"
 Write-Log "Auto-scale profiles:  $asProfilesRemoved"
