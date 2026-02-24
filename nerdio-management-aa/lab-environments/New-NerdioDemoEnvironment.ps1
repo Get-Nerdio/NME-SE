@@ -8,6 +8,7 @@
   2. Creates Entra ID users with a default password (skips existing users)
   3. Assigns users to the workspace with the WVD Admin role (skips if already assigned)
   4. Schedules the Cleanup-NerdioDemoEnvironment runbook
+  5. Sends a welcome email with login credentials via SendGrid (if DestEmailAddress is provided)
 
   This script is idempotent. Running it again with the same parameters will
   skip already-completed steps and finish any remaining work. If UserCount is
@@ -36,6 +37,9 @@
 .PARAMETER VariablePrefix
   Prefix for automation account variables. Defaults to 'CustomerDemo'.
 
+.PARAMETER DestEmailAddress
+  Email address to send the welcome email with login credentials. If not specified, no email is sent.
+
 .EXAMPLE
   .\New-NerdioDemoEnvironment.ps1 -CustomerAbbreviation 'ACME' -UserCount 5
   .\New-NerdioDemoEnvironment.ps1 -CustomerAbbreviation 'CNTO' -UserCount 3 -VariablePrefix 'Prod'
@@ -49,7 +53,8 @@ param(
     [string]$AzureRegion = 'centralus',
     [Parameter(Mandatory=$true)][datetime]$DestroyOnUTC,
     [bool]$UpdateExistingDemoEnv = $false,
-    [string]$VariablePrefix = 'CustomerDemo'
+    [string]$VariablePrefix = 'CustomerDemo',
+    [string]$DestEmailAddress
 )
 
 $ErrorActionPreference = 'Stop'
@@ -306,5 +311,92 @@ Write-Log "Users can login at $NmeUri using the default password: $UserDefaultPa
 Write-Log "They will be prompted to register for MFA."
 Write-Log ""
 Write-Log "WARNING: This demo environment will be cleaned up on $DestroyOnUTC (UTC)."
+
+#endregion
+
+#region 5. Send welcome email via SendGrid
+
+if ($DestEmailAddress) {
+    Write-Log "Sending welcome email to $DestEmailAddress..."
+
+    $SendGridApiKey = Get-AutomationVariable -Name 'SendGridKey'
+    $fromEmailAddress = 'team@nerdio.net'
+
+    # Build user credentials list
+    $userList = ""
+    foreach ($upn in $UserUpns) {
+        $userList += "  Username: $upn`n  Password: $UserDefaultPassword`n`n"
+    }
+
+    $content = @"
+Hi there!
+
+Welcome to Nerdio Manager! Your demo environment is ready and waiting for you.
+
+Here are your login credentials:
+
+$userList
+Login URL: $NmeUri
+
+You'll be prompted to set a new password and register for MFA on your first sign-in.
+
+To help you get started, here are some recommended first steps:
+
+1. Create your first desktop image
+   - Desktop Images overview: https://nmehelp.getnerdio.com/hc/en-us/articles/26124301690637-Desktop-Images
+   - Set as image: https://nmehelp.getnerdio.com/hc/en-us/articles/26124381963149-Desktop-images-set-as-image
+
+2. Create a host pool
+   - Host pools overview: https://nmehelp.getnerdio.com/hc/en-us/articles/26124329605517-Overview-of-host-pools
+   - Resize and re-image a host pool: https://nmehelp.getnerdio.com/hc/en-us/articles/26124319282061-Resize-re-image-a-host-pool
+
+3. Enable Auto-scale
+   - Dynamic host pool auto-scaling: https://nmehelp.getnerdio.com/hc/en-us/articles/26124304193037-Enable-dynamic-host-pool-Auto-scaling
+
+If you have any questions, don't hesitate to reach out. We're excited to have you on board!
+
+Best regards,
+The Nerdio Team
+"@
+
+    $subject = "Welcome to Nerdio Manager - Your Demo Environment is Ready!"
+
+    $headers = New-Object "System.Collections.Generic.Dictionary[[String],[String]]"
+    $headers.Add("Authorization", "Bearer $SendGridApiKey")
+    $headers.Add("Content-Type", "application/json")
+
+    $body = @{
+        personalizations = @(
+            @{
+                to = @(
+                    @{
+                        email = $DestEmailAddress
+                    }
+                )
+            }
+        )
+        from = @{
+            email = $fromEmailAddress
+        }
+        subject = $subject
+        content = @(
+            @{
+                type  = "text/plain"
+                value = $content
+            }
+        )
+    }
+
+    $bodyJson = $body | ConvertTo-Json -Depth 4
+
+    try {
+        Invoke-RestMethod -Uri https://api.sendgrid.com/v3/mail/send -Method Post -Headers $headers -Body $bodyJson
+        Write-Log "Welcome email sent to $DestEmailAddress."
+    } catch {
+        Write-Log "Failed to send welcome email: $($_.Exception.Message)" 'WARN'
+    }
+} else {
+    Write-Log "No DestEmailAddress specified, skipping welcome email."
+}
 
 #endregion
