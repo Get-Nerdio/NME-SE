@@ -371,7 +371,7 @@ $userRows
         </li>
     </ol>
 
-    <p>If you have any questions, don't hesitate to reach out. We're excited to have you on board!</p>
+    <p>If you have any questions, don't hesitate to reach out. We're excited for you to explore the power of Nerdio Manager for Enterprise.</p>
 
     <p>Best regards,<br>The Nerdio Team</p>
 </body>
