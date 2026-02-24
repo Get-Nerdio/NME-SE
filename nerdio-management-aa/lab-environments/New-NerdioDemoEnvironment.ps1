@@ -47,7 +47,7 @@
 
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory=$true)][ValidatePattern('^[a-zA-Z0-9]{2,4}$')][string]$CustomerAbbreviation,
+    [Parameter(Mandatory=$true)][ValidatePattern('^[a-zA-Z0-9]{2,8}$')][string]$CustomerAbbreviation,
     [Parameter(Mandatory=$true)][int]$UserCount,
     [string]$UserDefaultPassword = 'Nerdio123!',
     [string]$AzureRegion = 'centralus',
