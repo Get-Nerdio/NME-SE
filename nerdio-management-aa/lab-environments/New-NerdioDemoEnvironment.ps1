@@ -144,7 +144,7 @@ if ($null -eq $Workspace) {
     $WorkspaceRequest = New-NmeCreateWorkspaceRequest `
         -id (New-NmeWvdObjectId -subscriptionId $SubscriptionId -resourceGroup $ResourceGroupName -name $NewWorkspaceName) `
         -location $AzureRegion `
-        -friendlyName "Demo Workspace" `
+        -friendlyName "$NewWorkspaceName" `
         -description "Workspace for demo $EnvironmentName" `
         -tags @{ DestroyAfter = $DestroyOnUTC.ToString('o') }
     $WorkspaceResult = New-NmeWorkspace -NmeCreateWorkspaceRequest $WorkspaceRequest
