@@ -12,13 +12,13 @@
   5. Removes app management policies created by demo users
   6. Removes scripted actions created by demo users (via NME API)
   7. Removes desktop image VMs created by demo users (Azure VM, NIC, OS disk)
-  8. Removes the NME workspace
-  9. Removes RBAC assignments for demo users from the NME database
-  10. Removes the Entra ID users (identified by CompanyName matching the environment name)
-  11. Removes resources without API removal functions directly from the NME database:
+  8. Removes storage accounts and temp VMs created by demo users (Azure)
+  9. Removes the NME workspace and any additional workspaces created by demo users
+  10. Removes RBAC assignments and orphaned custom role definitions for demo users
+  11. Removes the Entra ID users (identified by CompanyName matching the environment name)
+  12. Removes resources without API removal functions directly from the NME database:
       AD configs, RDP properties configs, scripted actions profiles,
-      capacity extender profiles, deployment models, shell apps, custom views,
-      desktop images, RBAC role definitions
+      capacity extender profiles, deployment models, shell apps, custom views
 
 .PARAMETER CustomerAbbreviation
   Short customer abbreviation used when the demo environment was created.
@@ -196,9 +196,10 @@ $asProfilesRemoved = 0
 $appPoliciesRemoved = 0
 $scriptedActionsRemoved = 0
 $desktopImagesRemoved = 0
+$storageAccountsRemoved = 0
 $dbResourcesRemoved = 0
 $usersRemoved = 0
-$workspaceRemoved = $false
+$workspacesRemoved = 0
 $errors = 0
 
 #region 1. Query LAW for resources created by demo users
@@ -571,15 +572,126 @@ AppTraces
 
 #endregion
 
-#region 8. Remove workspace
+#region 8. Remove storage accounts created by demo users
 
+if ($discoveredJobTypes | Where-Object { $_.JobType -eq 'AddFileShare' }) {
+    Write-Log "Checking for storage accounts created by demo users..."
+    $storQuery = @"
+AppTraces
+| extend Props = parse_json(Properties)
+| where Props.Username in ($upnFilter)
+| where Props.TaskStatus == "Success"
+| where Props.JobType == "AddFileShare"
+| where Props.TaskName startswith "Create Storage Account:"
+| extend TaskResultRaw = tostring(Props.TaskResult)
+| extend TaskResultArray = parse_json(TaskResultRaw)
+| mv-expand TaskResultArray
+| where TaskResultArray.type == 0
+| extend PayloadStr = tostring(TaskResultArray.payload)
+| summarize Payloads = make_list(PayloadStr) by TaskId = tostring(Props.TaskId)
+| extend StorageAccountName = extract("StorageAccountName: (.+)", 1, tostring(Payloads))
+| extend StorageRg = extract("ResourceGroupName: (.+)", 1, tostring(Payloads))
+| where isnotempty(StorageAccountName) and isnotempty(StorageRg)
+| distinct StorageAccountName, StorageRg
+"@
+
+    $storResult = Invoke-AzOperationalInsightsQuery -WorkspaceId $LawWorkspaceId -Query $storQuery -ErrorAction SilentlyContinue
+    if ($storResult.Results) {
+        foreach ($storRow in $storResult.Results) {
+            $saName = $storRow.StorageAccountName
+            $saRg = $storRow.StorageRg
+
+            try {
+                Write-Log "Removing storage account '$saName' in $saRg..."
+                Remove-AzStorageAccount -ResourceGroupName $saRg -Name $saName -Force -ErrorAction Stop
+                Write-Log "Storage account '$saName' removed."
+                $storageAccountsRemoved++
+            } catch {
+                Write-Log "Failed to remove storage account '$saName': $($_.Exception.Message)" 'WARN'
+                $errors++
+            }
+        }
+    }
+
+    # Also remove temp VMs and NICs created during AddFileShare jobs
+    $storNicQuery = @"
+AppTraces
+| extend Props = parse_json(Properties)
+| where Props.Username in ($upnFilter)
+| where Props.TaskStatus == "Success"
+| where Props.JobType == "AddFileShare"
+| where Props.TaskName == "Create network interface"
+| extend TaskResultRaw = tostring(Props.TaskResult)
+| extend TaskResultArray = parse_json(TaskResultRaw)
+| mv-expand TaskResultArray
+| where TaskResultArray.type == 0
+| extend NicResourceId = tostring(TaskResultArray.payload)
+| where NicResourceId contains "/networkInterfaces/"
+| parse NicResourceId with "/subscriptions/" NicSub "/resourceGroups/" NicRg "/providers/Microsoft.Network/networkInterfaces/" NicName
+| extend VmName = replace_string(NicName, "-nic", "")
+| where isnotempty(VmName)
+| distinct NicSub, NicRg, VmName, NicName
+"@
+
+    $storNicResult = Invoke-AzOperationalInsightsQuery -WorkspaceId $LawWorkspaceId -Query $storNicQuery -ErrorAction SilentlyContinue
+    if ($storNicResult.Results) {
+        foreach ($nicRow in $storNicResult.Results) {
+            $vmName = $nicRow.VmName
+            $nicName = $nicRow.NicName
+            $nicRg = $nicRow.NicRg
+
+            # Remove the temp VM
+            try {
+                Write-Log "Removing temp VM '$vmName' in $nicRg (from AddFileShare)..."
+                Remove-AzVM -ResourceGroupName $nicRg -Name $vmName -ForceDeletion $true -Force -ErrorAction Stop | Out-Null
+                Write-Log "Temp VM '$vmName' removed."
+            } catch {
+                if ($_.Exception.Message -notmatch 'not found|could not be found') {
+                    Write-Log "Failed to remove temp VM '$vmName': $($_.Exception.Message)" 'WARN'
+                    $errors++
+                }
+            }
+
+            # Remove the NIC
+            try {
+                Write-Log "Removing NIC '$nicName' in $nicRg..."
+                Remove-AzNetworkInterface -ResourceGroupName $nicRg -Name $nicName -Force -ErrorAction Stop | Out-Null
+                Write-Log "NIC '$nicName' removed."
+            } catch {
+                if ($_.Exception.Message -notmatch 'not found|could not be found') {
+                    Write-Log "Failed to remove NIC '$nicName': $($_.Exception.Message)" 'WARN'
+                    $errors++
+                }
+            }
+
+            # Remove the OS disk
+            try {
+                $osDisk = Get-AzDisk -ResourceGroupName $nicRg -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "$vmName*" }
+                foreach ($disk in $osDisk) {
+                    Write-Log "Removing OS disk '$($disk.Name)' in $nicRg..."
+                    Remove-AzDisk -ResourceGroupName $nicRg -DiskName $disk.Name -Force -ErrorAction Stop | Out-Null
+                    Write-Log "OS disk '$($disk.Name)' removed."
+                }
+            } catch {
+                Write-Log "Failed to remove OS disk for '$vmName': $($_.Exception.Message)" 'WARN'
+                $errors++
+            }
+        }
+    }
+}
+
+#endregion
+
+#region 9. Remove workspaces
+
+# Remove the workspace we created for the demo environment
 $Workspace = Get-NmeWorkspace -ErrorAction SilentlyContinue | Where-Object { $_.id.name -eq $NewWorkspaceName }
 if ($null -ne $Workspace) {
     try {
         Write-Log "Removing workspace $NewWorkspaceName..."
         Remove-AzWvdWorkspace -ResourceGroupName $Workspace.id.resourceGroup -Name $Workspace.id.name -SubscriptionId $Workspace.id.subscriptionId -ErrorAction Stop
         Write-Log "Workspace $NewWorkspaceName removed."
-        $workspaceRemoved = $true
+        $workspacesRemoved++
     } catch {
         Write-Log "Failed to remove workspace $NewWorkspaceName`: $($_.Exception.Message)" 'WARN'
         $errors++
@@ -588,16 +700,78 @@ if ($null -ne $Workspace) {
     Write-Log "Workspace $NewWorkspaceName not found."
 }
 
+# Also remove any additional workspaces created by demo users
+if ($discoveredJobTypes | Where-Object { $_.JobType -eq 'CreateWorkspace' }) {
+    Write-Log "Checking for additional workspaces created by demo users..."
+    $wsQuery = @"
+AppTraces
+| extend Props = parse_json(Properties)
+| where Props.Username in ($upnFilter)
+| where Props.TaskStatus == "Success"
+| where Props.JobType == "CreateWorkspace"
+| where Props.TaskName == "Create workspace"
+| extend TaskResultRaw = tostring(Props.TaskResult)
+| extend TaskResultArray = parse_json(TaskResultRaw)
+| mv-expand TaskResultArray
+| where TaskResultArray.type == 0
+| extend PayloadStr = tostring(TaskResultArray.payload)
+| where PayloadStr startswith "Name: "
+| extend WsName = substring(PayloadStr, 6)
+| where isnotempty(WsName)
+| distinct WsName
+"@
+
+    $wsResult = Invoke-AzOperationalInsightsQuery -WorkspaceId $LawWorkspaceId -Query $wsQuery -ErrorAction SilentlyContinue
+    if ($wsResult.Results) {
+        $allWorkspaces = Get-NmeWorkspace -ErrorAction SilentlyContinue
+        foreach ($wsRow in $wsResult.Results) {
+            $wsName = $wsRow.WsName
+            if ($wsName -eq $NewWorkspaceName) { continue } # Already handled above
+            $matchingWs = $allWorkspaces | Where-Object { $_.id.name -eq $wsName }
+            if ($matchingWs) {
+                try {
+                    Write-Log "Removing workspace '$wsName' created by demo user..."
+                    Remove-AzWvdWorkspace -ResourceGroupName $matchingWs.id.resourceGroup -Name $matchingWs.id.name -SubscriptionId $matchingWs.id.subscriptionId -ErrorAction Stop
+                    Write-Log "Workspace '$wsName' removed."
+                    $workspacesRemoved++
+                } catch {
+                    Write-Log "Failed to remove workspace '$wsName': $($_.Exception.Message)" 'WARN'
+                    $errors++
+                }
+            } else {
+                Write-Log "Workspace '$wsName' not found (may have been removed already)."
+            }
+        }
+    }
+}
+
 #endregion
 
-#region 9. Remove RBAC assignments for demo users
+#region 10. Remove RBAC assignments for demo users
 
 if ($Users) {
-    Write-Log "Removing RBAC assignments for demo users from NME database..."
+    Write-Log "Removing RBAC assignments and custom role definitions for demo users..."
+
+    # First, collect the RoleIds assigned to demo users so we can clean up custom role definitions afterward
+    $demoRoleIds = @()
     foreach ($user in $Users) {
         try {
-            $rbacQuery = "DELETE FROM RbacAssignments WHERE ObjectId = @ObjectId"
-            $rowsDeleted = Invoke-NmeSql -Connection $SqlConnection -Query $rbacQuery -Parameters @{ '@ObjectId' = $user.Id }
+            $roleIdQuery = "SELECT RoleId FROM RoleAssignments WHERE PrincipalId = @PrincipalId"
+            $roleIdResult = Invoke-NmeSql -Connection $SqlConnection -Query $roleIdQuery -Parameters @{ '@PrincipalId' = $user.Id } -AsDataTable
+            foreach ($row in $roleIdResult.Rows) {
+                $demoRoleIds += $row.RoleId
+            }
+        } catch {
+            Write-Log "Failed to query RBAC assignments for $($user.UserPrincipalName): $($_.Exception.Message)" 'WARN'
+        }
+    }
+    $demoRoleIds = $demoRoleIds | Sort-Object -Unique
+
+    # Delete the RBAC assignments
+    foreach ($user in $Users) {
+        try {
+            $rbacQuery = "DELETE FROM RoleAssignments WHERE PrincipalId = @PrincipalId"
+            $rowsDeleted = Invoke-NmeSql -Connection $SqlConnection -Query $rbacQuery -Parameters @{ '@PrincipalId' = $user.Id }
             if ($rowsDeleted -gt 0) {
                 Write-Log "Removed $rowsDeleted RBAC assignment(s) for $($user.UserPrincipalName)."
                 $dbResourcesRemoved += $rowsDeleted
@@ -607,11 +781,29 @@ if ($Users) {
             $errors++
         }
     }
+
+    # Delete custom role definitions that were assigned to demo users and are now orphaned
+    foreach ($roleId in $demoRoleIds) {
+        try {
+            # Only delete if no other assignments reference this role
+            $refCheck = Invoke-NmeSql -Connection $SqlConnection -Query "SELECT COUNT(*) AS Cnt FROM RoleAssignments WHERE RoleId = @RoleId" -Parameters @{ '@RoleId' = $roleId } -AsDataTable
+            if ($refCheck.Rows[0].Cnt -eq 0) {
+                $rowsDeleted = Invoke-NmeSql -Connection $SqlConnection -Query "DELETE FROM RoleDefinitions WHERE Id = @RoleId" -Parameters @{ '@RoleId' = $roleId }
+                if ($rowsDeleted -gt 0) {
+                    Write-Log "Removed orphaned RBAC role definition (Id: $roleId)."
+                    $dbResourcesRemoved++
+                }
+            }
+        } catch {
+            Write-Log "Failed to remove RBAC role definition (Id: $roleId): $($_.Exception.Message)" 'WARN'
+            $errors++
+        }
+    }
 }
 
 #endregion
 
-#region 10. Remove users from Entra ID
+#region 11. Remove users from Entra ID
 
 if ($Users) {
     Write-Log "Found $($Users.Count) user(s) with CompanyName '$EnvironmentName'."
@@ -631,140 +823,48 @@ if ($Users) {
 
 #endregion
 
-#region 11. Remove resources via direct SQL (no API removal function)
+#region 12. Remove resources via direct SQL (no API removal function)
 
 # Map of JobType to the LAW query that extracts the resource name and the SQL cleanup logic
+# Helper: builds a LAW query to extract a resource name from changelog-format TaskResult messages.
+# The message format is "FieldName: none -> value\r\n..." and we extract the value after " -> ".
+# $jobType: the JobType to filter on
+# $nameField: the field label in the changelog (e.g. "Name", "FriendlyName", "Template name")
+function Build-ChangelogNameQuery {
+    param([string]$jobType, [string]$nameField)
+    return @"
+AppTraces
+| extend Props = parse_json(Properties)
+| where Props.Username in ($upnFilter)
+| where Props.TaskStatus == "Success"
+| where Props.JobType == "$jobType"
+| extend TaskResultRaw = tostring(Props.TaskResult)
+| extend TaskResultArray = parse_json(TaskResultRaw)
+| mv-expand TaskResultArray
+| where TaskResultArray.type == 5
+| extend Payload = parse_json(tostring(TaskResultArray.payload))
+| extend Message = tostring(Payload.message)
+| extend ResourceName = extract("(?:^|\\r\\n)${nameField}: (?:none -> )?(.+?)(?:\\r\\n|`$)", 1, Message)
+| where isnotempty(ResourceName)
+| distinct ResourceName
+"@
+}
+
 $sqlCleanupTypes = @(
-    @{ JobType = 'CreateActiveDirectoryConfig';            NameField = 'FriendlyName'; ParseQuery = @"
-AppTraces
-| extend Props = parse_json(Properties)
-| where Props.Username in ($upnFilter)
-| where Props.TaskStatus == "Success"
-| where Props.JobType == "CreateActiveDirectoryConfig"
-| extend TaskResultRaw = tostring(Props.TaskResult)
-| extend TaskResultArray = parse_json(TaskResultRaw)
-| mv-expand TaskResultArray
-| where TaskResultArray.type == 5
-| extend Payload = parse_json(tostring(TaskResultArray.payload))
-| extend ConfigJson = parse_json(tostring(Payload.message))
-| extend ResourceName = tostring(ConfigJson.friendlyName)
-| where isnotempty(ResourceName)
-| distinct ResourceName
-"@ }
-    @{ JobType = 'CreateRdpPropertiesConfig';              NameField = 'Name'; ParseQuery = @"
-AppTraces
-| extend Props = parse_json(Properties)
-| where Props.Username in ($upnFilter)
-| where Props.TaskStatus == "Success"
-| where Props.JobType == "CreateRdpPropertiesConfig"
-| extend TaskResultRaw = tostring(Props.TaskResult)
-| extend TaskResultArray = parse_json(TaskResultRaw)
-| mv-expand TaskResultArray
-| where TaskResultArray.type == 5
-| extend Payload = parse_json(tostring(TaskResultArray.payload))
-| extend ConfigJson = parse_json(tostring(Payload.message))
-| extend ResourceName = tostring(ConfigJson.name)
-| where isnotempty(ResourceName)
-| distinct ResourceName
-"@ }
-    @{ JobType = 'CreateHostPoolScriptedActionsProfile';   NameField = 'Name'; ParseQuery = @"
-AppTraces
-| extend Props = parse_json(Properties)
-| where Props.Username in ($upnFilter)
-| where Props.TaskStatus == "Success"
-| where Props.JobType == "CreateHostPoolScriptedActionsProfile"
-| extend TaskResultRaw = tostring(Props.TaskResult)
-| extend TaskResultArray = parse_json(TaskResultRaw)
-| mv-expand TaskResultArray
-| where TaskResultArray.type == 5
-| extend Payload = parse_json(tostring(TaskResultArray.payload))
-| extend ConfigJson = parse_json(tostring(Payload.message))
-| extend ResourceName = tostring(ConfigJson.name)
-| where isnotempty(ResourceName)
-| distinct ResourceName
-"@ }
-    @{ JobType = 'CreateHostPoolCapacityExtenderProfile';  NameField = 'Name'; ParseQuery = @"
-AppTraces
-| extend Props = parse_json(Properties)
-| where Props.Username in ($upnFilter)
-| where Props.TaskStatus == "Success"
-| where Props.JobType == "CreateHostPoolCapacityExtenderProfile"
-| extend TaskResultRaw = tostring(Props.TaskResult)
-| extend TaskResultArray = parse_json(TaskResultRaw)
-| mv-expand TaskResultArray
-| where TaskResultArray.type == 5
-| extend Payload = parse_json(tostring(TaskResultArray.payload))
-| extend ConfigJson = parse_json(tostring(Payload.message))
-| extend ResourceName = tostring(ConfigJson.name)
-| where isnotempty(ResourceName)
-| distinct ResourceName
-"@ }
-    @{ JobType = 'CreateOrUpdateDeploymentModel';          NameField = 'Name'; ParseQuery = @"
-AppTraces
-| extend Props = parse_json(Properties)
-| where Props.Username in ($upnFilter)
-| where Props.TaskStatus == "Success"
-| where Props.JobType == "CreateOrUpdateDeploymentModel"
-| extend TaskResultRaw = tostring(Props.TaskResult)
-| extend TaskResultArray = parse_json(TaskResultRaw)
-| mv-expand TaskResultArray
-| where TaskResultArray.type == 5
-| extend Payload = parse_json(tostring(TaskResultArray.payload))
-| extend ConfigJson = parse_json(tostring(Payload.message))
-| extend ResourceName = tostring(ConfigJson.name)
-| where isnotempty(ResourceName)
-| distinct ResourceName
-"@ }
-    @{ JobType = 'CreateShellApp';                         NameField = 'Name'; ParseQuery = @"
-AppTraces
-| extend Props = parse_json(Properties)
-| where Props.Username in ($upnFilter)
-| where Props.TaskStatus == "Success"
-| where Props.JobType == "CreateShellApp"
-| extend TaskResultRaw = tostring(Props.TaskResult)
-| extend TaskResultArray = parse_json(TaskResultRaw)
-| mv-expand TaskResultArray
-| where TaskResultArray.type == 5
-| extend Payload = parse_json(tostring(TaskResultArray.payload))
-| extend ConfigJson = parse_json(tostring(Payload.message))
-| extend ResourceName = tostring(ConfigJson.name)
-| where isnotempty(ResourceName)
-| distinct ResourceName
-"@ }
-    @{ JobType = 'CreateCustomView';                       NameField = 'Name'; ParseQuery = @"
-AppTraces
-| extend Props = parse_json(Properties)
-| where Props.Username in ($upnFilter)
-| where Props.TaskStatus == "Success"
-| where Props.JobType == "CreateCustomView"
-| extend TaskResultRaw = tostring(Props.TaskResult)
-| extend TaskResultArray = parse_json(TaskResultRaw)
-| mv-expand TaskResultArray
-| where TaskResultArray.type == 5
-| extend Payload = parse_json(tostring(TaskResultArray.payload))
-| extend ConfigJson = parse_json(tostring(Payload.message))
-| extend ResourceName = tostring(ConfigJson.name)
-| where isnotempty(ResourceName)
-| distinct ResourceName
-"@ }
-    @{ JobType = 'CreateDesktopImage';                     NameField = 'Name'; ParseQuery = @"
-AppTraces
-| extend Props = parse_json(Properties)
-| where Props.Username in ($upnFilter)
-| where Props.TaskStatus == "Success"
-| where Props.JobType == "CreateDesktopImage"
-| where Props.TaskName == "Create network interface"
-| extend TaskResultRaw = tostring(Props.TaskResult)
-| extend TaskResultArray = parse_json(TaskResultRaw)
-| mv-expand TaskResultArray
-| where TaskResultArray.type == 0
-| extend NicResourceId = tostring(TaskResultArray.payload)
-| where NicResourceId contains "/networkInterfaces/"
-| parse NicResourceId with * "/networkInterfaces/" NicName
-| extend ResourceName = replace_string(NicName, "-nic", "")
-| where isnotempty(ResourceName)
-| distinct ResourceName
-"@ }
+    @{ JobType = 'CreateActiveDirectoryConfig';            NameField = 'FriendlyName'
+       ParseQuery = Build-ChangelogNameQuery 'CreateActiveDirectoryConfig' 'FriendlyName' }
+    @{ JobType = 'CreateRdpPropertiesConfig';              NameField = 'Name'
+       ParseQuery = Build-ChangelogNameQuery 'CreateRdpPropertiesConfig' 'Name' }
+    @{ JobType = 'CreateHostPoolScriptedActionsProfile';   NameField = 'Name'
+       ParseQuery = Build-ChangelogNameQuery 'CreateHostPoolScriptedActionsProfile' 'Name' }
+    @{ JobType = 'CreateHostPoolCapacityExtenderProfile';  NameField = 'Name'
+       ParseQuery = Build-ChangelogNameQuery 'CreateHostPoolCapacityExtenderProfile' 'Name' }
+    @{ JobType = 'CreateOrUpdateDeploymentModel';          NameField = 'Name'
+       ParseQuery = Build-ChangelogNameQuery 'CreateOrUpdateDeploymentModel' 'Name' }
+    @{ JobType = 'CreateShellApp';                         NameField = 'Name'
+       ParseQuery = Build-ChangelogNameQuery 'CreateShellApp' 'Name' }
+    @{ JobType = 'CreateCustomView';                       NameField = 'Name'
+       ParseQuery = Build-ChangelogNameQuery 'CreateCustomView' 'Name' }
 )
 
 # SQL cleanup definitions: table name, name column, and any child tables that must be deleted first
@@ -810,12 +910,6 @@ $sqlCleanupMap = @{
         Table = 'CustomViews'; NameColumn = 'Name'
         PreCleanup = @()
     }
-    'CreateDesktopImage' = @{
-        Table = 'DesktopImages'; NameColumn = 'Name'
-        PreCleanup = @(
-            "DELETE FROM DesktopImageScheduledTasks WHERE DesktopImageId IN (SELECT Id FROM DesktopImages WHERE Name = @Name)"
-        )
-    }
 }
 
 foreach ($cleanupType in $sqlCleanupTypes) {
@@ -857,24 +951,6 @@ foreach ($cleanupType in $sqlCleanupTypes) {
     }
 }
 
-# Handle CreateRoleDefinition separately — the LAW logs don't include the role name,
-# so we query the DB directly for custom (non-system) role definitions when this job type is detected.
-if ($discoveredJobTypes | Where-Object { $_.JobType -eq 'CreateRoleDefinition' }) {
-    Write-Log "Checking for custom RBAC role definitions created by demo users..."
-    try {
-        $roleQuery = "DELETE FROM CustomRoleDefinitions WHERE IsSystem = 0"
-        $rolesDeleted = Invoke-NmeSql -Connection $SqlConnection -Query $roleQuery
-        if ($rolesDeleted -gt 0) {
-            Write-Log "Removed $rolesDeleted custom RBAC role definition(s) from CustomRoleDefinitions."
-            $dbResourcesRemoved += $rolesDeleted
-        } else {
-            Write-Log "No custom RBAC role definitions found to remove."
-        }
-    } catch {
-        Write-Log "Failed to remove custom RBAC role definitions: $($_.Exception.Message)" 'WARN'
-        $errors++
-    }
-}
 
 #endregion
 
@@ -895,8 +971,9 @@ Write-Log "Auto-scale profiles:  $asProfilesRemoved"
 Write-Log "App policies:         $appPoliciesRemoved"
 Write-Log "Scripted actions:     $scriptedActionsRemoved"
 Write-Log "Desktop images:       $desktopImagesRemoved"
+Write-Log "Storage accounts:     $storageAccountsRemoved"
 Write-Log "DB resources removed: $dbResourcesRemoved"
-Write-Log "Workspace removed:    $workspaceRemoved"
+Write-Log "Workspaces removed:   $workspacesRemoved"
 Write-Log "Users removed:        $usersRemoved"
 Write-Log "Errors:               $errors"
 
