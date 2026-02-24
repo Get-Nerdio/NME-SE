@@ -980,7 +980,8 @@ AppTraces
 "@ }
     @{ JobType = 'CreateRdpPropertiesConfig';              NameField = 'Name'
        ParseQuery = Build-ChangelogNameQuery 'CreateRdpPropertiesConfig' 'Name'
-       SqlFallback = $true }
+       SqlFallback = $true
+       SqlFallbackDirect = $true }
     @{ JobType = 'CreateHostPoolScriptedActionsProfile';   NameField = 'Name'
        ParseQuery = Build-ChangelogNameQuery 'CreateHostPoolScriptedActionsProfile' 'Name' }
     @{ JobType = 'CreateHostPoolCapacityExtenderProfile';  NameField = 'Name'
@@ -1061,21 +1062,48 @@ foreach ($cleanupType in $sqlCleanupTypes) {
 
     # Fall back to SQL ProvisionJob table if LAW returned nothing and SqlFallback is enabled
     if ($resourceNames.Count -eq 0 -and $cleanupType.SqlFallback) {
-        $jobQuery = "SELECT DISTINCT Resources FROM ProvisionJob WHERE UserId IN (SELECT Id FROM JobUser WHERE Username IN ({0})) AND JobType = @JobType AND Resources IS NOT NULL AND Resources <> ''"
         $upnParams = @{}
         $upnPlaceholders = @()
         for ($u = 0; $u -lt $userUpns.Count; $u++) {
             $upnParams["@upn$u"] = $userUpns[$u]
             $upnPlaceholders += "@upn$u"
         }
-        $jobQuery = $jobQuery -f ($upnPlaceholders -join ', ')
         $upnParams['@JobType'] = switch ($jobType) {
             'CreateRdpPropertiesConfig' { 2800 }
         }
+
+        # First try: ProvisionJob.Resources column
+        $jobQuery = "SELECT DISTINCT Resources FROM ProvisionJob WHERE UserId IN (SELECT Id FROM JobUser WHERE Username IN ({0})) AND JobType = @JobType AND Resources IS NOT NULL AND Resources <> ''"
+        $jobQuery = $jobQuery -f ($upnPlaceholders -join ', ')
         $jobResult = Invoke-NmeSql -Connection $SqlConnection -Query $jobQuery -Parameters $upnParams -AsDataTable
         foreach ($row in $jobResult.Rows) {
             if (-not [string]::IsNullOrWhiteSpace($row.Resources)) {
                 $resourceNames += $row.Resources
+            }
+        }
+
+        # Second try: query the target table directly
+        # The CreateRdpPropertiesConfig changelog doesn't include the config name in
+        # the TaskResult payload, so LAW extraction always fails. Fall back to querying
+        # the RdpPropertiesConfigurations table for non-default configs when we know
+        # the demo users created RDP configs (ProvisionJob records exist).
+        if ($resourceNames.Count -eq 0 -and $cleanupType.SqlFallbackDirect) {
+            Write-Log "ProvisionJob.Resources empty for $jobType; querying $($mapEntry.Table) directly..."
+            $checkQuery = "SELECT COUNT(*) AS Cnt FROM ProvisionJob WHERE UserId IN (SELECT Id FROM JobUser WHERE Username IN ({0})) AND JobType = @JobType"
+            $checkQuery = $checkQuery -f ($upnPlaceholders -join ', ')
+            $checkResult = Invoke-NmeSql -Connection $SqlConnection -Query $checkQuery -Parameters $upnParams -AsDataTable
+            if ($checkResult.Rows[0].Cnt -gt 0) {
+                # Get all non-default configs — in a demo environment these are demo-user-created
+                $directQuery = "SELECT [$($mapEntry.NameColumn)] AS ResourceName FROM [$($mapEntry.Table)] WHERE Id > 1"
+                $directResult = Invoke-NmeSql -Connection $SqlConnection -Query $directQuery -Parameters @{} -AsDataTable
+                foreach ($row in $directResult.Rows) {
+                    if (-not [string]::IsNullOrWhiteSpace($row.ResourceName)) {
+                        $resourceNames += $row.ResourceName
+                    }
+                }
+                if ($resourceNames.Count -gt 0) {
+                    Write-Log "Found $($resourceNames.Count) $jobType resource(s) via direct table query: $($resourceNames -join ', ')"
+                }
             }
         }
     }
