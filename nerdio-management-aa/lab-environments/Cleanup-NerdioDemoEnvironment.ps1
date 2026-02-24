@@ -6,19 +6,67 @@
 .DESCRIPTION
   This runbook removes resources created by New-NerdioDemoEnvironment.ps1 and by demo users:
   1. Queries NME analytics LAW to discover resources created by demo users
-  2. Removes host pools created by demo users (via NME API)
-  3. Removes FSLogix profiles created by demo users
-  4. Removes auto-scale profiles created by demo users
-  5. Removes app management policies created by demo users
-  6. Removes scripted actions created by demo users (via NME API)
-  7. Removes desktop image VMs created by demo users (Azure VM, NIC, OS disk)
-  8. Removes storage accounts and temp VMs created by demo users (Azure)
-  9. Removes the NME workspace and any additional workspaces created by demo users
-  10. Removes RBAC assignments and orphaned custom role definitions for demo users
-  11. Removes the Entra ID users (identified by CompanyName matching the environment name)
+  2. Revokes sign-in sessions and deletes demo users from Entra ID
+     (done first to immediately invalidate tokens and prevent new resource creation)
+  3. Removes RBAC assignments and orphaned custom role definitions from the NME database
+  4. Removes host pools created by demo users (via NME API)
+  5. Removes FSLogix profiles created by demo users
+  6. Removes auto-scale profiles created by demo users
+  7. Removes app management policies created by demo users
+  8. Removes scripted actions created by demo users (via NME API)
+  9. Removes desktop image VMs created by demo users (Azure VM, NIC, OS disk)
+  10. Removes storage accounts and temp VMs created by demo users (Azure)
+  11. Removes the NME workspace and any additional workspaces created by demo users
   12. Removes resources without API removal functions directly from the NME database:
       AD configs, RDP properties configs, scripted actions profiles,
       capacity extender profiles, deployment models, shell apps, custom views
+
+  PREREQUISITES
+  =============
+
+  Automation Account Modules (PowerShell 5.1):
+    - Az.Accounts
+    - Az.Sql                         (SQL server/database discovery)
+    - Az.Compute                     (VM, disk removal)
+    - Az.Network                     (NIC removal)
+    - Az.Storage                     (storage account removal)
+    - Az.DesktopVirtualization       (workspace and host pool queries/removal)
+    - Az.OperationalInsights         (Log Analytics Workspace queries)
+    - Microsoft.Graph.Authentication (Connect-MgGraph with managed identity)
+    - Microsoft.Graph.Users          (Get-MgUser, Remove-MgUser)
+    - Microsoft.Graph.Users.Actions  (Revoke-MgUserSignInSession)
+    - NerdioManagerPowerShell        (NME API: host pools, FSLogix, auto-scale, app policies,
+                                      scripted actions, workspaces)
+
+  Automation Account Variables (prefixed with VariablePrefix, default 'CustomerDemo'):
+    - {Prefix}TenantId          NME API app registration tenant ID
+    - {Prefix}ClientId          NME API app registration client ID
+    - {Prefix}ClientSecret      NME API app registration client secret (encrypt)
+    - {Prefix}Scope             NME API scope (e.g. api://<app-id>/.default)
+    - {Prefix}Uri               NME API base URI (e.g. https://app.nerdio.net)
+    - {Prefix}SubscriptionId    Azure subscription containing the demo resources
+    - {Prefix}TenantDomain      Entra ID tenant domain (e.g. contoso.onmicrosoft.com)
+    - {Prefix}LawWorkspaceId    Log Analytics Workspace ID for NME analytics
+    - {Prefix}NmeResourceGroup  Resource group containing the NME deployment (SQL server, etc.)
+
+  Managed Identity Permissions:
+    - Azure RBAC: Contributor on the subscription (or scoped to the demo resource groups) for
+      removing VMs, NICs, disks, storage accounts, workspaces, and host pools.
+    - Azure RBAC: Reader on the NME resource group for SQL server discovery.
+    - Microsoft Graph: User.ReadWrite.All (to read CompanyName and delete demo users).
+    - SQL: The automation account managed identity must be added as a user on the NME SQL
+      database with db_datareader and db_datawriter roles for direct SQL cleanup operations.
+
+  SQL Connectivity:
+    The runbook discovers the NME SQL server by looking for the tag 'NMW_OBJECT_TYPE' =
+    'PRIMARY_SQL_SERVER' on SQL servers in the NME resource group. It authenticates using a
+    managed identity access token for https://database.windows.net/. The NME SQL server
+    firewall must allow connections from the automation account (e.g. Allow Azure services).
+
+  Naming Conventions:
+    Demo users are identified by their CompanyName attribute matching '{CustomerAbbreviation}-Demo'.
+    The workspace created by the setup script is named '{CustomerAbbreviation}-Demo-workspace'.
+    Demo resources are expected in the 'autoclean-rg' resource group.
 
 .PARAMETER CustomerAbbreviation
   Short customer abbreviation used when the demo environment was created.
@@ -281,7 +329,92 @@ AppTraces
 
 #endregion
 
-#region 2. Remove host pools
+#region 2. Remove Entra ID users to revoke NME access
+
+# Delete demo users from Entra ID first to invalidate their sessions and prevent them
+# from creating new resources while cleanup is in progress. Revoking sign-in sessions
+# before deletion ensures refresh tokens are immediately invalidated.
+if ($Users) {
+    Write-Log "Removing $($Users.Count) demo user(s) from Entra ID to revoke access..."
+    foreach ($user in $Users) {
+        try {
+            Write-Log "Revoking sign-in sessions for $($user.UserPrincipalName)..."
+            Revoke-MgUserSignInSession -UserId $user.Id -ErrorAction Stop | Out-Null
+        } catch {
+            Write-Log "Failed to revoke sessions for $($user.UserPrincipalName): $($_.Exception.Message)" 'WARN'
+        }
+        try {
+            Write-Log "Removing user $($user.UserPrincipalName)..."
+            Remove-MgUser -UserId $user.Id -ErrorAction Stop
+            $usersRemoved++
+        } catch {
+            Write-Log "Failed to remove user $($user.UserPrincipalName): $($_.Exception.Message)" 'WARN'
+            $errors++
+        }
+    }
+} else {
+    Write-Log "No users found with CompanyName '$EnvironmentName'."
+}
+
+#endregion
+
+#region 3. Remove RBAC assignments and orphaned role definitions
+
+if ($Users) {
+    Write-Log "Cleaning up RBAC assignments and custom role definitions for demo users..."
+
+    # First, collect the RoleIds assigned to demo users so we can clean up custom role definitions afterward
+    $demoRoleIds = @()
+    foreach ($user in $Users) {
+        try {
+            $roleIdQuery = "SELECT RoleId FROM RoleAssignments WHERE PrincipalId = @PrincipalId"
+            $roleIdResult = Invoke-NmeSql -Connection $SqlConnection -Query $roleIdQuery -Parameters @{ '@PrincipalId' = $user.Id } -AsDataTable
+            foreach ($row in $roleIdResult.Rows) {
+                $demoRoleIds += $row.RoleId
+            }
+        } catch {
+            Write-Log "Failed to query RBAC assignments for $($user.UserPrincipalName): $($_.Exception.Message)" 'WARN'
+        }
+    }
+    $demoRoleIds = $demoRoleIds | Sort-Object -Unique
+
+    # Delete the RBAC assignments
+    foreach ($user in $Users) {
+        try {
+            $rbacQuery = "DELETE FROM RoleAssignments WHERE PrincipalId = @PrincipalId"
+            $rowsDeleted = Invoke-NmeSql -Connection $SqlConnection -Query $rbacQuery -Parameters @{ '@PrincipalId' = $user.Id }
+            if ($rowsDeleted -gt 0) {
+                Write-Log "Removed $rowsDeleted RBAC assignment(s) for $($user.UserPrincipalName)."
+                $dbResourcesRemoved += $rowsDeleted
+            }
+        } catch {
+            Write-Log "Failed to remove RBAC assignments for $($user.UserPrincipalName): $($_.Exception.Message)" 'WARN'
+            $errors++
+        }
+    }
+
+    # Delete custom role definitions that were assigned to demo users and are now orphaned
+    foreach ($roleId in $demoRoleIds) {
+        try {
+            # Only delete if no other assignments reference this role
+            $refCheck = Invoke-NmeSql -Connection $SqlConnection -Query "SELECT COUNT(*) AS Cnt FROM RoleAssignments WHERE RoleId = @RoleId" -Parameters @{ '@RoleId' = $roleId } -AsDataTable
+            if ($refCheck.Rows[0].Cnt -eq 0) {
+                $rowsDeleted = Invoke-NmeSql -Connection $SqlConnection -Query "DELETE FROM RoleDefinitions WHERE Id = @RoleId" -Parameters @{ '@RoleId' = $roleId }
+                if ($rowsDeleted -gt 0) {
+                    Write-Log "Removed orphaned RBAC role definition (Id: $roleId)."
+                    $dbResourcesRemoved++
+                }
+            }
+        } catch {
+            Write-Log "Failed to remove RBAC role definition (Id: $roleId): $($_.Exception.Message)" 'WARN'
+            $errors++
+        }
+    }
+}
+
+#endregion
+
+#region 4. Remove host pools
 
 if ($discoveredHostPools.Count -gt 0) {
     Write-Log "Removing $($discoveredHostPools.Count) host pool(s)..."
@@ -308,7 +441,7 @@ if ($discoveredHostPools.Count -gt 0) {
 
 #endregion
 
-#region 3. Remove FSLogix profiles created by demo users
+#region 5. Remove FSLogix profiles created by demo users
 
 if ($discoveredJobTypes | Where-Object { $_.JobType -eq 'CreateFSLogixConfiguration' }) {
     Write-Log "Checking for FSLogix profiles created by demo users..."
@@ -352,7 +485,7 @@ AppTraces
 
 #endregion
 
-#region 4. Remove auto-scale profiles created by demo users
+#region 6. Remove auto-scale profiles created by demo users
 
 if ($discoveredJobTypes | Where-Object { $_.JobType -eq 'CreateAutoScaleTemplate' }) {
     Write-Log "Checking for auto-scale profiles created by demo users..."
@@ -381,13 +514,18 @@ AppTraces
             $matchingProfile = $allAsProfiles | Where-Object { $_.Name -eq $profileName }
             if ($matchingProfile) {
                 try {
-                    Write-Log "Removing auto-scale profile '$profileName'..."
+                    Write-Log "Removing auto-scale profile '$profileName' (Id: $($matchingProfile.Id))..."
                     Remove-NmeAutoScaleProfileId -ProfileId $matchingProfile.Id -ErrorAction Stop | Out-Null
                     Write-Log "Auto-scale profile '$profileName' removed."
                     $asProfilesRemoved++
                 } catch {
-                    Write-Log "Failed to remove auto-scale profile '$profileName': $($_.Exception.Message)" 'WARN'
-                    $errors++
+                    if ($_.Exception.Message -match 'not found') {
+                        Write-Log "Auto-scale profile '$profileName' already removed."
+                        $asProfilesRemoved++
+                    } else {
+                        Write-Log "Failed to remove auto-scale profile '$profileName': $($_.Exception.Message)" 'WARN'
+                        $errors++
+                    }
                 }
             }
         }
@@ -396,7 +534,7 @@ AppTraces
 
 #endregion
 
-#region 5. Remove app management policies created by demo users
+#region 7. Remove app management policies created by demo users
 
 if ($discoveredJobTypes | Where-Object { $_.JobType -eq 'CreateAppPolicy' }) {
     Write-Log "Checking for app management policies created by demo users..."
@@ -457,7 +595,7 @@ AppTraces
 
 #endregion
 
-#region 6. Remove scripted actions created by demo users
+#region 8. Remove scripted actions created by demo users
 
 if ($discoveredJobTypes | Where-Object { $_.JobType -eq 'CreateWindowsScriptedAction' }) {
     Write-Log "Checking for scripted actions created by demo users..."
@@ -502,7 +640,7 @@ AppTraces
 
 #endregion
 
-#region 7. Remove desktop images created by demo users
+#region 9. Remove desktop images created by demo users
 
 if ($discoveredJobTypes | Where-Object { $_.JobType -eq 'CreateDesktopImage' }) {
     Write-Log "Checking for desktop image VMs created by demo users..."
@@ -572,7 +710,7 @@ AppTraces
 
 #endregion
 
-#region 8. Remove storage accounts created by demo users
+#region 10. Remove storage accounts created by demo users
 
 if ($discoveredJobTypes | Where-Object { $_.JobType -eq 'AddFileShare' }) {
     Write-Log "Checking for storage accounts created by demo users..."
@@ -588,9 +726,9 @@ AppTraces
 | mv-expand TaskResultArray
 | where TaskResultArray.type == 0
 | extend PayloadStr = tostring(TaskResultArray.payload)
-| summarize Payloads = make_list(PayloadStr) by TaskId = tostring(Props.TaskId)
-| extend StorageAccountName = extract("StorageAccountName: (.+)", 1, tostring(Payloads))
-| extend StorageRg = extract("ResourceGroupName: (.+)", 1, tostring(Payloads))
+| extend StorageAccountName = extract("^StorageAccountName: (.+)$", 1, PayloadStr)
+| extend StorageRg = extract("^ResourceGroupName: (.+)$", 1, PayloadStr)
+| summarize StorageAccountName = max(StorageAccountName), StorageRg = max(StorageRg) by TaskId = tostring(Props.TaskId)
 | where isnotempty(StorageAccountName) and isnotempty(StorageRg)
 | distinct StorageAccountName, StorageRg
 "@
@@ -682,7 +820,7 @@ AppTraces
 
 #endregion
 
-#region 9. Remove workspaces
+#region 11. Remove workspaces
 
 # Remove the workspace we created for the demo environment
 $Workspace = Get-NmeWorkspace -ErrorAction SilentlyContinue | Where-Object { $_.id.name -eq $NewWorkspaceName }
@@ -743,82 +881,6 @@ AppTraces
             }
         }
     }
-}
-
-#endregion
-
-#region 10. Remove RBAC assignments for demo users
-
-if ($Users) {
-    Write-Log "Removing RBAC assignments and custom role definitions for demo users..."
-
-    # First, collect the RoleIds assigned to demo users so we can clean up custom role definitions afterward
-    $demoRoleIds = @()
-    foreach ($user in $Users) {
-        try {
-            $roleIdQuery = "SELECT RoleId FROM RoleAssignments WHERE PrincipalId = @PrincipalId"
-            $roleIdResult = Invoke-NmeSql -Connection $SqlConnection -Query $roleIdQuery -Parameters @{ '@PrincipalId' = $user.Id } -AsDataTable
-            foreach ($row in $roleIdResult.Rows) {
-                $demoRoleIds += $row.RoleId
-            }
-        } catch {
-            Write-Log "Failed to query RBAC assignments for $($user.UserPrincipalName): $($_.Exception.Message)" 'WARN'
-        }
-    }
-    $demoRoleIds = $demoRoleIds | Sort-Object -Unique
-
-    # Delete the RBAC assignments
-    foreach ($user in $Users) {
-        try {
-            $rbacQuery = "DELETE FROM RoleAssignments WHERE PrincipalId = @PrincipalId"
-            $rowsDeleted = Invoke-NmeSql -Connection $SqlConnection -Query $rbacQuery -Parameters @{ '@PrincipalId' = $user.Id }
-            if ($rowsDeleted -gt 0) {
-                Write-Log "Removed $rowsDeleted RBAC assignment(s) for $($user.UserPrincipalName)."
-                $dbResourcesRemoved += $rowsDeleted
-            }
-        } catch {
-            Write-Log "Failed to remove RBAC assignments for $($user.UserPrincipalName): $($_.Exception.Message)" 'WARN'
-            $errors++
-        }
-    }
-
-    # Delete custom role definitions that were assigned to demo users and are now orphaned
-    foreach ($roleId in $demoRoleIds) {
-        try {
-            # Only delete if no other assignments reference this role
-            $refCheck = Invoke-NmeSql -Connection $SqlConnection -Query "SELECT COUNT(*) AS Cnt FROM RoleAssignments WHERE RoleId = @RoleId" -Parameters @{ '@RoleId' = $roleId } -AsDataTable
-            if ($refCheck.Rows[0].Cnt -eq 0) {
-                $rowsDeleted = Invoke-NmeSql -Connection $SqlConnection -Query "DELETE FROM RoleDefinitions WHERE Id = @RoleId" -Parameters @{ '@RoleId' = $roleId }
-                if ($rowsDeleted -gt 0) {
-                    Write-Log "Removed orphaned RBAC role definition (Id: $roleId)."
-                    $dbResourcesRemoved++
-                }
-            }
-        } catch {
-            Write-Log "Failed to remove RBAC role definition (Id: $roleId): $($_.Exception.Message)" 'WARN'
-            $errors++
-        }
-    }
-}
-
-#endregion
-
-#region 11. Remove users from Entra ID
-
-if ($Users) {
-    Write-Log "Found $($Users.Count) user(s) with CompanyName '$EnvironmentName'."
-    foreach ($user in $Users) {
-        try {
-            Write-Log "Removing user $($user.UserPrincipalName)..."
-            Remove-MgUser -UserId $user.Id -ErrorAction Stop
-            $usersRemoved++
-        } catch {
-            Write-Log "Failed to remove user $($user.UserPrincipalName): $($_.Exception.Message)" 'WARN'
-            $errors++
-        }
-    }
-} else {
-    Write-Log "No users found with CompanyName '$EnvironmentName'."
 }
 
 #endregion
