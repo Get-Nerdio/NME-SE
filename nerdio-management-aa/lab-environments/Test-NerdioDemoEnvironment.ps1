@@ -46,6 +46,15 @@ function Write-Log {
     }
 }
 
+# Helper to create typed psobjects – works around mandatory [string] params
+# in the NerdioManagerPowerShell module that reject empty strings.
+function New-TypedObject {
+    param([string]$TypeName, [hashtable]$Properties)
+    $obj = [pscustomobject]$Properties
+    $obj.PSObject.TypeNames.Insert(0, $TypeName)
+    $obj
+}
+
 #endregion
 
 #region Variables
@@ -92,12 +101,11 @@ $demoProfile = $fslProfiles | Where-Object { $_.Name -eq $ExpectedFslProfileName
 if (-not $demoProfile) {
     Write-Log "FSLogix profile '$ExpectedFslProfileName' not found. Creating it..." 'WARN'
 
-    $installer = New-NmeInstaller -Version '' -ForceUpdate $false
-    $profileContainer = New-NmeRegistry -Locations @($ExpectedProfileContainerLocation) -Options ''
-    $officeContainer = New-NmeRegistry -Locations @() -Options ''
-    $exclusions = New-NmeExclusions -ExclusionMode 'None'
-    $appServiceRegistryOptions = New-NmeOptionalRegistrySettings -RegistryOptionsMode 'None' -RegistryOptions ''
-    $logRegistryOptions = New-NmeOptionalRegistrySettings -RegistryOptionsMode 'None' -RegistryOptions ''
+    $installer          = New-TypedObject 'NmeInstaller'                @{ Version = ''; ForceUpdate = $false }
+    $profileContainer   = New-TypedObject 'NmeRegistry'                 @{ Locations = @($ExpectedProfileContainerLocation); Options = '' }
+    $officeContainer    = New-TypedObject 'NmeRegistry'                 @{ Locations = @(); Options = '' }
+    $exclusions         = New-NmeExclusions -ExclusionMode 'None'
+    $registrySettings   = New-TypedObject 'NmeOptionalRegistrySettings' @{ RegistryOptionsMode = 'None'; RegistryOptions = '' }
 
     $properties = New-NmeProperties `
         -Installer $installer `
@@ -108,8 +116,8 @@ if (-not $demoProfile) {
         -EntraIdKerberos $true `
         -RedirectionsXml '' `
         -Exclusions $exclusions `
-        -AppServiceRegistryOptions $appServiceRegistryOptions `
-        -LogRegistryOptions $logRegistryOptions
+        -AppServiceRegistryOptions $registrySettings `
+        -LogRegistryOptions $registrySettings
 
     $newProfile = New-NmeFsLogixParamsRest_POST -Name $ExpectedFslProfileName -IsDefault $true -Properties $properties
     New-NmeFslogixProfile -NmeFsLogixParamsRest_POST $newProfile
@@ -153,14 +161,13 @@ if (-not $demoProfile) {
     if ($needsUpdate) {
         Write-Log "FSLogix profile has configuration issues: $($issues -join '; '). Correcting..." 'WARN'
 
-        $installer = New-NmeInstaller -Version '' -ForceUpdate $false
-        $profileContainer = New-NmeRegistry -Locations @($ExpectedProfileContainerLocation) -Options ''
-        $officeContainer = New-NmeRegistry -Locations @() -Options ''
-        $exclusions = New-NmeExclusions -ExclusionMode 'None'
-        $appServiceRegistryOptions = New-NmeOptionalRegistrySettings -RegistryOptionsMode 'None' -RegistryOptions ''
-        $logRegistryOptions = New-NmeOptionalRegistrySettings -RegistryOptionsMode 'None' -RegistryOptions ''
+        $installer          = New-TypedObject 'NmeInstaller_PATCH'                @{ Version = ''; ForceUpdate = $false }
+        $profileContainer   = New-TypedObject 'NmeRegistry_PATCH'                 @{ Locations = @($ExpectedProfileContainerLocation); Options = '' }
+        $officeContainer    = New-TypedObject 'NmeRegistry_PATCH'                 @{ Locations = @(); Options = '' }
+        $exclusions         = New-NmeExclusions_PATCH -ExclusionMode 'None'
+        $registrySettings   = New-TypedObject 'NmeOptionalRegistrySettings_PATCH' @{ RegistryOptionsMode = 'None'; RegistryOptions = '' }
 
-        $properties = New-NmeProperties `
+        $properties = New-NmeProperties_PATCH `
             -Installer $installer `
             -ProfileContainer $profileContainer `
             -OfficeContainer $officeContainer `
@@ -169,8 +176,8 @@ if (-not $demoProfile) {
             -EntraIdKerberos $true `
             -RedirectionsXml '' `
             -Exclusions $exclusions `
-            -AppServiceRegistryOptions $appServiceRegistryOptions `
-            -LogRegistryOptions $logRegistryOptions
+            -AppServiceRegistryOptions $registrySettings `
+            -LogRegistryOptions $registrySettings
 
         $patchObj = New-NmeFsLogixParamsRest_PATCH -Name $ExpectedFslProfileName -IsDefault $true -Properties $properties
         Set-NmeFslogixProfileById -Id $demoProfile.Id -NmeFsLogixParamsRest_PATCH $patchObj
