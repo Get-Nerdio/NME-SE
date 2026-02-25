@@ -10,6 +10,9 @@
      has the correct properties (profile container location, Entra ID Kerberos, etc.).
      If missing, it is created. If misconfigured, it is corrected.
 
+  2. The Azure Files share used by FSLogix is linked in NME. If not linked, the
+     storage account is looked up in Azure and the share is re-linked.
+
   Additional checks can be added to this runbook over time.
 
 .PARAMETER VariablePrefix
@@ -52,11 +55,21 @@ $NmeClientId     = Get-AutomationVariable -Name "${VariablePrefix}ClientId"
 $NmeClientSecret = Get-AutomationVariable -Name "${VariablePrefix}ClientSecret"
 $NmeScope        = Get-AutomationVariable -Name "${VariablePrefix}Scope"
 $NmeUri          = Get-AutomationVariable -Name "${VariablePrefix}Uri"
+$SubscriptionId  = Get-AutomationVariable -Name "${VariablePrefix}SubscriptionId"
+
+$FslStorageAccountName = Get-AutomationVariable -Name "${VariablePrefix}-FslStorageAccount"
+$FslShareName          = Get-AutomationVariable -Name "${VariablePrefix}-FslShareName"
 
 #endregion
 
 #region Authentication
 
+# Connect to Azure using automation account managed identity
+Disable-AzContextAutosave -Scope Process | Out-Null
+Connect-AzAccount -Identity -SubscriptionId $SubscriptionId -ErrorAction Stop | Out-Null
+Write-Log "Connected to Azure subscription $SubscriptionId."
+
+# Connect to NME API
 Import-Module NerdioManagerPowerShell -Force
 Connect-Nme -ClientId $NmeClientId -ClientSecret $NmeClientSecret -TenantId $NmeTenantId -ApiScope $NmeScope -NmeUri $NmeUri | Out-Null
 Write-Log "Connected to NME API at $NmeUri."
@@ -66,7 +79,7 @@ Write-Log "Connected to NME API at $NmeUri."
 #region Expected FSLogix configuration
 
 $ExpectedFslProfileName = 'DemoEnvironmentFslConfig'
-$ExpectedProfileContainerLocation = '\\cussandboxsa.file.core.windows.net\profiles'
+$ExpectedProfileContainerLocation = "\\$FslStorageAccountName.file.core.windows.net\$FslShareName"
 
 #endregion
 
@@ -165,6 +178,32 @@ if (-not $demoProfile) {
     } else {
         Write-Log "FSLogix profile '$ExpectedFslProfileName' is correctly configured."
     }
+}
+
+#endregion
+
+#region 2. Validate Azure Files link
+
+Write-Log "Checking Azure Files link for '$FslStorageAccountName/$FslShareName'..."
+$linkedShares = Get-NmeAzureFiles
+$isLinked = $linkedShares | Where-Object {
+    $_.Id -match "/storageAccounts/$FslStorageAccountName/fileServices/default/shares/$FslShareName$"
+}
+
+if (-not $isLinked) {
+    Write-Log "Azure Files share '$FslStorageAccountName/$FslShareName' is not linked in NME. Re-linking..." 'WARN'
+
+    # Look up storage account in Azure to get its resource group
+    $storageAccount = Get-AzStorageAccount | Where-Object { $_.StorageAccountName -eq $FslStorageAccountName }
+    if (-not $storageAccount) {
+        Write-Log "Storage account '$FslStorageAccountName' not found in subscription '$SubscriptionId'." 'ERROR'
+    } else {
+        $saResourceGroup = $storageAccount.ResourceGroupName
+        New-NmeAzureFilesLink -SubscriptionId $SubscriptionId -ResourceGroup $saResourceGroup -AccountName $FslStorageAccountName -ShareName $FslShareName
+        Write-Log "Azure Files share '$FslStorageAccountName/$FslShareName' linked (RG: $saResourceGroup)."
+    }
+} else {
+    Write-Log "Azure Files share '$FslStorageAccountName/$FslShareName' is already linked."
 }
 
 #endregion
