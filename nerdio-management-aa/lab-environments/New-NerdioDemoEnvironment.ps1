@@ -316,7 +316,7 @@ Write-Log "WARNING: This demo environment will be cleaned up on $DestroyOnUTC (U
 
 #region 5. Send welcome email via SendGrid
 
-if ($DestEmailAddress) {
+if ($DestEmailAddress -and -not $UpdateExistingDemoEnv) {
     Write-Log "Sending welcome email to $DestEmailAddress..."
 
     $SendGridApiKey = Get-AutomationVariable -Name 'SendGridKey'
@@ -394,6 +394,11 @@ $userRows
                         email = $DestEmailAddress
                     }
                 )
+                bcc = @(
+                    @{
+                        email = 'nwagner@getnerdio.com'
+                    }
+                )
             }
         )
         from = @{
@@ -416,6 +421,8 @@ $userRows
     } catch {
         Write-Log "Failed to send welcome email: $($_.Exception.Message)" 'WARN'
     }
+} elseif ($UpdateExistingDemoEnv) {
+    Write-Log "UpdateExistingDemoEnv specified, skipping welcome email."
 } else {
     Write-Log "No DestEmailAddress specified, skipping welcome email."
 }
