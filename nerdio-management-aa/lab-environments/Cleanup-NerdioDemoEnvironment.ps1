@@ -14,13 +14,15 @@
   5b. Removes FSLogix profile VHDs from the file share for demo users
   6. Removes auto-scale profiles created by demo users
   7. Removes app management policies created by demo users
-  8. Removes scripted actions created by demo users (via NME API)
-  9. Removes desktop image VMs created by demo users (Azure VM, NIC, OS disk)
+  8. Removes scripted actions created by demo users (via NME API) - both Windows and Azure Automation types
+  9. Removes desktop image VMs created by demo users (Azure VM, NIC, OS disk, captured images)
   10. Removes storage accounts and temp VMs created by demo users (Azure)
+  10b. Removes VNets created by demo users (Azure VNet + Networks SQL table)
   11. Removes the NME workspace and any additional workspaces created by demo users
   12. Removes resources without API removal functions directly from the NME database:
       AD configs, RDP properties configs, scripted actions profiles,
-      capacity extender profiles, deployment models, shell apps, custom views
+      capacity extender profiles, deployment models, shell apps, custom views,
+      VM deployment profiles
   13. Removes the scheduled cleanup runbook if it exists (prevents duplicate runs)
 
   PREREQUISITES
@@ -37,8 +39,6 @@
     - Microsoft.Graph.Authentication (Connect-MgGraph with managed identity)
     - Microsoft.Graph.Users          (Get-MgUser, Remove-MgUser)
     - Microsoft.Graph.Users.Actions  (Revoke-MgUserSignInSession)
-    - NerdioManagerPowerShell        (NME API: host pools, FSLogix, auto-scale, app policies,
-                                      scripted actions, workspaces)
 
   Automation Account Variables (prefixed with VariablePrefix, default 'CustomerDemo'):
     - {Prefix}TenantId          NME API app registration tenant ID
@@ -108,13 +108,71 @@ function Write-Log {
     }
 }
 
+function Invoke-LawQuery {
+    <#
+    .SYNOPSIS
+      Executes a KQL query against the Log Analytics workspace via the Azure management REST API.
+      Returns a PSCustomObject with a .Results array of PSCustomObjects (one per row).
+      Uses the management.azure.com token — same auth path as the Azure CLI.
+    #>
+    param(
+        [string]$Query,
+        [string]$Timespan = 'P30D'
+    )
+    try {
+        $token = (Get-AzAccessToken -ResourceUrl 'https://management.azure.com/').Token
+        $body  = (@{ query = $Query; timespan = $Timespan } | ConvertTo-Json -Depth 3)
+        $uri   = "https://management.azure.com/subscriptions/$SubscriptionId/resourceGroups/$LawResourceGroup/providers/Microsoft.OperationalInsights/workspaces/$LawWorkspaceName/api/query?api-version=2020-08-01"
+        $raw   = Invoke-RestMethod -Uri $uri -Method POST -Body $body `
+                     -Headers @{ Authorization = "Bearer $token"; 'Content-Type' = 'application/json' } `
+                     -ErrorAction Stop
+        # Management API response uses Pascal-case: Tables, Columns, ColumnName, Rows
+        if ($raw.Tables -and $raw.Tables.Count -gt 0) {
+            $t    = $raw.Tables[0]
+            $cols = @($t.Columns | Select-Object -ExpandProperty ColumnName -ErrorAction SilentlyContinue)
+            if (-not $cols -or $cols.Count -eq 0) {
+                Write-Log "LAW query succeeded but returned no column metadata" 'WARN'
+                return [PSCustomObject]@{ Results = @() }
+            }
+            $rows = @(foreach ($row in $t.Rows) {
+                $obj = [ordered]@{}
+                for ($i = 0; $i -lt $cols.Count; $i++) { $obj[$cols[$i]] = $row[$i] }
+                [PSCustomObject]$obj
+            })
+            Write-Log "LAW query returned $($rows.Count) row(s)."
+            return [PSCustomObject]@{ Results = $rows }
+        }
+        Write-Log "LAW query returned no tables."
+        return [PSCustomObject]@{ Results = @() }
+    } catch {
+        Write-Log "LAW REST query failed: $($_.Exception.Message)" 'WARN'
+        return [PSCustomObject]@{ Results = @() }
+    }
+}
+
+function Get-NmeHeaders {
+    $tokenResponse = Invoke-RestMethod `
+        -Uri "https://login.microsoftonline.com/$NmeTenantId/oauth2/v2.0/token" `
+        -Method Post `
+        -Body @{
+            grant_type    = 'client_credentials'
+            client_id     = $NmeClientId
+            client_secret = $NmeClientSecret
+            scope         = $NmeScope
+        }
+    return @{
+        'Authorization' = "Bearer $($tokenResponse.access_token)"
+        'Content-Type'  = 'application/json'
+    }
+}
+
 function Wait-NmeJob {
     param([string]$JobId, [string]$Description)
-    $job = Get-NmeJob -jobid $JobId
-    while ($job.status -eq 'InProgress') {
+    $job = Invoke-RestMethod "$NmeUri/api/v1/job/$JobId" -Headers $NmeHeaders
+    while ($job.jobStatus -in @('Pending', 'InProgress')) {
         Write-Log "Waiting for $Description to complete..."
         Start-Sleep -Seconds 10
-        $job = Get-NmeJob -jobid $JobId
+        $job = Invoke-RestMethod "$NmeUri/api/v1/job/$JobId" -Headers $NmeHeaders
     }
     return $job
 }
@@ -207,13 +265,17 @@ $NmeScope        = Get-AutomationVariable -Name "${VariablePrefix}Scope"
 $NmeUri          = Get-AutomationVariable -Name "${VariablePrefix}Uri"
 $SubscriptionId  = Get-AutomationVariable -Name "${VariablePrefix}SubscriptionId"
 $TenantDomain    = Get-AutomationVariable -Name "${VariablePrefix}TenantDomain"
-$LawWorkspaceId  = Get-AutomationVariable -Name "${VariablePrefix}LawWorkspaceId"
+$LawWorkspaceId   = Get-AutomationVariable -Name "${VariablePrefix}LawWorkspaceId"
+# LAW resource path constants — used by Invoke-LawQuery (management.azure.com endpoint)
+$LawResourceGroup = 'nme-standard-1'
+$LawWorkspaceName = 'nme-st1-law-insights-vhsxofas5fpmu'
 
-$FslStorageAccountName = Get-AutomationVariable -Name "${VariablePrefix}-FslStorageAccount"
-$FslShareName          = Get-AutomationVariable -Name "${VariablePrefix}-FslShareName"
-$FslStorageAccountKey  = Get-AutomationVariable -Name "${VariablePrefix}-SAKey"
+# FSLogix profile share variables are optional — skip VHD cleanup if not configured
+try { $FslStorageAccountName = Get-AutomationVariable -Name "${VariablePrefix}-FslStorageAccount" } catch { $FslStorageAccountName = $null }
+try { $FslShareName          = Get-AutomationVariable -Name "${VariablePrefix}-FslShareName"      } catch { $FslShareName = $null }
+try { $FslStorageAccountKey  = Get-AutomationVariable -Name "${VariablePrefix}-SAKey"             } catch { $FslStorageAccountKey = $null }
 
-$ResourceGroupName = 'autoclean-rg'
+try { $ResourceGroupName = Get-AutomationVariable -Name "${VariablePrefix}DefaultRG" } catch { $ResourceGroupName = 'autoclean-rg' }
 $NmeResourceGroupName = Get-AutomationVariable -Name "${VariablePrefix}NmeResourceGroup"
 
 # Automation account constants (must match New-NerdioDemoEnvironment.ps1)
@@ -241,8 +303,7 @@ Connect-MgGraph -Identity -NoWelcome -ErrorAction Stop | Out-Null
 Write-Log "Connected to Microsoft Graph."
 
 # Connect to NME API
-Import-Module NerdioManagerPowerShell -Force
-Connect-Nme -ClientId $NmeClientId -ClientSecret $NmeClientSecret -TenantId $NmeTenantId -ApiScope $NmeScope -NmeUri $NmeUri | Out-Null
+$NmeHeaders = Get-NmeHeaders
 Write-Log "Connected to NME API at $NmeUri."
 
 # Connect to NME SQL database using managed identity
@@ -275,24 +336,46 @@ $userUpns = @($Users | ForEach-Object { $_.UserPrincipalName })
 $discoveredHostPools = @()
 $discoveredJobTypes = @()
 
-if ($userUpns.Count -eq 0) {
-    Write-Log "No demo users found in Entra ID. Skipping LAW query." 'WARN'
-} else {
-    Write-Log "Found $($userUpns.Count) demo user(s). Querying LAW for their activity..."
+$upnFilter = $null
+if ($userUpns.Count -gt 0) {
+    Write-Log "Found $($userUpns.Count) demo user(s) in Entra ID."
     $upnFilter = ($userUpns | ForEach-Object { "`"$_`"" }) -join ', '
+} else {
+    # Users already deleted from Entra — recover their UPNs from LAW using the naming pattern
+    Write-Log "No demo users found in Entra ID. Trying to recover UPNs from LAW..." 'WARN'
+    $patternDiscoveryQuery = @"
+AppTraces
+| extend Props = parse_json(Properties)
+| where tostring(Props.Username) startswith "$CustomerAbbreviation-User"
+| where tostring(Props.Username) endswith "@$TenantDomain"
+| distinct UserPrincipalName = tostring(Props.Username)
+"@
+    $patternResult = Invoke-LawQuery -Query $patternDiscoveryQuery
+    if ($patternResult.Results) {
+        $userUpns = @($patternResult.Results | ForEach-Object { $_.UserPrincipalName })
+        $upnFilter = ($userUpns | ForEach-Object { "`"$_`"" }) -join ', '
+        Write-Log "Recovered $($userUpns.Count) UPN(s) from LAW: $($userUpns -join ', ')"
+    } else {
+        Write-Log "No activity found in LAW for $CustomerAbbreviation users either. LAW-dependent cleanup steps will be skipped." 'WARN'
+    }
+}
+
+if ($upnFilter) {
+    Write-Log "Querying LAW for resource types created by demo users..."
+    $upnFilter = $upnFilter  # keep in scope for nested here-strings
 
     # Summary: what resource types did demo users create?
     $summaryQuery = @"
 AppTraces
 | extend Props = parse_json(Properties)
-| where Props.Username in ($upnFilter)
+| where tostring(Props.Username) in ($upnFilter)
 | where Props.TaskStatus == "Success"
 | where isnotempty(Props.JobType)
 | summarize TaskCount = count() by JobType = tostring(Props.JobType)
 | order by TaskCount desc
 "@
 
-    $summaryResult = Invoke-AzOperationalInsightsQuery -WorkspaceId $LawWorkspaceId -Query $summaryQuery -ErrorAction SilentlyContinue
+    $summaryResult = Invoke-LawQuery -Query $summaryQuery
     if ($summaryResult.Results) {
         $discoveredJobTypes = $summaryResult.Results
         Write-Log "Resource types created by demo users:"
@@ -310,9 +393,9 @@ AppTraces
     $hpQuery = @"
 AppTraces
 | extend Props = parse_json(Properties)
-| where Props.Username in ($upnFilter)
+| where tostring(Props.Username) in ($upnFilter)
 | where Props.TaskStatus == "Success"
-| where Props.JobType in ("CreateHostPool", "UpdateDynamicScaleSettings")
+| where tostring(Props.JobType) in ("CreateHostPool", "UpdateDynamicScaleSettings")
 | extend RequestPath = tostring(Props.RequestPath)
 | extend TaskResultRaw = tostring(Props.TaskResult)
 | extend TaskName = tostring(Props.TaskName)
@@ -328,10 +411,11 @@ AppTraces
 | extend HostPoolRg = coalesce(RgFromPayload, HpRgFromPath)
 | extend HostPoolSub = coalesce(SubFromPayload, HpSubFromPath)
 | where isnotempty(HostPoolName)
+| where HostPoolSub =~ "$SubscriptionId"
 | distinct HostPoolSub, HostPoolRg, HostPoolName
 "@
 
-    $hpResult = Invoke-AzOperationalInsightsQuery -WorkspaceId $LawWorkspaceId -Query $hpQuery -ErrorAction SilentlyContinue
+    $hpResult = Invoke-LawQuery -Query $hpQuery
     if ($hpResult.Results) {
         $discoveredHostPools = @($hpResult.Results)
         Write-Log "Discovered $($discoveredHostPools.Count) host pool(s) from LAW."
@@ -350,6 +434,28 @@ AppTraces
     $discoveredHostPools = $verifiedHostPools
 }
 
+# Fallback: scan the demo resource group for host pools not captured by LAW queries
+# (e.g. personal host pools created via a job type not covered above, or pools whose logs
+# have aged out of the 30-day LAW retention window)
+if ($ResourceGroupName) {
+    Write-Log "Scanning '$ResourceGroupName' for host pools not yet in discovery list..."
+    $azScanHps = @(Get-AzWvdHostPool -ResourceGroupName $ResourceGroupName -SubscriptionId $SubscriptionId -ErrorAction SilentlyContinue)
+    foreach ($azHp in $azScanHps) {
+        $alreadyDiscovered = $discoveredHostPools | Where-Object {
+            $_.HostPoolName -eq $azHp.Name -and $_.HostPoolRg -ieq $ResourceGroupName
+        }
+        if (-not $alreadyDiscovered) {
+            Write-Log "Adding undiscovered host pool '$($azHp.Name)' (found via Azure RG scan)."
+            $discoveredHostPools += [PSCustomObject]@{
+                HostPoolSub  = $SubscriptionId
+                HostPoolRg   = $ResourceGroupName
+                HostPoolName = $azHp.Name
+            }
+        }
+    }
+    Write-Log "Total host pools to remove after RG scan: $($discoveredHostPools.Count)."
+}
+
 #endregion
 
 #region 2. Clear RBAC workspace assignments and remove Entra ID users
@@ -362,13 +468,12 @@ $rbacAssignmentsCleared = 0
 if ($Users) {
     Write-Log "Clearing RBAC workspace assignments for $($Users.Count) demo user(s)..."
 
-    # Build an empty assignment model to overwrite each user's workspace access
-    $EmptyRbacAssignment = New-Object -TypeName psobject -Property @{ AvdWorkspaces = @() }
-    $EmptyRbacAssignment.PSObject.TypeNames.Insert(0, 'NmeRbacAssignmentUpdateRestModel')
+    # Build an empty assignment body to overwrite each user's workspace access
+    $EmptyRbacBody = @{ avdWorkspaces = @() } | ConvertTo-Json -Depth 3
 
     foreach ($user in $Users) {
         try {
-            Set-NmeRbacRolesAssignment -ObjectId $user.Id -NmeRbacAssignmentUpdateRestModel $EmptyRbacAssignment -ErrorAction Stop | Out-Null
+            Invoke-RestMethod "$NmeUri/api/v1/users-and-roles/assignment/$($user.Id)" -Method Put -Headers $NmeHeaders -Body $EmptyRbacBody | Out-Null
             Write-Log "Cleared RBAC workspace assignments for $($user.UserPrincipalName)."
             $rbacAssignmentsCleared++
         } catch {
@@ -473,9 +578,9 @@ if ($discoveredHostPools.Count -gt 0) {
     foreach ($hp in $discoveredHostPools) {
         try {
             Write-Log "Removing host pool $($hp.HostPoolName) in $($hp.HostPoolRg)..."
-            $Result = Remove-NmeHostPool -SubscriptionId $hp.HostPoolSub -ResourceGroup $hp.HostPoolRg -HostPoolName $hp.HostPoolName -ErrorAction Stop
-            $job = Wait-NmeJob -JobId $Result.job.Id -Description "host pool removal ($($hp.HostPoolName))"
-            if ($job.status -eq 'Failed') {
+            $Result = Invoke-RestMethod "$NmeUri/api/v1/arm/hostpool/$($hp.HostPoolSub)/$($hp.HostPoolRg)/$($hp.HostPoolName)" -Method Delete -Headers $NmeHeaders
+            $job = Wait-NmeJob -JobId $Result.job.id -Description "host pool removal ($($hp.HostPoolName))"
+            if ($job.jobStatus -eq 'Failed') {
                 Write-Log "Host pool removal failed for $($hp.HostPoolName): $($job.error.message)" 'WARN'
                 $errors++
             } else {
@@ -483,8 +588,55 @@ if ($discoveredHostPools.Count -gt 0) {
                 $hostPoolsRemoved++
             }
         } catch {
-            Write-Log "Failed to remove host pool $($hp.HostPoolName): $($_.Exception.Message)" 'WARN'
-            $errors++
+            Write-Log "NME API failed for host pool '$($hp.HostPoolName)': $($_.Exception.Message). Trying Azure ARM fallback..." 'WARN'
+            # Fallback: remove session host VMs via Azure ARM, then remove the AVD host pool resource
+            $armFallbackSucceeded = $false
+            try {
+                $sessionHosts = @(Get-AzWvdSessionHost `
+                    -ResourceGroupName $hp.HostPoolRg `
+                    -HostPoolName      $hp.HostPoolName `
+                    -SubscriptionId    $hp.HostPoolSub `
+                    -ErrorAction SilentlyContinue)
+                Write-Log "Removing $($sessionHosts.Count) session host VM(s) from '$($hp.HostPoolName)' via Azure ARM..."
+                foreach ($sh in $sessionHosts) {
+                    # .Name is "HostPoolName/vmhostname" — take only the host part
+                    $shVmName = ($sh.Name -split '/')[-1]
+                    try {
+                        $vm = Get-AzVM -ResourceGroupName $hp.HostPoolRg -Name $shVmName -ErrorAction SilentlyContinue
+                        if ($vm) {
+                            $shNicIds    = @($vm.NetworkProfile.NetworkInterfaces | Select-Object -ExpandProperty Id)
+                            $shOsDiskName = $vm.StorageProfile.OsDisk.Name
+                            Write-Log "Removing session host VM '$shVmName'..."
+                            Remove-AzVM -ResourceGroupName $hp.HostPoolRg -Name $shVmName -ForceDeletion $true -Force -ErrorAction Stop | Out-Null
+                            Write-Log "Session host VM '$shVmName' removed."
+                            foreach ($nicId in $shNicIds) {
+                                $shNicName = ($nicId -split '/')[-1]
+                                $shNicRg   = ($nicId -replace '^.*/resourceGroups/([^/]+)/.*$', '$1')
+                                Write-Log "Removing NIC '$shNicName'..."
+                                Remove-AzNetworkInterface -ResourceGroupName $shNicRg -Name $shNicName -Force -ErrorAction SilentlyContinue | Out-Null
+                            }
+                            if ($shOsDiskName) {
+                                Write-Log "Removing OS disk '$shOsDiskName'..."
+                                Remove-AzDisk -ResourceGroupName $hp.HostPoolRg -DiskName $shOsDiskName -Force -ErrorAction SilentlyContinue | Out-Null
+                            }
+                        }
+                    } catch {
+                        Write-Log "Failed to remove session host VM '$shVmName': $($_.Exception.Message)" 'WARN'
+                    }
+                    # Remove the session host registration from AVD
+                    Remove-AzWvdSessionHost -ResourceGroupName $hp.HostPoolRg -HostPoolName $hp.HostPoolName `
+                        -Name $shVmName -Force -ErrorAction SilentlyContinue | Out-Null
+                }
+                Write-Log "Removing host pool '$($hp.HostPoolName)' via Azure ARM..."
+                Remove-AzWvdHostPool -ResourceGroupName $hp.HostPoolRg -Name $hp.HostPoolName `
+                    -SubscriptionId $hp.HostPoolSub -Force -ErrorAction Stop
+                Write-Log "Host pool '$($hp.HostPoolName)' removed via Azure ARM fallback."
+                $hostPoolsRemoved++
+                $armFallbackSucceeded = $true
+            } catch {
+                Write-Log "Azure ARM fallback also failed for '$($hp.HostPoolName)': $($_.Exception.Message)" 'WARN'
+            }
+            if (-not $armFallbackSucceeded) { $errors++ }
         }
     }
 } else {
@@ -500,7 +652,7 @@ if ($discoveredJobTypes | Where-Object { $_.JobType -eq 'CreateFSLogixConfigurat
     $fslQuery = @"
 AppTraces
 | extend Props = parse_json(Properties)
-| where Props.Username in ($upnFilter)
+| where tostring(Props.Username) in ($upnFilter)
 | where Props.TaskStatus == "Success"
 | where Props.JobType == "CreateFSLogixConfiguration"
 | extend TaskResultRaw = tostring(Props.TaskResult)
@@ -514,16 +666,16 @@ AppTraces
 | distinct FslProfileName
 "@
 
-    $fslResult = Invoke-AzOperationalInsightsQuery -WorkspaceId $LawWorkspaceId -Query $fslQuery -ErrorAction SilentlyContinue
+    $fslResult = Invoke-LawQuery -Query $fslQuery
     if ($fslResult.Results) {
-        $allFslProfiles = Get-NmeFslogixProfile -ErrorAction SilentlyContinue
+        $allFslProfiles = Invoke-RestMethod "$NmeUri/api/v1/fslogix" -Headers $NmeHeaders
         foreach ($fslRow in $fslResult.Results) {
             $profileName = $fslRow.FslProfileName
             $matchingProfile = $allFslProfiles | Where-Object { $_.Name -eq $profileName }
             if ($matchingProfile) {
                 try {
                     Write-Log "Removing FSLogix profile '$profileName'..."
-                    Remove-NmeFslogixProfileById -Id $matchingProfile.Id -ErrorAction Stop | Out-Null
+                    Invoke-RestMethod "$NmeUri/api/v1/fslogix/$($matchingProfile.id)" -Method Delete -Headers $NmeHeaders | Out-Null
                     Write-Log "FSLogix profile '$profileName' removed."
                     $fslProfilesRemoved++
                 } catch {
@@ -539,7 +691,7 @@ AppTraces
 
 #region 5b. Remove FSLogix profile VHDs from the file share
 
-if ($Users.Count -gt 0) {
+if ($Users.Count -gt 0 -and $FslStorageAccountName -and $FslShareName -and $FslStorageAccountKey) {
     Write-Log "Checking for FSLogix profile VHDs on file share..."
 
     try {
@@ -588,6 +740,8 @@ if ($Users.Count -gt 0) {
         Write-Log "Failed to access FSLogix profile share '$FslShareName' on '$FslStorageAccountName': $($_.Exception.Message)" 'WARN'
         $errors++
     }
+} elseif (-not ($FslStorageAccountName -and $FslShareName -and $FslStorageAccountKey)) {
+    Write-Log "FSLogix share variables not configured (${VariablePrefix}-FslStorageAccount / -FslShareName / -SAKey), skipping VHD cleanup."
 } else {
     Write-Log "No demo users found, skipping FSLogix profile VHD cleanup."
 }
@@ -601,7 +755,7 @@ if ($discoveredJobTypes | Where-Object { $_.JobType -eq 'CreateAutoScaleTemplate
     $asQuery = @"
 AppTraces
 | extend Props = parse_json(Properties)
-| where Props.Username in ($upnFilter)
+| where tostring(Props.Username) in ($upnFilter)
 | where Props.TaskStatus == "Success"
 | where Props.JobType == "CreateAutoScaleTemplate"
 | extend TaskResultRaw = tostring(Props.TaskResult)
@@ -615,16 +769,16 @@ AppTraces
 | distinct AsProfileName
 "@
 
-    $asResult = Invoke-AzOperationalInsightsQuery -WorkspaceId $LawWorkspaceId -Query $asQuery -ErrorAction SilentlyContinue
+    $asResult = Invoke-LawQuery -Query $asQuery
     if ($asResult.Results) {
-        $allAsProfiles = Get-NmeAutoScaleProfile -ErrorAction SilentlyContinue
+        $allAsProfiles = Invoke-RestMethod "$NmeUri/api/v1/auto-scale-profile" -Headers $NmeHeaders
         foreach ($asRow in $asResult.Results) {
             $profileName = $asRow.AsProfileName
             $matchingProfile = $allAsProfiles | Where-Object { $_.Name -eq $profileName }
             if ($matchingProfile) {
                 try {
                     Write-Log "Removing auto-scale profile '$profileName' (Id: $($matchingProfile.Id))..."
-                    Remove-NmeAutoScaleProfileId -ProfileId $matchingProfile.Id -ErrorAction Stop | Out-Null
+                    Invoke-RestMethod "$NmeUri/api/v1/auto-scale-profile/$($matchingProfile.id)" -Method Delete -Headers $NmeHeaders | Out-Null
                     Write-Log "Auto-scale profile '$profileName' removed."
                     $asProfilesRemoved++
                 } catch {
@@ -650,7 +804,7 @@ if ($discoveredJobTypes | Where-Object { $_.JobType -eq 'CreateAppPolicy' }) {
     $appQuery = @"
 AppTraces
 | extend Props = parse_json(Properties)
-| where Props.Username in ($upnFilter)
+| where tostring(Props.Username) in ($upnFilter)
 | where Props.TaskStatus == "Success"
 | where Props.JobType == "CreateAppPolicy"
 | extend TaskResultRaw = tostring(Props.TaskResult)
@@ -665,12 +819,11 @@ AppTraces
 | distinct AppPolicyName
 "@
 
-    $appResult = Invoke-AzOperationalInsightsQuery -WorkspaceId $LawWorkspaceId -Query $appQuery -ErrorAction SilentlyContinue
+    $appResult = Invoke-LawQuery -Query $appQuery
     if ($appResult.Results) {
         # Check both one-time and recurrent policies
-        $oneTimePolicies = Get-NmeAppManagementOneTimePolicy -CreatedSince '2020-01-01' -ErrorAction SilentlyContinue
-        $recurrentPolicies = Get-NmeAppManagementRecurrentPolicy -ErrorAction SilentlyContinue
-
+        $oneTimePolicies = Invoke-RestMethod "$NmeUri/api/v1/app-management/policy/onetime?createdSince=2020-01-01" -Headers $NmeHeaders
+        $recurrentPolicies = Invoke-RestMethod "$NmeUri/api/v1/app-management/policy/recurrent" -Headers $NmeHeaders
         foreach ($appRow in $appResult.Results) {
             $policyName = $appRow.AppPolicyName
             $matchingOneTime = $oneTimePolicies | Where-Object { $_.Name -eq $policyName }
@@ -679,7 +832,7 @@ AppTraces
             if ($matchingOneTime) {
                 try {
                     Write-Log "Removing one-time app policy '$policyName'..."
-                    Remove-NmeAppManagementOneTimePolicyId -PolicyId $matchingOneTime.Id -ErrorAction Stop | Out-Null
+                    Invoke-RestMethod "$NmeUri/api/v1/app-management/policy/onetime/$($matchingOneTime.id)" -Method Delete -Headers $NmeHeaders | Out-Null
                     Write-Log "One-time app policy '$policyName' removed."
                     $appPoliciesRemoved++
                 } catch {
@@ -690,7 +843,7 @@ AppTraces
             if ($matchingRecurrent) {
                 try {
                     Write-Log "Removing recurrent app policy '$policyName'..."
-                    Remove-NmeAppManagementRecurrentPolicyId -PolicyId $matchingRecurrent.Id -ErrorAction Stop | Out-Null
+                    Invoke-RestMethod "$NmeUri/api/v1/app-management/policy/recurrent/$($matchingRecurrent.id)" -Method Delete -Headers $NmeHeaders | Out-Null
                     Write-Log "Recurrent app policy '$policyName' removed."
                     $appPoliciesRemoved++
                 } catch {
@@ -706,14 +859,14 @@ AppTraces
 
 #region 8. Remove scripted actions created by demo users
 
-if ($discoveredJobTypes | Where-Object { $_.JobType -eq 'CreateWindowsScriptedAction' }) {
+if ($discoveredJobTypes | Where-Object { $_.JobType -in @('CreateWindowsScriptedAction', 'CreateAutomationScriptedAction') }) {
     Write-Log "Checking for scripted actions created by demo users..."
     $saQuery = @"
 AppTraces
 | extend Props = parse_json(Properties)
-| where Props.Username in ($upnFilter)
+| where tostring(Props.Username) in ($upnFilter)
 | where Props.TaskStatus == "Success"
-| where Props.JobType == "CreateWindowsScriptedAction"
+| where tostring(Props.JobType) in ("CreateWindowsScriptedAction", "CreateAutomationScriptedAction")
 | extend TaskResultRaw = tostring(Props.TaskResult)
 | extend TaskResultArray = parse_json(TaskResultRaw)
 | mv-expand TaskResultArray
@@ -725,17 +878,17 @@ AppTraces
 | distinct ScriptedActionName
 "@
 
-    $saResult = Invoke-AzOperationalInsightsQuery -WorkspaceId $LawWorkspaceId -Query $saQuery -ErrorAction SilentlyContinue
+    $saResult = Invoke-LawQuery -Query $saQuery
     if ($saResult.Results) {
-        $allScriptedActions = Get-NmeScriptedActions -ErrorAction SilentlyContinue
-        $deleteRequest = New-NmeDeleteScriptedActionRequest -Force $true
+        $allScriptedActions = Invoke-RestMethod "$NmeUri/api/v1/scripted-actions" -Headers $NmeHeaders
+        $deleteRequestBody = @{ force = $true } | ConvertTo-Json
         foreach ($saRow in $saResult.Results) {
             $actionName = $saRow.ScriptedActionName
             $matchingAction = $allScriptedActions | Where-Object { $_.Name -eq $actionName }
             if ($matchingAction) {
                 try {
-                    Write-Log "Removing scripted action '$actionName' (Id: $($matchingAction.Id))..."
-                    Remove-NmeScriptedAction -Id $matchingAction.Id -NmeDeleteScriptedActionRequest $deleteRequest -ErrorAction Stop | Out-Null
+                    Write-Log "Removing scripted action '$actionName' (Id: $($matchingAction.id))..."
+                    Invoke-RestMethod "$NmeUri/api/v1/scripted-actions/$($matchingAction.id)" -Method Delete -Headers $NmeHeaders -Body $deleteRequestBody | Out-Null
                     Write-Log "Scripted action '$actionName' removed."
                     $scriptedActionsRemoved++
                 } catch {
@@ -756,7 +909,7 @@ if ($discoveredJobTypes | Where-Object { $_.JobType -eq 'CreateDesktopImage' }) 
     $diQuery = @"
 AppTraces
 | extend Props = parse_json(Properties)
-| where Props.Username in ($upnFilter)
+| where tostring(Props.Username) in ($upnFilter)
 | where Props.TaskStatus == "Success"
 | where Props.JobType == "CreateDesktopImage"
 | where Props.TaskName == "Create network interface"
@@ -772,7 +925,7 @@ AppTraces
 | distinct DiSub, DiRg, ImageName, NicResourceId
 "@
 
-    $diResult = Invoke-AzOperationalInsightsQuery -WorkspaceId $LawWorkspaceId -Query $diQuery -ErrorAction SilentlyContinue
+    $diResult = Invoke-LawQuery -Query $diQuery
     if ($diResult.Results) {
         foreach ($diRow in $diResult.Results) {
             $imageName = $diRow.ImageName
@@ -813,6 +966,39 @@ AppTraces
                 Write-Log "Failed to remove OS disk for '$imageName': $($_.Exception.Message)" 'WARN'
                 $errors++
             }
+
+            # Remove captured compute images (VM may have been sysprepped/captured before deletion)
+            try {
+                $capturedImages = Get-AzImage -ResourceGroupName $diRg -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "$imageName*" }
+                foreach ($image in $capturedImages) {
+                    Write-Log "Removing captured image '$($image.Name)' in $diRg..."
+                    Remove-AzImage -ResourceGroupName $diRg -ImageName $image.Name -Force -ErrorAction Stop | Out-Null
+                    Write-Log "Captured image '$($image.Name)' removed."
+                }
+            } catch {
+                Write-Log "Failed to remove captured image(s) for '$imageName': $($_.Exception.Message)" 'WARN'
+                $errors++
+            }
+        }
+    }
+}
+
+# Fallback: scan demo RG for any captured images not discovered via LAW
+# (e.g. SysprepVM → SysprepVM-image captured after 'Smurfs' VM was logged)
+if ($ResourceGroupName) {
+    $remainingImages = @(Get-AzImage -ResourceGroupName $ResourceGroupName -ErrorAction SilentlyContinue)
+    if ($remainingImages.Count -gt 0) {
+        Write-Log "Scanning '$ResourceGroupName' for orphaned captured images..."
+        foreach ($img in $remainingImages) {
+            try {
+                Write-Log "Removing captured image '$($img.Name)' from $ResourceGroupName (RG scan fallback)..."
+                Remove-AzImage -ResourceGroupName $ResourceGroupName -ImageName $img.Name -Force -ErrorAction Stop | Out-Null
+                Write-Log "Captured image '$($img.Name)' removed."
+                $desktopImagesRemoved++
+            } catch {
+                Write-Log "Failed to remove captured image '$($img.Name)': $($_.Exception.Message)" 'WARN'
+                $errors++
+            }
         }
     }
 }
@@ -826,7 +1012,7 @@ if ($discoveredJobTypes | Where-Object { $_.JobType -eq 'AddFileShare' }) {
     $storQuery = @"
 AppTraces
 | extend Props = parse_json(Properties)
-| where Props.Username in ($upnFilter)
+| where tostring(Props.Username) in ($upnFilter)
 | where Props.TaskStatus == "Success"
 | where Props.JobType == "AddFileShare"
 | where Props.TaskName startswith "Create Storage Account:"
@@ -842,7 +1028,7 @@ AppTraces
 | distinct StorageAccountName, StorageRg
 "@
 
-    $storResult = Invoke-AzOperationalInsightsQuery -WorkspaceId $LawWorkspaceId -Query $storQuery -ErrorAction SilentlyContinue
+    $storResult = Invoke-LawQuery -Query $storQuery
     if ($storResult.Results) {
         foreach ($storRow in $storResult.Results) {
             $saName = $storRow.StorageAccountName
@@ -864,7 +1050,7 @@ AppTraces
     $storNicQuery = @"
 AppTraces
 | extend Props = parse_json(Properties)
-| where Props.Username in ($upnFilter)
+| where tostring(Props.Username) in ($upnFilter)
 | where Props.TaskStatus == "Success"
 | where Props.JobType == "AddFileShare"
 | where Props.TaskName == "Create network interface"
@@ -880,7 +1066,7 @@ AppTraces
 | distinct NicSub, NicRg, VmName, NicName
 "@
 
-    $storNicResult = Invoke-AzOperationalInsightsQuery -WorkspaceId $LawWorkspaceId -Query $storNicQuery -ErrorAction SilentlyContinue
+    $storNicResult = Invoke-LawQuery -Query $storNicQuery
     if ($storNicResult.Results) {
         foreach ($nicRow in $storNicResult.Results) {
             $vmName = $nicRow.VmName
@@ -929,10 +1115,84 @@ AppTraces
 
 #endregion
 
+#region 10b. Remove VNets created by demo users
+
+if ($discoveredJobTypes | Where-Object { $_.JobType -eq 'CreateNetwork' }) {
+    Write-Log "Checking for VNets created by demo users..."
+
+    # Query the Networks SQL table for VNets scoped to the demo subscription.
+    # NetworkId format: /subscriptions/{sub}/resourceGroups/{rg}/providers/Microsoft.Network/virtualNetworks/{name}
+    $networkPattern = "%/subscriptions/$SubscriptionId/%/providers/Microsoft.Network/virtualNetworks/%"
+    try {
+        $networkRows = Invoke-NmeSql -Connection $SqlConnection `
+            -Query "SELECT NetworkId FROM Networks WHERE NetworkId LIKE @Pattern" `
+            -Parameters @{ '@Pattern' = $networkPattern } -AsDataTable
+    } catch {
+        Write-Log "Failed to query Networks SQL table: $($_.Exception.Message)" 'WARN'
+        $networkRows = $null
+        $errors++
+    }
+
+    if ($networkRows -and $networkRows.Rows.Count -gt 0) {
+        foreach ($row in $networkRows.Rows) {
+            $networkArmId = $row.NetworkId
+            if ($networkArmId -match '/subscriptions/([^/]+)/resourceGroups/([^/]+)/providers/Microsoft\.Network/virtualNetworks/([^/]+)') {
+                $vnetSub = $Matches[1]
+                $vnetRg  = $Matches[2]
+                $vnetName = $Matches[3]
+
+                # Null FK references in DynamicPoolConfigurations and VmTemplates before deleting
+                foreach ($fkQuery in @(
+                    "UPDATE DynamicPoolConfigurations SET SecondaryNetworkDbId = NULL WHERE SecondaryNetworkDbId IN (SELECT Id FROM Networks WHERE NetworkId = @NetworkId)",
+                    "UPDATE VmTemplates SET NetworkDbId = NULL WHERE NetworkDbId IN (SELECT Id FROM Networks WHERE NetworkId = @NetworkId)"
+                )) {
+                    try {
+                        Invoke-NmeSql -Connection $SqlConnection -Query $fkQuery -Parameters @{ '@NetworkId' = $networkArmId } | Out-Null
+                    } catch {
+                        Write-Log "Failed to null FK for VNet '$vnetName': $($_.Exception.Message)" 'WARN'
+                    }
+                }
+
+                # Remove the Azure VNet
+                try {
+                    Write-Log "Removing VNet '$vnetName' in $vnetRg..."
+                    Remove-AzVirtualNetwork -ResourceGroupName $vnetRg -Name $vnetName -Force -ErrorAction Stop | Out-Null
+                    Write-Log "VNet '$vnetName' removed from Azure."
+                } catch {
+                    if ($_.Exception.Message -notmatch 'not found|could not be found') {
+                        Write-Log "Failed to remove VNet '$vnetName': $($_.Exception.Message)" 'WARN'
+                        $errors++
+                    } else {
+                        Write-Log "VNet '$vnetName' already gone from Azure."
+                    }
+                }
+
+                # Delete from Networks SQL table
+                try {
+                    $rowsDeleted = Invoke-NmeSql -Connection $SqlConnection `
+                        -Query "DELETE FROM Networks WHERE NetworkId = @NetworkId" `
+                        -Parameters @{ '@NetworkId' = $networkArmId }
+                    if ($rowsDeleted -gt 0) {
+                        Write-Log "Removed VNet '$vnetName' from Networks SQL table."
+                        $dbResourcesRemoved++
+                    }
+                } catch {
+                    Write-Log "Failed to delete VNet '$vnetName' from Networks SQL table: $($_.Exception.Message)" 'WARN'
+                    $errors++
+                }
+            }
+        }
+    } else {
+        Write-Log "No VNets found in Networks SQL table for this subscription."
+    }
+}
+
+#endregion
+
 #region 11. Remove workspaces
 
 # Remove the workspace we created for the demo environment
-$Workspace = Get-NmeWorkspace -ErrorAction SilentlyContinue | Where-Object { $_.id.name -eq $NewWorkspaceName }
+$Workspace = (Invoke-RestMethod "$NmeUri/api/v1/workspace" -Headers $NmeHeaders -ErrorAction SilentlyContinue) | Where-Object { $_.id.name -eq $NewWorkspaceName }
 if ($null -ne $Workspace) {
     try {
         Write-Log "Removing workspace $NewWorkspaceName..."
@@ -953,7 +1213,7 @@ if ($discoveredJobTypes | Where-Object { $_.JobType -eq 'CreateWorkspace' }) {
     $wsQuery = @"
 AppTraces
 | extend Props = parse_json(Properties)
-| where Props.Username in ($upnFilter)
+| where tostring(Props.Username) in ($upnFilter)
 | where Props.TaskStatus == "Success"
 | where Props.JobType == "CreateWorkspace"
 | where Props.TaskName == "Create workspace"
@@ -968,9 +1228,9 @@ AppTraces
 | distinct WsName
 "@
 
-    $wsResult = Invoke-AzOperationalInsightsQuery -WorkspaceId $LawWorkspaceId -Query $wsQuery -ErrorAction SilentlyContinue
+    $wsResult = Invoke-LawQuery -Query $wsQuery
     if ($wsResult.Results) {
-        $allWorkspaces = Get-NmeWorkspace -ErrorAction SilentlyContinue
+        $allWorkspaces = Invoke-RestMethod "$NmeUri/api/v1/workspace" -Headers $NmeHeaders
         foreach ($wsRow in $wsResult.Results) {
             $wsName = $wsRow.WsName
             if ($wsName -eq $NewWorkspaceName) { continue } # Already handled above
@@ -1006,7 +1266,7 @@ function Build-ChangelogNameQuery {
     return @"
 AppTraces
 | extend Props = parse_json(Properties)
-| where Props.Username in ($upnFilter)
+| where tostring(Props.Username) in ($upnFilter)
 | where Props.TaskStatus == "Success"
 | where Props.JobType == "$jobType"
 | extend TaskResultRaw = tostring(Props.TaskResult)
@@ -1026,7 +1286,7 @@ $sqlCleanupTypes = @(
        ParseQuery = @"
 AppTraces
 | extend Props = parse_json(Properties)
-| where Props.Username in ($upnFilter)
+| where tostring(Props.Username) in ($upnFilter)
 | where Props.TaskStatus == "Success"
 | where Props.JobType == "CreateActiveDirectoryConfig"
 | extend TaskResultRaw = tostring(Props.TaskResult)
@@ -1053,6 +1313,8 @@ AppTraces
        ParseQuery = Build-ChangelogNameQuery 'CreateShellApp' 'Name' }
     @{ JobType = 'CreateCustomView';                       NameField = 'Name'
        ParseQuery = Build-ChangelogNameQuery 'CreateCustomView' 'Name' }
+    @{ JobType = 'CreateHostPoolVmDeploymentProfile';      NameField = 'Name'
+       ParseQuery = Build-ChangelogNameQuery 'CreateHostPoolVmDeploymentProfile' 'Name' }
 )
 
 # SQL cleanup definitions: table name, name column, and any child tables that must be deleted first
@@ -1098,6 +1360,12 @@ $sqlCleanupMap = @{
         Table = 'CustomViews'; NameColumn = 'Name'
         PreCleanup = @()
     }
+    'CreateHostPoolVmDeploymentProfile' = @{
+        Table = 'VmDeploymentProfiles'; NameColumn = 'Name'
+        PreCleanup = @(
+            "UPDATE HostPoolProperties SET VmDeploymentProfileId = NULL WHERE VmDeploymentProfileId IN (SELECT Id FROM VmDeploymentProfiles WHERE Name = @Name)"
+        )
+    }
 }
 
 foreach ($cleanupType in $sqlCleanupTypes) {
@@ -1111,7 +1379,7 @@ foreach ($cleanupType in $sqlCleanupTypes) {
 
     # Try LAW query first if available
     if ($cleanupType.ParseQuery) {
-        $lawResult = Invoke-AzOperationalInsightsQuery -WorkspaceId $LawWorkspaceId -Query $cleanupType.ParseQuery -ErrorAction SilentlyContinue
+        $lawResult = Invoke-LawQuery -Query $cleanupType.ParseQuery
         if ($lawResult.Results) {
             foreach ($row in $lawResult.Results) {
                 if (-not [string]::IsNullOrWhiteSpace($row.ResourceName)) {
@@ -1206,7 +1474,7 @@ foreach ($cleanupType in $sqlCleanupTypes) {
 
 $ScheduleName = "$EnvironmentName-destroy-schedule"
 $Schedule = Get-AzAutomationSchedule -Name $ScheduleName -ResourceGroupName $AutomationRg -AutomationAccountName $automationAccountName -ErrorAction SilentlyContinue
-if ($null -ne $Schedule) {
+    if ($null -ne $Schedule) {
     try {
         Write-Log "Removing cleanup schedule '$ScheduleName'..."
         Remove-AzAutomationSchedule -Name $ScheduleName -ResourceGroupName $AutomationRg -AutomationAccountName $automationAccountName -Force -ErrorAction Stop
@@ -1241,9 +1509,10 @@ Write-Log "App policies:         $appPoliciesRemoved"
 Write-Log "Scripted actions:     $scriptedActionsRemoved"
 Write-Log "Desktop images:       $desktopImagesRemoved"
 Write-Log "Storage accounts:     $storageAccountsRemoved"
-Write-Log "DB resources removed: $dbResourcesRemoved"
+Write-Log "DB resources removed: $dbResourcesRemoved  (includes VNet SQL rows)"
 Write-Log "Workspaces removed:   $workspacesRemoved"
-Write-Log "Users removed:        $usersRemoved"
+Write-Log "Users removed:
+        $usersRemoved"
 Write-Log "Errors:               $errors"
 
 #endregion
