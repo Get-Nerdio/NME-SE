@@ -412,6 +412,7 @@ AppTraces
 | extend HostPoolSub = coalesce(SubFromPayload, HpSubFromPath)
 | where isnotempty(HostPoolName)
 | where HostPoolSub =~ "$SubscriptionId"
+| where HostPoolRg =~ "$ResourceGroupName"
 | distinct HostPoolSub, HostPoolRg, HostPoolName
 "@
 
@@ -626,6 +627,16 @@ if ($discoveredHostPools.Count -gt 0) {
                     # Remove the session host registration from AVD
                     Remove-AzWvdSessionHost -ResourceGroupName $hp.HostPoolRg -HostPoolName $hp.HostPoolName `
                         -Name $shVmName -Force -ErrorAction SilentlyContinue | Out-Null
+                }
+                # Remove associated ApplicationGroups first — host pool deletion fails (400) if any remain
+                $appGroups = @(Get-AzWvdApplicationGroup -ResourceGroupName $hp.HostPoolRg `
+                    -ErrorAction SilentlyContinue |
+                    Where-Object { $_.HostPoolArmPath -like "*/hostPools/$($hp.HostPoolName)" })
+                foreach ($ag in $appGroups) {
+                    Write-Log "Removing ApplicationGroup '$($ag.Name)' from '$($hp.HostPoolName)'..."
+                    Remove-AzWvdApplicationGroup -ResourceGroupName $hp.HostPoolRg -Name $ag.Name `
+                        -ErrorAction SilentlyContinue | Out-Null
+                    Write-Log "ApplicationGroup '$($ag.Name)' removed."
                 }
                 Write-Log "Removing host pool '$($hp.HostPoolName)' via Azure ARM..."
                 Remove-AzWvdHostPool -ResourceGroupName $hp.HostPoolRg -Name $hp.HostPoolName `
@@ -1117,8 +1128,10 @@ AppTraces
 
 #region 10b. Remove VNets created by demo users
 
-if ($discoveredJobTypes | Where-Object { $_.JobType -eq 'CreateNetwork' }) {
-    Write-Log "Checking for VNets created by demo users..."
+# Always scan the Networks SQL table for VNets in the demo subscription — do not gate on LAW
+# because CreateNetwork jobs may not appear if activity predates the LAW retention window.
+Write-Log "Checking for VNets in the demo subscription (Networks SQL table)..."
+if ($true) {
 
     # Query the Networks SQL table for VNets scoped to the demo subscription.
     # NetworkId format: /subscriptions/{sub}/resourceGroups/{rg}/providers/Microsoft.Network/virtualNetworks/{name}
@@ -1184,6 +1197,55 @@ if ($discoveredJobTypes | Where-Object { $_.JobType -eq 'CreateNetwork' }) {
         }
     } else {
         Write-Log "No VNets found in Networks SQL table for this subscription."
+    }
+}
+
+#endregion
+
+#region 10c. Remove orphaned VMs in the demo resource group
+
+# After host-pool session-host removal, scan the demo RG for any VMs that are not
+# currently registered as a session host in any remaining host pool. These are typically
+# desktop-image VMs (e.g. SysprepVM) or VMs whose session host registration was already
+# deleted but the underlying Azure VM, NIC, and disk were never removed.
+if ($ResourceGroupName) {
+    Write-Log "Scanning '$ResourceGroupName' for orphaned VMs (not registered as session hosts)..."
+
+    # Build a set of VM names still registered as session hosts in this subscription/RG
+    $registeredShVmNames = @{}
+    $remainingHpList = @(Get-AzWvdHostPool -ResourceGroupName $ResourceGroupName `
+        -SubscriptionId $SubscriptionId -ErrorAction SilentlyContinue)
+    foreach ($rhp in $remainingHpList) {
+        $shList = @(Get-AzWvdSessionHost -ResourceGroupName $ResourceGroupName `
+            -HostPoolName $rhp.Name -ErrorAction SilentlyContinue)
+        foreach ($sh in $shList) {
+            $registeredShVmNames[($sh.Name -split '/')[-1]] = $true
+        }
+    }
+
+    $allVmsInRg = @(Get-AzVM -ResourceGroupName $ResourceGroupName -ErrorAction SilentlyContinue)
+    foreach ($vm in $allVmsInRg) {
+        if ($registeredShVmNames.ContainsKey($vm.Name)) { continue }  # still a session host
+        Write-Log "Removing orphaned VM '$($vm.Name)' from $ResourceGroupName..."
+        try {
+            $vmNicIds    = @($vm.NetworkProfile.NetworkInterfaces | Select-Object -ExpandProperty Id)
+            $vmOsDiskName = $vm.StorageProfile.OsDisk.Name
+            Remove-AzVM -ResourceGroupName $ResourceGroupName -Name $vm.Name -ForceDeletion $true -Force -ErrorAction Stop | Out-Null
+            Write-Log "Orphaned VM '$($vm.Name)' removed."
+            foreach ($nicId in $vmNicIds) {
+                $nicName = ($nicId -split '/')[-1]
+                $nicRg   = ($nicId -replace '^.*/resourceGroups/([^/]+)/.*$', '$1')
+                Remove-AzNetworkInterface -ResourceGroupName $nicRg -Name $nicName -Force -ErrorAction SilentlyContinue | Out-Null
+                Write-Log "NIC '$nicName' removed."
+            }
+            if ($vmOsDiskName) {
+                Remove-AzDisk -ResourceGroupName $ResourceGroupName -DiskName $vmOsDiskName -Force -ErrorAction SilentlyContinue | Out-Null
+                Write-Log "OS disk '$vmOsDiskName' removed."
+            }
+        } catch {
+            Write-Log "Failed to remove orphaned VM '$($vm.Name)': $($_.Exception.Message)" 'WARN'
+            $errors++
+        }
     }
 }
 
