@@ -1133,13 +1133,15 @@ AppTraces
 Write-Log "Checking for VNets in the demo subscription (Networks SQL table)..."
 if ($true) {
 
-    # Query the Networks SQL table for VNets scoped to the demo subscription.
+    # Query the Networks SQL table for VNets in the demo resource group.
     # NetworkId format: /subscriptions/{sub}/resourceGroups/{rg}/providers/Microsoft.Network/virtualNetworks/{name}
-    $networkPattern = "%/subscriptions/$SubscriptionId/%/providers/Microsoft.Network/virtualNetworks/%"
+    # Use the resource group name as the filter (simpler and unambiguous vs subscription GUID LIKE patterns).
+    $networkRgPattern = "%/resourceGroups/$ResourceGroupName/%"
     try {
         $networkRows = Invoke-NmeSql -Connection $SqlConnection `
             -Query "SELECT NetworkId FROM Networks WHERE NetworkId LIKE @Pattern" `
-            -Parameters @{ '@Pattern' = $networkPattern } -AsDataTable
+            -Parameters @{ '@Pattern' = $networkRgPattern } -AsDataTable
+        Write-Log "Networks SQL query returned $($networkRows.Rows.Count) row(s) for RG '$ResourceGroupName'."
     } catch {
         Write-Log "Failed to query Networks SQL table: $($_.Exception.Message)" 'WARN'
         $networkRows = $null
