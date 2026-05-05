@@ -1185,8 +1185,8 @@ if ($RemoveUndefinedResources) {
                 }
                 Write-Log "Removing session host '$shVmName' from '$($liveHp.Name)'..."
                 try {
-                    # forceRemoveWVDRecord removes the WVD registration even if the underlying VM is gone
-                    $shBody   = @{ forceRemoveWVDRecord = $true; skipAdRemoval = $false } | ConvertTo-Json
+                    # jobPayload wrapper required by SessionHostRemove schema
+                    $shBody = @{ jobPayload = @{ forceRemoveWVDRecord = $true; skipAdRemoval = $false; removeUsedVmName = $false } } | ConvertTo-Json -Depth 5
                     $shResult = Invoke-NmeApi -Method DELETE -Uri "$strayUrl/host/$([uri]::EscapeDataString($shVmName))" -Body $shBody
                     if ($shResult.job.id) {
                         Wait-NmeJob -JobId $shResult.job.id -Description "remove session host '$shVmName' from '$($liveHp.Name)'"
