@@ -83,6 +83,9 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# PowerShell 5.1 in Azure Automation defaults to TLS 1.0/1.1 — force TLS 1.2
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
 #region 1 — Helpers
 
 function Write-Log {
