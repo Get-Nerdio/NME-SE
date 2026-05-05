@@ -256,12 +256,15 @@ function Compare-HpFslogixAssignment {
 }
 
 function Compare-HpAutoScale {
-    param([PSCustomObject]$Live, [PSCustomObject]$Desired, [string]$DesiredPrefix)
-    if ($Live.isEnabled            -ne $Desired.isEnabled)          { return $true }
-    if ($Live.hostPoolCapacity     -ne $Desired.hostPoolCapacity)   { return $true }
-    if ($Live.minActiveHostsCount  -ne $Desired.minActiveHostsCount) { return $true }
-    if ($Live.vmTemplate.size      -ne $Desired.vmSize)             { return $true }
-    if ($Live.vmTemplate.prefix    -ne $DesiredPrefix)              { return $true }
+    param([PSCustomObject]$Live, [PSCustomObject]$Desired, [string]$DesiredPrefix, [string]$PoolType = 'Pooled')
+    if ($Live.isEnabled -ne $Desired.isEnabled) { return $true }
+    # Personal pools: NME does not surface hostPoolCapacity/minActiveHostsCount — skip comparison
+    if ($PoolType -ne 'Personal') {
+        if ($Live.hostPoolCapacity    -ne $Desired.hostPoolCapacity)    { return $true }
+        if ($Live.minActiveHostsCount -ne $Desired.minActiveHostsCount) { return $true }
+    }
+    if ($Live.vmTemplate.size   -ne $Desired.vmSize)    { return $true }
+    if ($Live.vmTemplate.prefix -ne $DesiredPrefix)     { return $true }
     return $false
 }
 
@@ -1100,7 +1103,7 @@ foreach ($entry in $DesiredState.hostPools) {
                     Invoke-NmeApi -Method POST -Uri "$hpUrl/auto-scale" | Out-Null
                     $liveAs = Invoke-NmeApi -Method GET -Uri "$hpUrl/auto-scale"
                 }
-                if (Compare-HpAutoScale -Live $liveAs -Desired $entry.autoScale -DesiredPrefix $hpVmPrefixTemplate) {
+                if (Compare-HpAutoScale -Live $liveAs -Desired $entry.autoScale -DesiredPrefix $hpVmPrefixTemplate -PoolType $entry.poolType) {
                     Write-Log "Auto-scale config drifted on '$hpName' (isEnabled=$($liveAs.isEnabled), vmSize=$($liveAs.vmTemplate.size), prefix='$($liveAs.vmTemplate.prefix)', capacity=$($liveAs.hostPoolCapacity), minActive=$($liveAs.minActiveHostsCount))."
                     if (-not $WhatIf) {
                         # Read-modify-write: patch only the desired-state fields
@@ -1176,9 +1179,15 @@ if ($RemoveUndefinedResources) {
             foreach ($sh in $strayHosts) {
                 # NME returns session hosts with a 'hostName' field (e.g. "vm-abc-0.domain.com")
                 $shVmName = $sh.hostName
+                if ([string]::IsNullOrWhiteSpace($shVmName)) {
+                    Write-Log "Session host with null/empty hostName on '$($liveHp.Name)' — skipping." 'WARN'
+                    continue
+                }
                 Write-Log "Removing session host '$shVmName' from '$($liveHp.Name)'..."
                 try {
-                    $shResult = Invoke-NmeApi -Method DELETE -Uri "$strayUrl/host/$([uri]::EscapeDataString($shVmName))"
+                    # forceRemoveWVDRecord removes the WVD registration even if the underlying VM is gone
+                    $shBody   = @{ forceRemoveWVDRecord = $true; skipAdRemoval = $false } | ConvertTo-Json
+                    $shResult = Invoke-NmeApi -Method DELETE -Uri "$strayUrl/host/$([uri]::EscapeDataString($shVmName))" -Body $shBody
                     if ($shResult.job.id) {
                         Wait-NmeJob -JobId $shResult.job.id -Description "remove session host '$shVmName' from '$($liveHp.Name)'"
                     }
