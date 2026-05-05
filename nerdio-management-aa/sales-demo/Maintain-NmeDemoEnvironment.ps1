@@ -218,13 +218,6 @@ function Resolve-FslogixIdByName {
     return $match.id
 }
 
-function Resolve-AutoScaleIdByName {
-    param([string]$Name, [array]$LiveProfiles)
-    $match = $LiveProfiles | Where-Object { $_.name -eq $Name }
-    if (-not $match) { return $null }
-    return $match.id
-}
-
 function Compare-HostPoolWvdProps {
     param([PSCustomObject]$Live, [PSCustomObject]$Desired)
     if ($Live.loadBalancerType -ne $Desired.loadBalancingAlgorithm) { return $true }
@@ -402,19 +395,8 @@ foreach ($hp in $liveHostPools) {
             if ($fslMatch) { $fslConfigName = $fslMatch.name }
         }
 
-        # Read auto-scale config
+        # Read auto-scale config (local HP rules — no profile assignment)
         $asConfig = Invoke-NmeApi -Method GET -Uri "$NmeUri/api/v1/arm/hostpool/$hpSub/$hpRg/$hpName/auto-scale"
-
-        # Find which profile is assigned — search all profiles' assignments
-        $assignedProfileName = $null
-        foreach ($profile in $liveAutoScale) {
-            try {
-                $assignments = Invoke-NmeApi -Method GET -Uri "$NmeUri/api/v1/auto-scale-profile/$($profile.id)/assignments"
-                $hpArmId = "/subscriptions/$hpSub/resourceGroups/$hpRg/providers/Microsoft.DesktopVirtualization/hostpools/$hpName"
-                $match = $assignments | Where-Object { $_.hostPoolId -like "*$hpName" }
-                if ($match) { $assignedProfileName = $profile.name; break }
-            } catch { }
-        }
 
         $poolType = if ($hp.HostPoolType -eq 'Personal') { 'Personal' } else { 'Pooled' }
         $entry = [ordered]@{
@@ -432,7 +414,6 @@ foreach ($hp in $liveHostPools) {
             maxSessionLimit         = $wvd.maxSessionLimit
             fslogixConfigName       = $fslConfigName
             autoScale               = [ordered]@{
-                profileName         = $assignedProfileName
                 isEnabled           = $asConfig.isEnabled
                 vmSize              = $asConfig.vmTemplate.vmSize
                 hostPoolCapacity    = $asConfig.hostPoolCapacity
@@ -614,30 +595,17 @@ foreach ($live in $liveFslogix) {
 #region 9 — Reconcile Auto-Scale Profiles
 
 Write-Log "--- Reconcile Auto-Scale Profiles ---"
+# Note: host pools use local auto-scale rules, not profile assignments.
+# This section only verifies expected profiles exist (for use by demo users who
+# may want to assign them manually). Missing profiles are logged as warnings —
+# they must be created manually in NME since the full schedule configuration
+# cannot be derived from the desired-state schema.
 
 foreach ($entry in $DesiredState.autoScaleProfiles) {
     $live = $liveAutoScale | Where-Object { $_.name -eq $entry.name }
 
     if (-not $live) {
-        Write-Log "Auto-scale profile '$($entry.name)' not found. Creating..."
-        if (-not $WhatIf) {
-            $asBody = @{
-                name        = $entry.name
-                description = $entry.description
-                mode        = $entry.mode
-            } | ConvertTo-Json -Depth 5
-            try {
-                Invoke-NmeApi -Method POST -Uri "$NmeUri/api/v1/auto-scale-profile" -Body $asBody | Out-Null
-                $asCreated++
-                Write-Log "Auto-scale profile '$($entry.name)' created."
-                $liveAutoScale = Invoke-NmeApi -Method GET -Uri "$NmeUri/api/v1/auto-scale-profile"
-                if (-not $liveAutoScale) { $liveAutoScale = @() }
-            } catch {
-                Add-NonFatalError "Failed to create auto-scale profile '$($entry.name)': $($_.Exception.Message)"
-            }
-        } else {
-            Write-Log "[WHATIF] Would create auto-scale profile '$($entry.name)'."
-        }
+        Write-Log "Auto-scale profile '$($entry.name)' not found. Create it manually in NME (mode=$($entry.mode))." 'WARN'
     } elseif ($live.mode -ne $entry.mode) {
         Write-Log "Auto-scale profile '$($entry.name)' mode drifted ('$($live.mode)' → '$($entry.mode)'). Updating..."
         if (-not $WhatIf) {
@@ -708,15 +676,6 @@ foreach ($entry in $DesiredState.hostPools) {
         }
     }
 
-    # Resolve auto-scale profile ID
-    $resolvedAsId = $null
-    if ($entry.autoScale.profileName) {
-        $resolvedAsId = Resolve-AutoScaleIdByName -Name $entry.autoScale.profileName -LiveProfiles $liveAutoScale
-        if (-not $resolvedAsId) {
-            Add-NonFatalError "Cannot resolve auto-scale profile '$($entry.autoScale.profileName)' for host pool '$hpName'. Skipping auto-scale operations."
-        }
-    }
-
     $liveHp = $liveHostPools | Where-Object { $_.Name -eq $hpName }
     $tag    = if ($liveHp) { Get-ArmTagValue -ResourceId $liveHp.Id -TagName 'NME-SE-Manage' } else { $null }
 
@@ -780,28 +739,24 @@ foreach ($entry in $DesiredState.hostPools) {
             }
             Write-Log "WVD props set on '$hpName'."
 
-            # Assign auto-scale profile
-            if ($resolvedAsId) {
-                $hpArmId = "/subscriptions/$hpSub/resourceGroups/$hpRg/providers/Microsoft.DesktopVirtualization/hostpools/$hpName"
-                $assignBody = @{ hostPoolId = $hpArmId; type = 'Default' } | ConvertTo-Json
-                Invoke-NmeApi -Method POST -Uri "$NmeUri/api/v1/auto-scale-profile/$resolvedAsId/assignments" -Body $assignBody | Out-Null
-                Write-Log "Auto-scale profile '$($entry.autoScale.profileName)' assigned to '$hpName'."
-            }
-
-            # Set auto-scale config via read-modify-write
-            if ($resolvedAsId) {
-                $asConfig = Invoke-NmeApi -Method GET -Uri "$hpUrl/auto-scale"
-                $asConfig.isEnabled           = $entry.autoScale.isEnabled
-                $asConfig.hostPoolCapacity    = $entry.autoScale.hostPoolCapacity
-                $asConfig.minActiveHostsCount = $entry.autoScale.minActiveHostsCount
-                if ($asConfig.vmTemplate) {
-                    $asConfig.vmTemplate.vmSize = $entry.autoScale.vmSize
+            # Set auto-scale config directly on HP (local rules, no profile assignment)
+            if ($entry.autoScale) {
+                try {
+                    $asConfig = Invoke-NmeApi -Method GET -Uri "$hpUrl/auto-scale"
+                    $asConfig.isEnabled           = $entry.autoScale.isEnabled
+                    $asConfig.hostPoolCapacity    = $entry.autoScale.hostPoolCapacity
+                    $asConfig.minActiveHostsCount = $entry.autoScale.minActiveHostsCount
+                    if ($asConfig.vmTemplate) {
+                        $asConfig.vmTemplate.vmSize = $entry.autoScale.vmSize
+                    }
+                    $asResult = Invoke-NmeApi -Method PUT -Uri "$hpUrl/auto-scale" -Body ($asConfig | ConvertTo-Json -Depth 20)
+                    if ($asResult.job.id) {
+                        Wait-NmeJob -JobId $asResult.job.id -Description "set auto-scale config on '$hpName'"
+                    }
+                    Write-Log "Auto-scale config set on '$hpName'."
+                } catch {
+                    Add-NonFatalError "Failed to set auto-scale config on '$hpName': $($_.Exception.Message)"
                 }
-                $asResult = Invoke-NmeApi -Method PUT -Uri "$hpUrl/auto-scale" -Body ($asConfig | ConvertTo-Json -Depth 20)
-                if ($asResult.job.id) {
-                    Wait-NmeJob -JobId $asResult.job.id -Description "set auto-scale config on '$hpName'"
-                }
-                Write-Log "Auto-scale config set on '$hpName'."
             }
 
             $hpCreated++
@@ -858,8 +813,8 @@ foreach ($entry in $DesiredState.hostPools) {
             }
         }
 
-        # Auto-scale config
-        if ($resolvedAsId) {
+        # Auto-scale config (local rules directly on HP — no profile assignment)
+        if ($entry.autoScale) {
             try {
                 $liveAs = Invoke-NmeApi -Method GET -Uri "$hpUrl/auto-scale"
                 if (Compare-HpAutoScale -Live $liveAs -Desired $entry.autoScale) {
@@ -949,8 +904,8 @@ if (-not $SkipSessionHostCheck) {
             if ($available -lt $minimum) {
                 Write-Log "HP '$hpName': $available available session host(s), minimum desired is $minimum." 'WARN'
 
-                # Re-enable auto-scale if it's disabled (only active remediation)
-                if (-not $WhatIf) {
+                # Re-enable auto-scale if it got disabled during demo
+                if (-not $WhatIf -and $entry.autoScale.isEnabled) {
                     try {
                         $liveAs = Invoke-NmeApi -Method GET -Uri "$hpUrl/auto-scale"
                         if (-not $liveAs.isEnabled) {

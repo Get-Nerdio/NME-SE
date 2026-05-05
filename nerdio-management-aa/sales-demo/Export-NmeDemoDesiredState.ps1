@@ -292,23 +292,6 @@ foreach ($hp in $liveHostPools) {
             if ($fslMatch) { $fslConfigName = $fslMatch.name }
         }
 
-        # Resolve auto-scale profile name from HP assignments
-        $assignedProfileName = $null
-        $assignedProfileId   = $null
-        foreach ($profile in $liveAutoScale) {
-            try {
-                $assignments = Invoke-NmeApi -Method GET -Uri "$NmeUri/api/v1/auto-scale-profile/$($profile.id)/assignments"
-                if (-not $assignments) { continue }
-                $hpArmIdSuffix = "/hostpools/$hpName"
-                $match = $assignments | Where-Object { $_.hostPoolId -like "*$hpArmIdSuffix" }
-                if ($match) {
-                    $assignedProfileName = $profile.name
-                    $assignedProfileId   = $profile.id
-                    break
-                }
-            } catch { }
-        }
-
         $poolType = if ($hp.HostPoolType -eq 'Personal') { 'Personal' } else { 'Pooled' }
 
         $hpEntry = [ordered]@{
@@ -326,7 +309,6 @@ foreach ($hp in $liveHostPools) {
             maxSessionLimit        = $wvd.maxSessionLimit
             fslogixConfigName      = $fslConfigName
             autoScale              = [ordered]@{
-                profileName         = $assignedProfileName
                 isEnabled           = $asConfig.isEnabled
                 vmSize              = $asConfig.vmTemplate.vmSize
                 hostPoolCapacity    = $asConfig.hostPoolCapacity
