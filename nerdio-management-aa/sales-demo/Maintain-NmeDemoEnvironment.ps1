@@ -754,6 +754,8 @@ foreach ($entry in $DesiredState.hostPools) {
             # Set auto-scale config directly on HP (local rules, no profile assignment)
             if ($entry.autoScale) {
                 try {
+                    # Convert static HP to dynamic (POST) — required before GET/PUT will succeed
+                    Invoke-NmeApi -Method POST -Uri "$hpUrl/auto-scale" | Out-Null
                     $asConfig = Invoke-NmeApi -Method GET -Uri "$hpUrl/auto-scale"
                     $asConfig.isEnabled           = $entry.autoScale.isEnabled
                     $asConfig.hostPoolCapacity    = $entry.autoScale.hostPoolCapacity
@@ -829,6 +831,12 @@ foreach ($entry in $DesiredState.hostPools) {
         if ($entry.autoScale) {
             try {
                 $liveAs = Invoke-NmeApi -Method GET -Uri "$hpUrl/auto-scale"
+                if (-not $liveAs) {
+                    # HP is static — convert to dynamic first
+                    Write-Log "Converting '$hpName' from static to dynamic (auto-scale)..."
+                    Invoke-NmeApi -Method POST -Uri "$hpUrl/auto-scale" | Out-Null
+                    $liveAs = Invoke-NmeApi -Method GET -Uri "$hpUrl/auto-scale"
+                }
                 if (Compare-HpAutoScale -Live $liveAs -Desired $entry.autoScale) {
                     Write-Log "Auto-scale config drifted on '$hpName' (isEnabled=$($liveAs.isEnabled), vmSize=$($liveAs.vmTemplate.vmSize), capacity=$($liveAs.hostPoolCapacity), minActive=$($liveAs.minActiveHostsCount))."
                     if (-not $WhatIf) {
