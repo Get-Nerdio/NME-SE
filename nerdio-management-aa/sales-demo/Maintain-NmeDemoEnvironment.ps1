@@ -754,9 +754,14 @@ foreach ($entry in $DesiredState.hostPools) {
             # Set auto-scale config directly on HP (local rules, no profile assignment)
             if ($entry.autoScale) {
                 try {
-                    # Convert static HP to dynamic (POST) — required before GET/PUT will succeed
-                    Invoke-NmeApi -Method POST -Uri "$hpUrl/auto-scale" | Out-Null
-                    $asConfig = Invoke-NmeApi -Method GET -Uri "$hpUrl/auto-scale"
+                    # Try GET; if 404 (HP is static) convert to dynamic first
+                    $asConfig = $null
+                    try { $asConfig = Invoke-NmeApi -Method GET -Uri "$hpUrl/auto-scale" } catch {}
+                    if (-not $asConfig) {
+                        Write-Log "Converting '$hpName' from static to dynamic (auto-scale)..."
+                        Invoke-NmeApi -Method POST -Uri "$hpUrl/auto-scale" | Out-Null
+                        $asConfig = Invoke-NmeApi -Method GET -Uri "$hpUrl/auto-scale"
+                    }
                     $asConfig.isEnabled           = $entry.autoScale.isEnabled
                     $asConfig.hostPoolCapacity    = $entry.autoScale.hostPoolCapacity
                     $asConfig.minActiveHostsCount = $entry.autoScale.minActiveHostsCount
@@ -830,7 +835,8 @@ foreach ($entry in $DesiredState.hostPools) {
         # Auto-scale config (local rules directly on HP — no profile assignment)
         if ($entry.autoScale) {
             try {
-                $liveAs = Invoke-NmeApi -Method GET -Uri "$hpUrl/auto-scale"
+                $liveAs = $null
+                try { $liveAs = Invoke-NmeApi -Method GET -Uri "$hpUrl/auto-scale" } catch {}
                 if (-not $liveAs) {
                     # HP is static — convert to dynamic first
                     Write-Log "Converting '$hpName' from static to dynamic (auto-scale)..."
@@ -927,7 +933,12 @@ if (-not $SkipSessionHostCheck) {
                 # Re-enable auto-scale if it got disabled during demo
                 if (-not $WhatIf -and $entry.autoScale.isEnabled) {
                     try {
-                        $liveAs = Invoke-NmeApi -Method GET -Uri "$hpUrl/auto-scale"
+                        $liveAs = $null
+                        try { $liveAs = Invoke-NmeApi -Method GET -Uri "$hpUrl/auto-scale" } catch {}
+                        if (-not $liveAs) {
+                            Invoke-NmeApi -Method POST -Uri "$hpUrl/auto-scale" | Out-Null
+                            $liveAs = Invoke-NmeApi -Method GET -Uri "$hpUrl/auto-scale"
+                        }
                         if (-not $liveAs.isEnabled) {
                             Write-Log "Auto-scale is disabled on '$hpName'. Re-enabling..."
                             $liveAs.isEnabled = $true
