@@ -762,9 +762,11 @@ foreach ($entry in $DesiredState.hostPools) {
                         Invoke-NmeApi -Method POST -Uri "$hpUrl/auto-scale" | Out-Null
                         $asConfig = Invoke-NmeApi -Method GET -Uri "$hpUrl/auto-scale"
                     }
-                    $asConfig.isEnabled           = $entry.autoScale.isEnabled
-                    $asConfig.hostPoolCapacity    = $entry.autoScale.hostPoolCapacity
-                    $asConfig.minActiveHostsCount = $entry.autoScale.minActiveHostsCount
+                    $asConfig.isEnabled = $entry.autoScale.isEnabled
+                    if ($entry.poolType -ne 'Personal') {
+                        $asConfig.hostPoolCapacity    = $entry.autoScale.hostPoolCapacity
+                        $asConfig.minActiveHostsCount = $entry.autoScale.minActiveHostsCount
+                    }
                     if ($asConfig.vmTemplate) {
                         $asConfig.vmTemplate.size = $entry.autoScale.vmSize
                     }
@@ -846,10 +848,13 @@ foreach ($entry in $DesiredState.hostPools) {
                 if (Compare-HpAutoScale -Live $liveAs -Desired $entry.autoScale) {
                     Write-Log "Auto-scale config drifted on '$hpName' (isEnabled=$($liveAs.isEnabled), vmSize=$($liveAs.vmTemplate.size), capacity=$($liveAs.hostPoolCapacity), minActive=$($liveAs.minActiveHostsCount))."
                     if (-not $WhatIf) {
-                        # Read-modify-write: patch only the 4 desired-state fields
-                        $liveAs.isEnabled           = $entry.autoScale.isEnabled
-                        $liveAs.hostPoolCapacity    = $entry.autoScale.hostPoolCapacity
-                        $liveAs.minActiveHostsCount = $entry.autoScale.minActiveHostsCount
+                        # Read-modify-write: patch only the desired-state fields
+                        # Personal pools don't support hostPoolCapacity/minActiveHostsCount
+                        $liveAs.isEnabled = $entry.autoScale.isEnabled
+                        if ($entry.poolType -ne 'Personal') {
+                            $liveAs.hostPoolCapacity    = $entry.autoScale.hostPoolCapacity
+                            $liveAs.minActiveHostsCount = $entry.autoScale.minActiveHostsCount
+                        }
                         if ($liveAs.vmTemplate) {
                             $liveAs.vmTemplate.size = $entry.autoScale.vmSize
                         }
