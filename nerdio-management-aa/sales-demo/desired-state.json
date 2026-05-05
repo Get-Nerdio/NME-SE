@@ -3,7 +3,7 @@
   "lastUpdated": "2026-05-05T00:00:00Z",
   "workspace": {
     "subscriptionId": "2b9dd21c-8f1d-44aa-a344-4527243840c7",
-    "resourceGroup": "nme-standard-1-autoclean-us",
+    "resourceGroup": "nw-salesdemo-resources-rg",
     "name": "sales-demo-workspace",
     "location": "centralus",
     "friendlyName": "NME Sales Demo"
@@ -40,7 +40,7 @@
     {
       "id": {
         "subscriptionId": "2b9dd21c-8f1d-44aa-a344-4527243840c7",
-        "resourceGroup": "nme-standard-1-autoclean-us",
+        "resourceGroup": "nw-salesdemo-resources-rg",
         "hostpoolName": "demo-pooled-desktop"
       },
       "friendlyName": "Demo Pooled Desktop",
@@ -61,7 +61,7 @@
     {
       "id": {
         "subscriptionId": "2b9dd21c-8f1d-44aa-a344-4527243840c7",
-        "resourceGroup": "nme-standard-1-autoclean-us",
+        "resourceGroup": "nw-salesdemo-resources-rg",
         "hostpoolName": "demo-pooled-remoteapp"
       },
       "friendlyName": "Demo Pooled RemoteApp",
@@ -82,7 +82,7 @@
     {
       "id": {
         "subscriptionId": "2b9dd21c-8f1d-44aa-a344-4527243840c7",
-        "resourceGroup": "nme-standard-1-autoclean-us",
+        "resourceGroup": "nw-salesdemo-resources-rg",
         "hostpoolName": "demo-singlesession-pooled"
       },
       "friendlyName": "Demo Single-Session Pooled",
@@ -103,7 +103,7 @@
     {
       "id": {
         "subscriptionId": "2b9dd21c-8f1d-44aa-a344-4527243840c7",
-        "resourceGroup": "nme-standard-1-autoclean-us",
+        "resourceGroup": "nw-salesdemo-resources-rg",
         "hostpoolName": "demo-personal-desktop"
       },
       "friendlyName": "Demo Personal Desktop",

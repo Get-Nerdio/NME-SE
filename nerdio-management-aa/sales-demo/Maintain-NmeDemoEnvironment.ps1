@@ -83,9 +83,6 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-# PowerShell 5.1 in Azure Automation defaults to TLS 1.0/1.1 — force TLS 1.2
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-
 #region 1 — Helpers
 
 function Write-Log {
@@ -145,9 +142,10 @@ function Invoke-NmeApi {
         [string]$Body = $null
     )
     $params = @{
-        Uri     = $Uri
-        Method  = $Method
-        Headers = $NmeHeaders
+        Uri                  = $Uri
+        Method               = $Method
+        Headers              = $NmeHeaders
+        SkipCertificateCheck = $true
     }
     if ($Body) { $params['Body'] = $Body }
     return Invoke-RestMethod @params
@@ -313,6 +311,17 @@ Write-Log "Connected to Azure subscription $SubscriptionId."
 
 $NmeHeaders = Get-NmeHeaders
 Write-Log "Connected to NME API at $NmeUri."
+
+# Connectivity diagnostic — logs full exception chain if SSL fails
+try {
+    $null = Invoke-RestMethod -Uri "$NmeUri/api/v1/workspace" -Method GET -Headers $NmeHeaders -SkipCertificateCheck -ErrorAction Stop
+    Write-Log "NME API connectivity: OK"
+} catch {
+    $ex = $_.Exception
+    $chain = @()
+    while ($ex) { $chain += $ex.GetType().Name + ': ' + $ex.Message; $ex = $ex.InnerException }
+    Write-Log "NME API connectivity FAILED — $($chain -join ' --> ')" 'WARN'
+}
 
 $ErrorActionPreference = 'Continue'
 
