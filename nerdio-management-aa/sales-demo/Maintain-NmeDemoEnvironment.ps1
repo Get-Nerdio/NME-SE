@@ -124,7 +124,7 @@ function Wait-NmeJob {
     $timeoutSeconds = 600
     $elapsed = 0
     $job = Invoke-RestMethod "$NmeUri/api/v1/job/$JobId" -Headers $NmeHeaders -SkipCertificateCheck
-    while ($job.jobStatus -in @('Pending', 'InProgress')) {
+    while ($job.jobStatus -in @('Pending', 'InProgress', 'Running')) {
         if ($elapsed -ge $timeoutSeconds) {
             throw "Timeout waiting for $Description (job $JobId) after ${timeoutSeconds}s"
         }
