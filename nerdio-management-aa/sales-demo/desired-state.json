@@ -1,130 +1,84 @@
 {
-  "schemaVersion": "1.0",
-  "lastUpdated": "2026-05-01T00:00:00Z",
-  "workspace": {
-    "subscriptionId": "2b9dd21c-8f1d-44aa-a344-4527243840c7",
-    "resourceGroup": "nme-standard-1-autoclean-us",
-    "name": "sales-demo-workspace",
-    "location": "centralus",
-    "friendlyName": "NME Sales Demo"
-  },
-  "fslogixConfigs": [
-    {
-      "name": "DemoFSLogix-Standard",
-      "isDefault": true,
-      "properties": {
-        "profileContainer": {
-          "locations": [
-            "\\\\PLACEHOLDER.file.core.windows.net\\profiles"
-          ]
-        },
-        "entraIdKerberos": true,
-        "cloudCache": false,
-        "pageBlobs": false
-      }
-    }
-  ],
-  "autoScaleProfiles": [
-    {
-      "name": "DemoAutoScale-Pooled",
-      "mode": "WorkingHours",
-      "description": "Pooled host pool scaling - business hours"
-    },
-    {
-      "name": "DemoAutoScale-Personal",
-      "mode": "UserDriven",
-      "description": "Personal desktop scaling - user-driven"
-    }
-  ],
-  "hostPools": [
-    {
-      "id": {
-        "subscriptionId": "2b9dd21c-8f1d-44aa-a344-4527243840c7",
-        "resourceGroup": "nme-standard-1-autoclean-us",
-        "hostpoolName": "demo-pooled-desktop"
-      },
-      "friendlyName": "Demo Pooled Desktop",
-      "description": "Multi-session pooled desktop host pool",
-      "poolType": "Pooled",
-      "isDesktop": true,
-      "isSingleUser": false,
-      "loadBalancingAlgorithm": "BreadthFirst",
-      "maxSessionLimit": 10,
-      "fslogixConfigName": "DemoFSLogix-Standard",
-      "autoScale": {
-        "profileName": "DemoAutoScale-Pooled",
-        "isEnabled": true,
-        "vmSize": "Standard_D4s_v5",
-        "hostPoolCapacity": 2,
-        "minActiveHostsCount": 1
-      }
-    },
-    {
-      "id": {
-        "subscriptionId": "2b9dd21c-8f1d-44aa-a344-4527243840c7",
-        "resourceGroup": "nme-standard-1-autoclean-us",
-        "hostpoolName": "demo-pooled-remoteapp"
-      },
-      "friendlyName": "Demo Pooled RemoteApp",
-      "description": "Multi-session pooled RemoteApp host pool",
-      "poolType": "Pooled",
-      "isDesktop": false,
-      "isSingleUser": false,
-      "loadBalancingAlgorithm": "BreadthFirst",
-      "maxSessionLimit": 10,
-      "fslogixConfigName": "DemoFSLogix-Standard",
-      "autoScale": {
-        "profileName": "DemoAutoScale-Pooled",
-        "isEnabled": true,
-        "vmSize": "Standard_D4s_v5",
-        "hostPoolCapacity": 2,
-        "minActiveHostsCount": 1
-      }
-    },
-    {
-      "id": {
-        "subscriptionId": "2b9dd21c-8f1d-44aa-a344-4527243840c7",
-        "resourceGroup": "nme-standard-1-autoclean-us",
-        "hostpoolName": "demo-singlesession-pooled"
-      },
-      "friendlyName": "Demo Single-Session Pooled",
-      "description": "Single-session pooled desktop host pool",
-      "poolType": "Pooled",
-      "isDesktop": true,
-      "isSingleUser": true,
-      "loadBalancingAlgorithm": "DepthFirst",
-      "maxSessionLimit": 1,
-      "fslogixConfigName": "DemoFSLogix-Standard",
-      "autoScale": {
-        "profileName": "DemoAutoScale-Pooled",
-        "isEnabled": true,
-        "vmSize": "Standard_D4s_v5",
-        "hostPoolCapacity": 2,
-        "minActiveHostsCount": 1
-      }
-    },
-    {
-      "id": {
-        "subscriptionId": "2b9dd21c-8f1d-44aa-a344-4527243840c7",
-        "resourceGroup": "nme-standard-1-autoclean-us",
-        "hostpoolName": "demo-personal-desktop"
-      },
-      "friendlyName": "Demo Personal Desktop",
-      "description": "Personal desktop host pool with automatic assignment",
-      "poolType": "Personal",
-      "personalAssignmentType": "Automatic",
-      "isDesktop": true,
-      "isSingleUser": true,
-      "loadBalancingAlgorithm": "Persistent",
-      "maxSessionLimit": 1,
-      "fslogixConfigName": "DemoFSLogix-Standard",
-      "autoScale": {
-        "profileName": "DemoAutoScale-Personal",
-        "isEnabled": true,
-        "vmSize": "Standard_D4s_v5",
-        "hostPoolCapacity": 2,
-        "minActiveHostsCount": 1
-      }
-    }
-  ]
+    "schemaVersion":  "1.0",
+    "lastUpdated":  "2026-05-05T13:19:01.7303005+00:00",
+    "workspace":  {
+                      "subscriptionId":  "2b9dd21c-8f1d-44aa-a344-4527243840c7",
+                      "resourceGroup":  "nme-standard-1-autoclean-us",
+                      "name":  "MJ-Workspace",
+                      "location":  "eastus2",
+                      "friendlyName":  ""
+                  },
+    "fslogixConfigs":  [
+                           {
+                               "name":  "Default profile",
+                               "isDefault":  false,
+                               "properties":  {
+                                                  "profileContainer":  {
+                                                                           "locations":  [
+
+                                                                                         ]
+                                                                       },
+                                                  "entraIdKerberos":  false,
+                                                  "cloudCache":  false,
+                                                  "pageBlobs":  false
+                                              }
+                           },
+                           {
+                               "name":  "standard-1-entraid",
+                               "isDefault":  true,
+                               "properties":  {
+                                                  "profileContainer":  {
+                                                                           "locations":  [
+                                                                                             "\\\\nmest1labsa.file.core.windows.net\\profiles"
+                                                                                         ]
+                                                                       },
+                                                  "entraIdKerberos":  true,
+                                                  "cloudCache":  false,
+                                                  "pageBlobs":  false
+                                              }
+                           },
+                           {
+                               "name":  "MJPRofiles",
+                               "isDefault":  false,
+                               "properties":  {
+                                                  "profileContainer":  {
+                                                                           "locations":  [
+                                                                                             "\\\\mjprofilesstorage.file.core.windows.net\\mjprofilesnew"
+                                                                                         ]
+                                                                       },
+                                                  "entraIdKerberos":  true,
+                                                  "cloudCache":  false,
+                                                  "pageBlobs":  false
+                                              }
+                           },
+                           {
+                               "name":  "entse4.local AD share",
+                               "isDefault":  false,
+                               "properties":  {
+                                                  "profileContainer":  {
+                                                                           "locations":  [
+                                                                                             "\\\\nmest1labsa2.file.core.windows.net\\ad-profiles"
+                                                                                         ]
+                                                                       },
+                                                  "entraIdKerberos":  false,
+                                                  "cloudCache":  false,
+                                                  "pageBlobs":  false
+                                              }
+                           }
+                       ],
+    "autoScaleProfiles":  [
+                              {
+                                  "name":  "Test UserDriven Profile",
+                                  "mode":  "UserDriven",
+                                  "description":  "Auto-scale profile created for testing"
+                              },
+                              {
+                                  "name":  "Test Default Profile",
+                                  "mode":  "Default",
+                                  "description":  "Auto-scale profile created for testing"
+                              }
+                          ],
+    "hostPools":  [
+
+                  ]
 }
