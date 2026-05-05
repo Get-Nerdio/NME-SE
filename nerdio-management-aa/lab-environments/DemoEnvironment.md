@@ -2,7 +2,8 @@
 
 ## Overview
 
-Two Azure Automation runbooks manage the lifecycle of Nerdio demo environments:
+Two Azure Automation runbooks manage the lifecycle of a customer-facing 
+Nerdio demo environment:
 
 - **New-NerdioDemoEnvironment.ps1** - Creates the environment (workspace, users, schedule)
 - **Cleanup-NerdioDemoEnvironment.ps1** - Tears down everything created by the setup script
@@ -224,7 +225,6 @@ resources that no longer exist could be orphaned.
 | Microsoft.Graph.Authentication | Managed identity Graph auth |
 | Microsoft.Graph.Users | User CRUD |
 | Microsoft.Graph.Users.Actions | Revoke sign-in sessions |
-| NerdioManagerPowerShell | NME API operations |
 
 ### Managed Identity Permissions
 

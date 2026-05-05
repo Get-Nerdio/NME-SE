@@ -1,6 +1,8 @@
 <#
 .SYNOPSIS
-  Creates a Nerdio demo environment with Entra ID users and an NME workspace.
+  Creates a Nerdio demo environment with Entra ID users and an NME workspace. 
+  This is intended to create a demo that customers can login to and see NME 
+  in action
 
 .DESCRIPTION
   This runbook creates a simplified Nerdio demo environment:
@@ -47,11 +49,11 @@
 
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory=$true)][ValidatePattern('^[a-zA-Z0-9]{2,8}$')][string]$CustomerAbbreviation,
-    [Parameter(Mandatory=$true)][int]$UserCount,
+    [Parameter(Mandatory = $true)][ValidatePattern('^[a-zA-Z0-9]{2,8}$')][string]$CustomerAbbreviation,
+    [Parameter(Mandatory = $true)][int]$UserCount,
     [string]$UserDefaultPassword = 'Nerdio123!',
     [string]$AzureRegion = 'centralus',
-    [Parameter(Mandatory=$true)][datetime]$DestroyOnUTC,
+    [Parameter(Mandatory = $true)][datetime]$DestroyOnUTC,
     [bool]$UpdateExistingDemoEnv = $false,
     [string]$VariablePrefix = 'CustomerDemo',
     [string]$DestEmailAddress
@@ -64,13 +66,13 @@ $ErrorActionPreference = 'Stop'
 function Write-Log {
     param(
         [string] $Message,
-        [ValidateSet('INFO','WARN','ERROR')]
+        [ValidateSet('INFO', 'WARN', 'ERROR')]
         [string] $Level = 'INFO'
     )
     $stamp = (Get-Date).ToString('u')
     switch ($Level) {
-        'INFO'  { Write-Output  "[$stamp] [INFO]  $Message" }
-        'WARN'  { Write-Output  "[$stamp] [WARN]  $Message"; Write-Warning "[$stamp] [WARN]  $Message" }
+        'INFO' { Write-Output  "[$stamp] [INFO]  $Message" }
+        'WARN' { Write-Output  "[$stamp] [WARN]  $Message"; Write-Warning "[$stamp] [WARN]  $Message" }
         'ERROR' { Write-Error   "[$stamp] [ERROR] $Message" }
     }
 }
@@ -80,17 +82,17 @@ function Write-Log {
 #region Variables
 
 # NME API credentials from automation account variables
-$NmeTenantId     = Get-AutomationVariable -Name "${VariablePrefix}TenantId"
-$NmeClientId     = Get-AutomationVariable -Name "${VariablePrefix}ClientId"
+$NmeTenantId = Get-AutomationVariable -Name "${VariablePrefix}TenantId"
+$NmeClientId = Get-AutomationVariable -Name "${VariablePrefix}ClientId"
 $NmeClientSecret = Get-AutomationVariable -Name "${VariablePrefix}ClientSecret"
-$NmeScope        = Get-AutomationVariable -Name "${VariablePrefix}Scope"
-$NmeUri          = Get-AutomationVariable -Name "${VariablePrefix}Uri"
-$NmeAppObjectId  = Get-AutomationVariable -Name "${VariablePrefix}AppObjectId"
-$SubscriptionId  = Get-AutomationVariable -Name "${VariablePrefix}SubscriptionId"
-$TenantDomain    = Get-AutomationVariable -Name "${VariablePrefix}TenantDomain"
-$ResourceGroupName     = Get-AutomationVariable -Name "${VariablePrefix}DefaultRG"
+$NmeScope = Get-AutomationVariable -Name "${VariablePrefix}Scope"
+$NmeUri = Get-AutomationVariable -Name "${VariablePrefix}Uri"
+$NmeAppObjectId = Get-AutomationVariable -Name "${VariablePrefix}AppObjectId"
+$SubscriptionId = Get-AutomationVariable -Name "${VariablePrefix}SubscriptionId"
+$TenantDomain = Get-AutomationVariable -Name "${VariablePrefix}TenantDomain"
+$ResourceGroupName = Get-AutomationVariable -Name "${VariablePrefix}DefaultRG"
 $automationAccountName = 'nerdio-management-aa'
-$AutomationRg          = 'nerdio-management-rg'
+$AutomationRg = 'nerdio-management-rg'
 
 # Naming conventions
 $EnvironmentName = "$CustomerAbbreviation-Demo"
@@ -124,7 +126,7 @@ Write-Log "Connected to NME API at $NmeUri."
 
 #region Validate environment does not already exist
 
-$existingUsers = Get-MgUser -Property DisplayName,CompanyName -All | Where-Object { $_.CompanyName -eq $EnvironmentName }
+$existingUsers = Get-MgUser -Property DisplayName, CompanyName -All | Where-Object { $_.CompanyName -eq $EnvironmentName }
 $existingWorkspace = Get-NmeWorkspace -ErrorAction SilentlyContinue | Where-Object { $_.id.name -eq $NewWorkspaceName }
 
 if (($existingUsers -or $existingWorkspace) -and -not $UpdateExistingDemoEnv) {
@@ -168,7 +170,8 @@ if ($null -eq $Workspace) {
 
     Write-Log "Workspace $NewWorkspaceName created successfully."
     $Workspace = Get-NmeWorkspace -ErrorAction Stop | Where-Object { $_.id.name -eq $NewWorkspaceName }
-} else {
+}
+else {
     Write-Log "Workspace $NewWorkspaceName already exists."
 
     # Update DestroyAfter tag if re-running with a potentially different date
@@ -211,7 +214,8 @@ for ($i = 1; $i -le $UserCount; $i++) {
     if ($User) {
         Write-Log "User $UserUpn already exists, skipping creation."
         $usersExisting++
-    } else {
+    }
+    else {
         Write-Log "Creating user $UserUpn..."
         $passwordProfile = @{ ForceChangePasswordNextSignIn = $true; ForceChangePasswordNextSignInWithMfa = $true; Password = $UserDefaultPassword }
         $User = New-MgUser `
@@ -229,7 +233,7 @@ for ($i = 1; $i -le $UserCount; $i++) {
 
     # Ensure WVD Admin role assignment (skip if already assigned)
     $existingAppRole = Get-MgUserAppRoleAssignment -UserId $User.Id -ErrorAction SilentlyContinue |
-        Where-Object { $_.AppRoleId -eq $AdminRoleId -and $_.ResourceId -eq $ServicePrincipal.Id }
+    Where-Object { $_.AppRoleId -eq $AdminRoleId -and $_.ResourceId -eq $ServicePrincipal.Id }
 
     if (-not $existingAppRole) {
         New-MgUserAppRoleAssignment `
@@ -240,7 +244,8 @@ for ($i = 1; $i -le $UserCount; $i++) {
             -PrincipalType "User" `
             -ErrorAction Stop | Out-Null
         Write-Log "Assigned WVD Admin role to $UserName."
-    } else {
+    }
+    else {
         Write-Log "User $UserName already has WVD Admin role."
     }
 
@@ -254,7 +259,8 @@ for ($i = 1; $i -le $UserCount; $i++) {
             Set-NmeRbacRolesAssignment -objectId $User.Id -NmeRbacAssignmentUpdateRestModel $RbacAssignmentUpdateRestModel | Out-Null
             Write-Log "Ensured user $UserName is assigned to workspace $NewWorkspaceName."
             break
-        } catch {
+        }
+        catch {
             $retryCount++
             if ($retryCount -ge $maxRetries) {
                 Write-Log "Failed to assign user $UserName to workspace after $maxRetries retries: $($_.Exception.Message)" 'WARN'
@@ -284,7 +290,7 @@ if ($null -ne $Schedule) {
 $Schedule = New-AzAutomationSchedule -Name $ScheduleName -StartTime $DestroyOnUTC -OneTime -ResourceGroupName $AutomationRg -AutomationAccountName $automationAccountName -ErrorAction Stop
 $RunbookParams = @{
     CustomerAbbreviation = $CustomerAbbreviation
-    VariablePrefix = $VariablePrefix
+    VariablePrefix       = $VariablePrefix
 }
 Register-AzAutomationScheduledRunbook -ResourceGroupName $AutomationRg -AutomationAccountName $automationAccountName -RunbookName $RunbookName -ScheduleName $ScheduleName -Parameters $RunbookParams -ErrorAction Stop | Out-Null
 Write-Log "Cleanup scheduled for $DestroyOnUTC (UTC)."
@@ -389,7 +395,7 @@ $userRows
     $body = @{
         personalizations = @(
             @{
-                to = @(
+                to  = @(
                     @{
                         email = $DestEmailAddress
                     }
@@ -401,12 +407,36 @@ $userRows
                 )
             }
         )
-        from = @{
+        from             = @{
             email = $fromEmailAddress
         }
-        subject = $subject
-        content = @(
+        subject          = $subject
+        content          = @(
             @{
+                type  = "text/html"
+                value = $content
+            }
+        )
+    }
+
+    $bodyJson = $body | ConvertTo-Json -Depth 4
+
+    try {
+        Invoke-RestMethod -Uri https://api.sendgrid.com/v3/mail/send -Method Post -Headers $headers -Body $bodyJson
+        Write-Log "Welcome email sent to $DestEmailAddress."
+    }
+    catch {
+        Write-Log "Failed to send welcome email: $($_.Exception.Message)" 'WARN'
+    }
+}
+elseif ($UpdateExistingDemoEnv) {
+    Write-Log "UpdateExistingDemoEnv specified, skipping welcome email."
+}
+else {
+    Write-Log "No DestEmailAddress specified, skipping welcome email."
+}
+
+#endregion
                 type  = "text/html"
                 value = $content
             }
