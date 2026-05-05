@@ -27,11 +27,12 @@
   PREREQUISITES
   =============
 
-  Automation Account Modules (PowerShell 5.1):
+  Automation Account Modules:
     - Az.Accounts
     - Az.Compute         (tag reads)
     - Az.DesktopVirtualization (Get-AzWvdHostPool, host reads)
     - Az.Resources       (Update-AzTag)
+    - Az.Storage         (New-AzStorageAccount, New-AzRmStorageShare)
 
   Automation Account Variables (prefixed with VariablePrefix, default 'SalesDemo'):
     - {Prefix}TenantId              NME API app registration tenant ID
@@ -61,8 +62,10 @@
 .PARAMETER WhatIf
   Log what would be changed without applying any changes.
 
-.PARAMETER SkipRemoval
-  Reconcile configuration but do not delete stray host pools.
+.PARAMETER RemoveUndefinedResources
+  Actively remove resources not present in desired state: stray host pools (after disabling
+  auto-scale and removing session hosts), desktop images, unlinked storage shares, and VNets.
+  Without this switch, stray resources are only logged as warnings.
 
 .PARAMETER SkipSessionHostCheck
   Skip the session host availability advisory at the end.
@@ -70,15 +73,16 @@
 .EXAMPLE
   .\Maintain-NmeDemoEnvironment.ps1
   .\Maintain-NmeDemoEnvironment.ps1 -LocalDesiredStateFile ./desired-state.json -WhatIf
+  .\Maintain-NmeDemoEnvironment.ps1 -RemoveUndefinedResources
+  .\Maintain-NmeDemoEnvironment.ps1 -RemoveUndefinedResources -WhatIf
 #>
 
-[CmdletBinding()]
 param(
-    [string]$VariablePrefix        = 'SalesDemo',
-    [string]$LocalDesiredStateFile = '',
-    [switch]$WhatIf,
-    [switch]$SkipRemoval,
-    [switch]$SkipSessionHostCheck
+    [string]$VariablePrefix           = 'SalesDemo',
+    [string]$LocalDesiredStateFile    = '',
+    [bool]$WhatIf                     = $false,
+    [bool]$RemoveUndefinedResources   = $false,
+    [bool]$SkipSessionHostCheck       = $false
 )
 
 $ErrorActionPreference = 'Stop'
@@ -119,7 +123,7 @@ function Wait-NmeJob {
     param([string]$JobId, [string]$Description)
     $timeoutSeconds = 600
     $elapsed = 0
-    $job = Invoke-RestMethod "$NmeUri/api/v1/job/$JobId" -Headers $NmeHeaders
+    $job = Invoke-RestMethod "$NmeUri/api/v1/job/$JobId" -Headers $NmeHeaders -SkipCertificateCheck
     while ($job.jobStatus -in @('Pending', 'InProgress')) {
         if ($elapsed -ge $timeoutSeconds) {
             throw "Timeout waiting for $Description (job $JobId) after ${timeoutSeconds}s"
@@ -127,7 +131,7 @@ function Wait-NmeJob {
         Write-Log "Waiting for $Description to complete (${elapsed}s elapsed)..."
         Start-Sleep -Seconds 10
         $elapsed += 10
-        $job = Invoke-RestMethod "$NmeUri/api/v1/job/$JobId" -Headers $NmeHeaders
+        $job = Invoke-RestMethod "$NmeUri/api/v1/job/$JobId" -Headers $NmeHeaders -SkipCertificateCheck
     }
     if ($job.jobStatus -eq 'Failed') {
         throw "NME job failed: $Description. Error: $($job.error.message)"
@@ -251,11 +255,12 @@ function Compare-HpFslogixAssignment {
 }
 
 function Compare-HpAutoScale {
-    param([PSCustomObject]$Live, [PSCustomObject]$Desired)
-    if ($Live.isEnabled           -ne $Desired.isEnabled)          { return $true }
-    if ($Live.hostPoolCapacity    -ne $Desired.hostPoolCapacity)   { return $true }
-    if ($Live.minActiveHostsCount -ne $Desired.minActiveHostsCount) { return $true }
-    if ($Live.vmTemplate.size   -ne $Desired.vmSize)             { return $true }
+    param([PSCustomObject]$Live, [PSCustomObject]$Desired, [string]$DesiredPrefix)
+    if ($Live.isEnabled            -ne $Desired.isEnabled)          { return $true }
+    if ($Live.hostPoolCapacity     -ne $Desired.hostPoolCapacity)   { return $true }
+    if ($Live.minActiveHostsCount  -ne $Desired.minActiveHostsCount) { return $true }
+    if ($Live.vmTemplate.size      -ne $Desired.vmSize)             { return $true }
+    if ($Live.vmTemplate.prefix    -ne $DesiredPrefix)              { return $true }
     return $false
 }
 
@@ -289,15 +294,18 @@ $script:NonFatalErrors = @()
 $script:DesiredStateSha = $null
 
 # Counters
-$hpCreated  = 0
-$hpUpdated  = 0
-$hpRemoved  = 0
-$hpImported = 0
-$fslCreated = 0
-$fslUpdated = 0
-$asCreated  = 0
+$hpCreated       = 0
+$hpUpdated       = 0
+$hpRemoved       = 0
+$hpImported      = 0
+$fslCreated      = 0
+$fslUpdated      = 0
+$asCreated       = 0
+$imagesRemoved   = 0
+$storageUnlinked = 0
+$vnetsUnlinked   = 0
 
-Write-Log "=== Maintain-NmeDemoEnvironment starting (WhatIf=$WhatIf, SkipRemoval=$SkipRemoval) ==="
+Write-Log "=== Maintain-NmeDemoEnvironment starting (WhatIf=$WhatIf, RemoveUndefinedResources=$RemoveUndefinedResources) ==="
 
 #endregion
 
@@ -658,7 +666,7 @@ foreach ($live in $liveAutoScale) {
 Write-Log "--- Reconcile VNets ---"
 
 if ($DesiredState.vnets) {
-    $liveNets = @(Invoke-NmeApi -Method GET -Uri "$NmeUri/api/v1/networks")
+    $liveNets = Invoke-NmeApi -Method GET -Uri "$NmeUri/api/v1/networks"
     if (-not $liveNets) { $liveNets = @() }
 
     foreach ($entry in $DesiredState.vnets) {
@@ -688,13 +696,28 @@ if ($DesiredState.vnets) {
         }
     }
 
-    # Stray VNets — warn only (may be used by other host pools outside desired state)
+    # Stray VNets
     foreach ($live in $liveNets) {
         $inDs = $DesiredState.vnets | Where-Object {
             $_.networkName -ieq $live.name -and $_.subnetName -ieq $live.subnet
         }
         if (-not $inDs) {
-            Write-Log "VNet '$($live.name)/$($live.subnet)' is not in desired state (stray). Manual review recommended." 'WARN'
+            if ($RemoveUndefinedResources) {
+                Write-Log "VNet '$($live.name)/$($live.subnet)' not in desired state. Unlinking..."
+                if (-not $WhatIf) {
+                    try {
+                        Invoke-NmeApi -Method DELETE -Uri "$NmeUri/api/v1/networks/$($live.id)" | Out-Null
+                        $vnetsUnlinked++
+                        Write-Log "VNet '$($live.name)/$($live.subnet)' unlinked."
+                    } catch {
+                        Add-NonFatalError "Failed to unlink VNet '$($live.name)/$($live.subnet)': $($_.Exception.Message)"
+                    }
+                } else {
+                    Write-Log "[WHATIF] Would unlink VNet '$($live.name)/$($live.subnet)'."
+                }
+            } else {
+                Write-Log "VNet '$($live.name)/$($live.subnet)' is not in desired state (stray). Run with -RemoveUndefinedResources to unlink." 'WARN'
+            }
         }
     }
 } else {
@@ -708,7 +731,7 @@ if ($DesiredState.vnets) {
 Write-Log "--- Reconcile Storage Accounts ---"
 
 if ($DesiredState.storageAccounts) {
-    $liveStorage = @(Invoke-NmeApi -Method GET -Uri "$NmeUri/api/v1/storage/azure-files")
+    $liveStorage = Invoke-NmeApi -Method GET -Uri "$NmeUri/api/v1/storage/azure-files"
     if (-not $liveStorage) { $liveStorage = @() }
 
     foreach ($entry in $DesiredState.storageAccounts) {
@@ -717,31 +740,93 @@ if ($DesiredState.storageAccounts) {
         $match = $liveStorage | Where-Object { $_.id -ieq $expectedId }
 
         if (-not $match) {
-            Write-Log "Storage account '$($entry.accountName)/$($entry.shareName)' not linked. Linking..."
-            if (-not $WhatIf) {
+            Write-Log "Storage account '$($entry.accountName)/$($entry.shareName)' not linked to NME."
+            if ($WhatIf) {
+                Write-Log "[WHATIF] Would create (if missing) and link storage '$($entry.accountName)/$($entry.shareName)'."
+            } else {
                 try {
+                    # Ensure the Azure Storage account exists — create it if not
+                    $azSa = Get-AzStorageAccount -ResourceGroupName $entry.resourceGroup `
+                        -Name $entry.accountName -ErrorAction SilentlyContinue
+                    if (-not $azSa) {
+                        Write-Log "Storage account '$($entry.accountName)' not found in Azure. Creating in '$($entry.resourceGroup)'..."
+                        $rgObj = Get-AzResourceGroup -Name $entry.resourceGroup -ErrorAction Stop
+                        $azSa  = New-AzStorageAccount `
+                            -ResourceGroupName $entry.resourceGroup `
+                            -Name             $entry.accountName `
+                            -Location         $rgObj.Location `
+                            -SkuName          'Standard_LRS' `
+                            -Kind             'StorageV2' `
+                            -AllowBlobPublicAccess $false `
+                            -MinimumTlsVersion 'TLS1_2' `
+                            -ErrorAction Stop
+                        Write-Log "Storage account '$($entry.accountName)' created (Standard_LRS, $($rgObj.Location))."
+                    }
+
+                    # Ensure the file share exists — create it if not
+                    $azShare = Get-AzRmStorageShare -ResourceGroupName $entry.resourceGroup `
+                        -StorageAccountName $entry.accountName -Name $entry.shareName `
+                        -ErrorAction SilentlyContinue
+                    if (-not $azShare) {
+                        Write-Log "File share '$($entry.shareName)' not found. Creating..."
+                        New-AzRmStorageShare `
+                            -ResourceGroupName  $entry.resourceGroup `
+                            -StorageAccountName $entry.accountName `
+                            -Name               $entry.shareName `
+                            -QuotaGiB           100 `
+                            -ErrorAction Stop | Out-Null
+                        Write-Log "File share '$($entry.shareName)' created (100 GiB)."
+                    }
+
+                    # Link the share to NME
                     $linkUrl = "$NmeUri/api/v1/storage/azure-files/$($entry.subscriptionId)/$($entry.resourceGroup)/$($entry.accountName)/$($entry.shareName)/link"
                     Invoke-NmeApi -Method POST -Uri $linkUrl | Out-Null
-                    Write-Log "Storage account '$($entry.accountName)/$($entry.shareName)' linked."
+                    Write-Log "Storage '$($entry.accountName)/$($entry.shareName)' linked to NME."
                 } catch {
-                    Add-NonFatalError "Failed to link storage '$($entry.accountName)/$($entry.shareName)': $($_.Exception.Message)"
+                    Add-NonFatalError "Failed to provision/link storage '$($entry.accountName)/$($entry.shareName)': $($_.Exception.Message)"
                 }
-            } else {
-                Write-Log "[WHATIF] Would link storage '$($entry.accountName)/$($entry.shareName)'."
             }
         } else {
             Write-Log "Storage account '$($entry.accountName)/$($entry.shareName)' is linked."
         }
     }
 
-    # Stray storage — warn only
+    # Stray storage — unlink any share not in desired state (NME unlink is non-destructive; the SA/share in Azure is untouched)
     foreach ($live in $liveStorage) {
         $inDs = $DesiredState.storageAccounts | Where-Object {
             $expectedId = "/subscriptions/$($_.subscriptionId)/resourceGroups/$($_.resourceGroup)/providers/Microsoft.Storage/storageAccounts/$($_.accountName)/fileServices/default/shares/$($_.shareName)"
             $expectedId -ieq $live.id
         }
         if (-not $inDs) {
-            Write-Log "Storage '$($live.id)' is not in desired state (stray). Manual review recommended." 'WARN'
+            if ($RemoveUndefinedResources) {
+                # Parse ARM resource ID to build the unlink URL
+                # Format: /subscriptions/{sub}/resourceGroups/{rg}/providers/Microsoft.Storage/storageAccounts/{acct}/fileServices/default/shares/{share}
+                $idParts   = $live.id -split '/'
+                $liveSub   = $idParts[2]
+                $liveRg    = $idParts[4]
+                $liveAcct  = $idParts[8]
+                $liveShare = $idParts[12]
+                Write-Log "Storage '$liveAcct/$liveShare' not in desired state. Unlinking from NME (the Azure storage account and file share are NOT deleted — remove manually to avoid ongoing Azure costs)..." 'WARN'
+                if (-not $WhatIf) {
+                    try {
+                        $unlinkUrl = "$NmeUri/api/v1/storage/azure-files/$liveSub/$liveRg/$liveAcct/$liveShare/link"
+                        Invoke-NmeApi -Method DELETE -Uri $unlinkUrl | Out-Null
+                        $storageUnlinked++
+                        Write-Log "Storage '$liveAcct/$liveShare' unlinked from NME. NOTE: Azure resource '$liveAcct' in '$liveRg' still exists and will accrue costs until manually deleted." 'WARN'
+                    } catch {
+                        # 404 means the share is already gone from NME's perspective — treat as success
+                        if ($_.Exception.Message -match '404') {
+                            Write-Log "Storage '$liveAcct/$liveShare' already removed from NME (404). Skipping."
+                        } else {
+                            Add-NonFatalError "Failed to unlink storage '$liveAcct/$liveShare': $($_.Exception.Message)"
+                        }
+                    }
+                } else {
+                    Write-Log "[WHATIF] Would unlink storage '$liveAcct/$liveShare'."
+                }
+            } else {
+                Write-Log "Storage '$($live.id)' is not in desired state (stray). Run with -RemoveUndefinedResources to unlink." 'WARN'
+            }
         }
     }
 } else {
@@ -754,10 +839,10 @@ if ($DesiredState.storageAccounts) {
 
 Write-Log "--- Check Desktop Images ---"
 
-if ($DesiredState.images) {
-    $liveImages = @(Invoke-NmeApi -Method GET -Uri "$NmeUri/api/v1/desktop-image")
-    if (-not $liveImages) { $liveImages = @() }
+$liveImages = Invoke-NmeApi -Method GET -Uri "$NmeUri/api/v1/desktop-image"
+if (-not $liveImages) { $liveImages = @() }
 
+if ($DesiredState.images) {
     foreach ($entry in $DesiredState.images) {
         $match = $liveImages | Where-Object { $_.name -ieq $entry.name }
         if (-not $match) {
@@ -768,6 +853,29 @@ if ($DesiredState.images) {
     }
 } else {
     Write-Log "No images defined in desired state. Skipping."
+}
+
+# Stray images
+foreach ($live in $liveImages) {
+    $inDs = $DesiredState.images | Where-Object { $_.name -ieq $live.name }
+    if (-not $inDs) {
+        if ($RemoveUndefinedResources) {
+            Write-Log "Desktop image '$($live.name)' not in desired state. Removing..."
+            if (-not $WhatIf) {
+                try {
+                    Invoke-NmeApi -Method DELETE -Uri "$NmeUri/api/v1/desktop-image/$($live.id)" | Out-Null
+                    $imagesRemoved++
+                    Write-Log "Desktop image '$($live.name)' removed."
+                } catch {
+                    Add-NonFatalError "Failed to remove desktop image '$($live.name)': $($_.Exception.Message)"
+                }
+            } else {
+                Write-Log "[WHATIF] Would remove desktop image '$($live.name)'."
+            }
+        } else {
+            Write-Log "Desktop image '$($live.name)' is not in desired state (stray). Run with -RemoveUndefinedResources to remove." 'WARN'
+        }
+    }
 }
 
 #endregion
@@ -795,7 +903,12 @@ foreach ($entry in $DesiredState.hostPools) {
     $hpName = $entry.id.hostpoolName
     $hpRg   = $entry.id.resourceGroup
     $hpSub  = $entry.id.subscriptionId
-    $hpUrl  = "$NmeUri/api/v1/arm/hostpool/$hpSub/$hpRg/$hpName"
+    $hpUrl  = "$NmeUri/api/v1/arm/hostpool/$hpSub/$hpRg/$([uri]::EscapeDataString($hpName))"
+    # Derive VM name prefix: strip non-alphanumeric, lowercase, max 9 chars
+    # NME appends -{????} (5 chars) at VM creation; Windows computer names are limited to 15 chars total
+    $hpVmPrefix = ($hpName -replace '[^a-zA-Z0-9]', '').ToLower()
+    if ($hpVmPrefix.Length -gt 9) { $hpVmPrefix = $hpVmPrefix.Substring(0, 9) }
+    $hpVmPrefixTemplate = "$hpVmPrefix-{????}"
 
     Write-Log "Processing host pool '$hpName'..."
 
@@ -844,6 +957,7 @@ foreach ($entry in $DesiredState.hostPools) {
                     resourceGroup  = $wsMatch.id.resourceGroup
                     name           = $wsMatch.id.name
                 }
+                friendlyName = $entry.friendlyName
                 description  = $entry.description
                 tags         = @{ 'NME-SE-Manage' = 'managed'; Environment = 'SalesDemo' }
             }
@@ -882,19 +996,34 @@ foreach ($entry in $DesiredState.hostPools) {
                         Invoke-NmeApi -Method POST -Uri "$hpUrl/auto-scale" | Out-Null
                         $asConfig = Invoke-NmeApi -Method GET -Uri "$hpUrl/auto-scale"
                     }
-                    $asConfig.isEnabled = $entry.autoScale.isEnabled
+
+                    # Step 1 — PUT all desired settings with auto-scale DISABLED.
+                    # This prevents the default post-conversion config (e.g. capacity=5, random vmName)
+                    # from triggering VM provisioning before our settings are in place.
+                    $asConfig.isEnabled = $false
                     if ($entry.poolType -ne 'Personal') {
                         $asConfig.hostPoolCapacity    = $entry.autoScale.hostPoolCapacity
                         $asConfig.minActiveHostsCount = $entry.autoScale.minActiveHostsCount
                     }
                     if ($asConfig.vmTemplate) {
-                        $asConfig.vmTemplate.size = $entry.autoScale.vmSize
+                        $asConfig.vmTemplate.size   = $entry.autoScale.vmSize
+                        $asConfig.vmTemplate.prefix = $hpVmPrefixTemplate
                     }
                     $asResult = Invoke-NmeApi -Method PUT -Uri "$hpUrl/auto-scale" -Body ($asConfig | ConvertTo-Json -Depth 20)
                     if ($asResult.job.id) {
-                        Wait-NmeJob -JobId $asResult.job.id -Description "set auto-scale config on '$hpName'"
+                        Wait-NmeJob -JobId $asResult.job.id -Description "configure auto-scale on '$hpName'"
                     }
-                    Write-Log "Auto-scale config set on '$hpName'."
+
+                    # Step 2 — Enable auto-scale now that the correct config is locked in.
+                    if ($entry.autoScale.isEnabled) {
+                        $enableResult = Invoke-NmeApi -Method PATCH -Uri "$hpUrl/auto-scale" -Body (@{ isEnabled = $true } | ConvertTo-Json)
+                        if ($enableResult.job.id) {
+                            Wait-NmeJob -JobId $enableResult.job.id -Description "enable auto-scale on '$hpName'"
+                        }
+                        Write-Log "Auto-scale configured (vmPrefix='$hpVmPrefixTemplate', capacity=$($entry.autoScale.hostPoolCapacity)) and enabled on '$hpName'."
+                    } else {
+                        Write-Log "Auto-scale configured (vmPrefix='$hpVmPrefixTemplate') and left disabled on '$hpName'."
+                    }
                 } catch {
                     Add-NonFatalError "Failed to set auto-scale config on '$hpName': $($_.Exception.Message)"
                 }
@@ -965,8 +1094,8 @@ foreach ($entry in $DesiredState.hostPools) {
                     Invoke-NmeApi -Method POST -Uri "$hpUrl/auto-scale" | Out-Null
                     $liveAs = Invoke-NmeApi -Method GET -Uri "$hpUrl/auto-scale"
                 }
-                if (Compare-HpAutoScale -Live $liveAs -Desired $entry.autoScale) {
-                    Write-Log "Auto-scale config drifted on '$hpName' (isEnabled=$($liveAs.isEnabled), vmSize=$($liveAs.vmTemplate.size), capacity=$($liveAs.hostPoolCapacity), minActive=$($liveAs.minActiveHostsCount))."
+                if (Compare-HpAutoScale -Live $liveAs -Desired $entry.autoScale -DesiredPrefix $hpVmPrefixTemplate) {
+                    Write-Log "Auto-scale config drifted on '$hpName' (isEnabled=$($liveAs.isEnabled), vmSize=$($liveAs.vmTemplate.size), prefix='$($liveAs.vmTemplate.prefix)', capacity=$($liveAs.hostPoolCapacity), minActive=$($liveAs.minActiveHostsCount))."
                     if (-not $WhatIf) {
                         # Read-modify-write: patch only the desired-state fields
                         # Personal pools don't support hostPoolCapacity/minActiveHostsCount
@@ -976,7 +1105,8 @@ foreach ($entry in $DesiredState.hostPools) {
                             $liveAs.minActiveHostsCount = $entry.autoScale.minActiveHostsCount
                         }
                         if ($liveAs.vmTemplate) {
-                            $liveAs.vmTemplate.size = $entry.autoScale.vmSize
+                            $liveAs.vmTemplate.size   = $entry.autoScale.vmSize
+                            $liveAs.vmTemplate.prefix = $hpVmPrefixTemplate
                         }
                         $asResult = Invoke-NmeApi -Method PUT -Uri "$hpUrl/auto-scale" -Body ($liveAs | ConvertTo-Json -Depth 20)
                         if ($asResult.job.id) {
@@ -999,8 +1129,8 @@ foreach ($entry in $DesiredState.hostPools) {
 
 # ── REMOVAL PASS ─────────────────────────────────────────────────────────────
 
-if (-not $SkipRemoval) {
-    Write-Log "--- Removal Pass ---"
+if ($RemoveUndefinedResources) {
+    Write-Log "--- Removal Pass (RemoveUndefinedResources) ---"
     $desiredNames = @($DesiredState.hostPools | ForEach-Object { $_.id.hostpoolName })
 
     foreach ($liveHp in $liveHostPools) {
@@ -1013,24 +1143,61 @@ if (-not $SkipRemoval) {
         }
 
         Write-Log "Stray host pool '$($liveHp.Name)' found (not in desired state). Removing..."
-        if (-not $WhatIf) {
-            try {
-                $delUrl = "$NmeUri/api/v1/arm/hostpool/$SubscriptionId/$ScopedResourceGroup/$($liveHp.Name)"
-                $delResult = Invoke-NmeApi -Method DELETE -Uri $delUrl
-                if ($delResult.job.id) {
-                    Wait-NmeJob -JobId $delResult.job.id -Description "remove stray host pool '$($liveHp.Name)'"
-                }
-                $hpRemoved++
-                Write-Log "Stray host pool '$($liveHp.Name)' removed."
-            } catch {
-                Add-NonFatalError "Failed to remove stray host pool '$($liveHp.Name)': $($_.Exception.Message)"
+
+        if ($WhatIf) {
+            Write-Log "[WHATIF] Would disable auto-scale, remove session hosts, and delete host pool '$($liveHp.Name)'."
+            continue
+        }
+
+        $strayUrl = "$NmeUri/api/v1/arm/hostpool/$SubscriptionId/$ScopedResourceGroup/$([uri]::EscapeDataString($liveHp.Name))"
+
+        # Step 1 — Disable auto-scale so it won't provision new hosts during teardown
+        try {
+            $strayAs = $null
+            try { $strayAs = Invoke-NmeApi -Method GET -Uri "$strayUrl/auto-scale" } catch {}
+            if ($strayAs -and $strayAs.isEnabled) {
+                Write-Log "Disabling auto-scale on '$($liveHp.Name)'..."
+                Invoke-NmeApi -Method PATCH -Uri "$strayUrl/auto-scale" -Body (@{ isEnabled = $false } | ConvertTo-Json) | Out-Null
             }
-        } else {
-            Write-Log "[WHATIF] Would remove stray host pool '$($liveHp.Name)'."
+        } catch {
+            Add-NonFatalError "Failed to disable auto-scale on '$($liveHp.Name)' (continuing removal): $($_.Exception.Message)"
+        }
+
+        # Step 2 — Remove all session hosts
+        try {
+            $strayHosts = Invoke-NmeApi -Method GET -Uri "$strayUrl/host"
+            if (-not $strayHosts) { $strayHosts = @() }
+            foreach ($sh in $strayHosts) {
+                # NME session host names may be in "poolname/vmname" format — use only the vm part
+                $shVmName = if ($sh.name -match '/') { ($sh.name -split '/', 2)[1] } else { $sh.name }
+                Write-Log "Removing session host '$shVmName' from '$($liveHp.Name)'..."
+                try {
+                    $shResult = Invoke-NmeApi -Method DELETE -Uri "$strayUrl/host/$([uri]::EscapeDataString($shVmName))"
+                    if ($shResult.job.id) {
+                        Wait-NmeJob -JobId $shResult.job.id -Description "remove session host '$shVmName' from '$($liveHp.Name)'"
+                    }
+                } catch {
+                    Add-NonFatalError "Failed to remove session host '$shVmName' from '$($liveHp.Name)': $($_.Exception.Message)"
+                }
+            }
+        } catch {
+            Add-NonFatalError "Failed to enumerate session hosts on '$($liveHp.Name)' (continuing removal): $($_.Exception.Message)"
+        }
+
+        # Step 3 — Delete the host pool
+        try {
+            $delResult = Invoke-NmeApi -Method DELETE -Uri $strayUrl
+            if ($delResult.job.id) {
+                Wait-NmeJob -JobId $delResult.job.id -Description "remove stray host pool '$($liveHp.Name)'"
+            }
+            $hpRemoved++
+            Write-Log "Stray host pool '$($liveHp.Name)' removed."
+        } catch {
+            Add-NonFatalError "Failed to remove stray host pool '$($liveHp.Name)': $($_.Exception.Message)"
         }
     }
 } else {
-    Write-Log "SkipRemoval set — skipping removal pass."
+    Write-Log "RemoveUndefinedResources not set — stray host pools logged above as warnings only."
 }
 
 #endregion
@@ -1044,7 +1211,7 @@ if (-not $SkipSessionHostCheck) {
         $hpName = $entry.id.hostpoolName
         $hpRg   = $entry.id.resourceGroup
         $hpSub  = $entry.id.subscriptionId
-        $hpUrl  = "$NmeUri/api/v1/arm/hostpool/$hpSub/$hpRg/$hpName"
+        $hpUrl  = "$NmeUri/api/v1/arm/hostpool/$hpSub/$hpRg/$([uri]::EscapeDataString($hpName))"
 
         try {
             $hosts     = Invoke-NmeApi -Method GET -Uri "$hpUrl/host"
@@ -1091,7 +1258,9 @@ Write-Log "=== Summary ==="
 Write-Log "Host pools  — imported: $hpImported, created: $hpCreated, updated: $hpUpdated, removed: $hpRemoved"
 Write-Log "FSLogix     — created: $fslCreated, updated: $fslUpdated"
 Write-Log "Auto-scale  — created: $asCreated"
-Write-Log "VNets/storage/images — see region logs above for status"
+Write-Log "Images      — removed: $imagesRemoved (stray)"
+Write-Log "Storage     — unlinked: $storageUnlinked (stray)"
+Write-Log "VNets       — unlinked: $vnetsUnlinked (stray)"
 
 if ($script:NonFatalErrors.Count -gt 0) {
     Write-Log "$($script:NonFatalErrors.Count) non-fatal error(s) occurred:" 'WARN'
