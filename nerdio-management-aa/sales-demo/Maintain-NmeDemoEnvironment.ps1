@@ -368,6 +368,7 @@ if (-not $liveFslogix)    { $liveFslogix    = @() }
 if (-not $liveAutoScale)  { $liveAutoScale  = @() }
 
 Write-Log "Live state: $($liveHostPools.Count) host pool(s) in '$ScopedResourceGroup', $(@($liveFslogix).Count) FSLogix config(s), $(@($liveAutoScale).Count) auto-scale profile(s)."
+Write-Log "(VNets, storage accounts, and images gathered per-region.)"
 
 #endregion
 
@@ -652,7 +653,126 @@ foreach ($live in $liveAutoScale) {
 
 #endregion
 
-#region 10 — Reconcile Host Pools
+#region 10 — Reconcile VNets
+
+Write-Log "--- Reconcile VNets ---"
+
+if ($DesiredState.vnets) {
+    $liveNets = @(Invoke-NmeApi -Method GET -Uri "$NmeUri/api/v1/networks")
+    if (-not $liveNets) { $liveNets = @() }
+
+    foreach ($entry in $DesiredState.vnets) {
+        $match = $liveNets | Where-Object {
+            $_.name -ieq $entry.networkName -and $_.subnet -ieq $entry.subnetName
+        }
+        if (-not $match) {
+            Write-Log "VNet '$($entry.networkName)/$($entry.subnetName)' not linked. Linking..."
+            if (-not $WhatIf) {
+                try {
+                    $netBody = @{
+                        subscriptionId    = $entry.subscriptionId
+                        resourceGroupName = $entry.resourceGroupName
+                        networkName       = $entry.networkName
+                        subnetName        = $entry.subnetName
+                    } | ConvertTo-Json
+                    Invoke-NmeApi -Method POST -Uri "$NmeUri/api/v1/networks" -Body $netBody | Out-Null
+                    Write-Log "VNet '$($entry.networkName)/$($entry.subnetName)' linked."
+                } catch {
+                    Add-NonFatalError "Failed to link VNet '$($entry.networkName)': $($_.Exception.Message)"
+                }
+            } else {
+                Write-Log "[WHATIF] Would link VNet '$($entry.networkName)/$($entry.subnetName)'."
+            }
+        } else {
+            Write-Log "VNet '$($entry.networkName)/$($entry.subnetName)' is linked."
+        }
+    }
+
+    # Stray VNets — warn only (may be used by other host pools outside desired state)
+    foreach ($live in $liveNets) {
+        $inDs = $DesiredState.vnets | Where-Object {
+            $_.networkName -ieq $live.name -and $_.subnetName -ieq $live.subnet
+        }
+        if (-not $inDs) {
+            Write-Log "VNet '$($live.name)/$($live.subnet)' is not in desired state (stray). Manual review recommended." 'WARN'
+        }
+    }
+} else {
+    Write-Log "No vnets defined in desired state. Skipping."
+}
+
+#endregion
+
+#region 11 — Reconcile Storage Accounts
+
+Write-Log "--- Reconcile Storage Accounts ---"
+
+if ($DesiredState.storageAccounts) {
+    $liveStorage = @(Invoke-NmeApi -Method GET -Uri "$NmeUri/api/v1/storage/azure-files")
+    if (-not $liveStorage) { $liveStorage = @() }
+
+    foreach ($entry in $DesiredState.storageAccounts) {
+        # NME storage IDs are ARM resource IDs — construct expected ID for comparison
+        $expectedId = "/subscriptions/$($entry.subscriptionId)/resourceGroups/$($entry.resourceGroup)/providers/Microsoft.Storage/storageAccounts/$($entry.accountName)/fileServices/default/shares/$($entry.shareName)"
+        $match = $liveStorage | Where-Object { $_.id -ieq $expectedId }
+
+        if (-not $match) {
+            Write-Log "Storage account '$($entry.accountName)/$($entry.shareName)' not linked. Linking..."
+            if (-not $WhatIf) {
+                try {
+                    $linkUrl = "$NmeUri/api/v1/storage/azure-files/$($entry.subscriptionId)/$($entry.resourceGroup)/$($entry.accountName)/$($entry.shareName)/link"
+                    Invoke-NmeApi -Method POST -Uri $linkUrl | Out-Null
+                    Write-Log "Storage account '$($entry.accountName)/$($entry.shareName)' linked."
+                } catch {
+                    Add-NonFatalError "Failed to link storage '$($entry.accountName)/$($entry.shareName)': $($_.Exception.Message)"
+                }
+            } else {
+                Write-Log "[WHATIF] Would link storage '$($entry.accountName)/$($entry.shareName)'."
+            }
+        } else {
+            Write-Log "Storage account '$($entry.accountName)/$($entry.shareName)' is linked."
+        }
+    }
+
+    # Stray storage — warn only
+    foreach ($live in $liveStorage) {
+        $inDs = $DesiredState.storageAccounts | Where-Object {
+            $expectedId = "/subscriptions/$($_.subscriptionId)/resourceGroups/$($_.resourceGroup)/providers/Microsoft.Storage/storageAccounts/$($_.accountName)/fileServices/default/shares/$($_.shareName)"
+            $expectedId -ieq $live.id
+        }
+        if (-not $inDs) {
+            Write-Log "Storage '$($live.id)' is not in desired state (stray). Manual review recommended." 'WARN'
+        }
+    }
+} else {
+    Write-Log "No storageAccounts defined in desired state. Skipping."
+}
+
+#endregion
+
+#region 12 — Check Desktop Images
+
+Write-Log "--- Check Desktop Images ---"
+
+if ($DesiredState.images) {
+    $liveImages = @(Invoke-NmeApi -Method GET -Uri "$NmeUri/api/v1/desktop-image")
+    if (-not $liveImages) { $liveImages = @() }
+
+    foreach ($entry in $DesiredState.images) {
+        $match = $liveImages | Where-Object { $_.name -ieq $entry.name }
+        if (-not $match) {
+            Write-Log "Desktop image '$($entry.name)' not found in NME. Create it manually in the Desktop Images page." 'WARN'
+        } else {
+            Write-Log "Desktop image '$($entry.name)' exists (id=$($match.id))."
+        }
+    }
+} else {
+    Write-Log "No images defined in desired state. Skipping."
+}
+
+#endregion
+
+#region 13 — Reconcile Host Pools
 
 Write-Log "--- Reconcile Host Pools ---"
 
@@ -915,7 +1035,7 @@ if (-not $SkipRemoval) {
 
 #endregion
 
-#region 11 — Session Host Count Advisory
+#region 14 — Session Host Count Advisory
 
 if (-not $SkipSessionHostCheck) {
     Write-Log "--- Session Host Count Advisory ---"
@@ -965,12 +1085,13 @@ if (-not $SkipSessionHostCheck) {
 
 #endregion
 
-#region 12 — Summary
+#region 15 — Summary
 
 Write-Log "=== Summary ==="
 Write-Log "Host pools  — imported: $hpImported, created: $hpCreated, updated: $hpUpdated, removed: $hpRemoved"
 Write-Log "FSLogix     — created: $fslCreated, updated: $fslUpdated"
 Write-Log "Auto-scale  — created: $asCreated"
+Write-Log "VNets/storage/images — see region logs above for status"
 
 if ($script:NonFatalErrors.Count -gt 0) {
     Write-Log "$($script:NonFatalErrors.Count) non-fatal error(s) occurred:" 'WARN'

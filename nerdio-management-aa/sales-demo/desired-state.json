@@ -8,6 +8,22 @@
     "location": "centralus",
     "friendlyName": "NME Sales Demo"
   },
+  "vnets": [
+    {
+      "subscriptionId": "2b9dd21c-8f1d-44aa-a344-4527243840c7",
+      "resourceGroupName": "nw-salesdemo-resources-rg",
+      "networkName": "nw-salesdemo-vnet",
+      "subnetName": "avd"
+    }
+  ],
+  "storageAccounts": [
+    {
+      "subscriptionId": "2b9dd21c-8f1d-44aa-a344-4527243840c7",
+      "resourceGroup": "nme-standard-shared-1",
+      "accountName": "nmest1labsa",
+      "shareName": "profiles"
+    }
+  ],
   "fslogixConfigs": [
     {
       "name": "DemoFSLogix-Standard",
@@ -36,14 +52,18 @@
       "description": "Personal desktop scaling - user-driven"
     }
   ],
+  "images": [
+    { "name": "Multisession Image" },
+    { "name": "Personal Desktop Image" }
+  ],
   "hostPools": [
     {
       "id": {
         "subscriptionId": "2b9dd21c-8f1d-44aa-a344-4527243840c7",
         "resourceGroup": "nw-salesdemo-resources-rg",
-        "hostpoolName": "demo-pooled-desktop"
+        "hostpoolName": "Multi-session Pooled"
       },
-      "friendlyName": "Demo Pooled Desktop",
+      "friendlyName": "Multi-session Pooled",
       "description": "Multi-session pooled desktop host pool",
       "poolType": "Pooled",
       "isDesktop": true,
@@ -53,7 +73,7 @@
       "fslogixConfigName": "DemoFSLogix-Standard",
       "autoScale": {
         "isEnabled": true,
-        "vmSize": "Standard_D4s_v5",
+        "vmSize": "Standard_D2s_v5",
         "hostPoolCapacity": 2,
         "minActiveHostsCount": 1
       }
@@ -62,9 +82,9 @@
       "id": {
         "subscriptionId": "2b9dd21c-8f1d-44aa-a344-4527243840c7",
         "resourceGroup": "nw-salesdemo-resources-rg",
-        "hostpoolName": "demo-pooled-remoteapp"
+        "hostpoolName": "RemoteApp Pooled"
       },
-      "friendlyName": "Demo Pooled RemoteApp",
+      "friendlyName": "RemoteApp Pooled",
       "description": "Multi-session pooled RemoteApp host pool",
       "poolType": "Pooled",
       "isDesktop": false,
@@ -74,7 +94,7 @@
       "fslogixConfigName": "DemoFSLogix-Standard",
       "autoScale": {
         "isEnabled": true,
-        "vmSize": "Standard_D4s_v5",
+        "vmSize": "Standard_D2s_v5",
         "hostPoolCapacity": 2,
         "minActiveHostsCount": 1
       }
@@ -83,9 +103,9 @@
       "id": {
         "subscriptionId": "2b9dd21c-8f1d-44aa-a344-4527243840c7",
         "resourceGroup": "nw-salesdemo-resources-rg",
-        "hostpoolName": "demo-singlesession-pooled"
+        "hostpoolName": "Single-Session Pooled"
       },
-      "friendlyName": "Demo Single-Session Pooled",
+      "friendlyName": "Single-Session Pooled",
       "description": "Single-session pooled desktop host pool",
       "poolType": "Pooled",
       "isDesktop": true,
@@ -95,7 +115,7 @@
       "fslogixConfigName": "DemoFSLogix-Standard",
       "autoScale": {
         "isEnabled": true,
-        "vmSize": "Standard_D4s_v5",
+        "vmSize": "Standard_D2s_v5",
         "hostPoolCapacity": 2,
         "minActiveHostsCount": 1
       }
@@ -104,9 +124,9 @@
       "id": {
         "subscriptionId": "2b9dd21c-8f1d-44aa-a344-4527243840c7",
         "resourceGroup": "nw-salesdemo-resources-rg",
-        "hostpoolName": "demo-personal-desktop"
+        "hostpoolName": "Personal Desktop"
       },
-      "friendlyName": "Demo Personal Desktop",
+      "friendlyName": "Personal Desktop",
       "description": "Personal desktop host pool with automatic assignment",
       "poolType": "Personal",
       "personalAssignmentType": "Automatic",
@@ -117,7 +137,7 @@
       "fslogixConfigName": "DemoFSLogix-Standard",
       "autoScale": {
         "isEnabled": true,
-        "vmSize": "Standard_D4s_v5",
+        "vmSize": "Standard_D2s_v5",
         "hostPoolCapacity": 2,
         "minActiveHostsCount": 1
       }
