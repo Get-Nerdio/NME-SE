@@ -19,8 +19,8 @@
   "storageAccounts": [
     {
       "subscriptionId": "2b9dd21c-8f1d-44aa-a344-4527243840c7",
-      "resourceGroup": "nme-standard-shared-1",
-      "accountName": "nmest1labsa",
+      "resourceGroup": "nw-salesdemo-resources-rg",
+      "accountName": "nwsdfslsa",
       "shareName": "profiles"
     }
   ],
@@ -53,15 +53,19 @@
     }
   ],
   "images": [
-    { "name": "Multisession Image" },
-    { "name": "Personal Desktop Image" }
+    {
+      "name": "Multisession Image"
+    },
+    {
+      "name": "Personal Desktop Image"
+    }
   ],
   "hostPools": [
     {
       "id": {
         "subscriptionId": "2b9dd21c-8f1d-44aa-a344-4527243840c7",
         "resourceGroup": "nw-salesdemo-resources-rg",
-        "hostpoolName": "Multi-session Pooled"
+        "hostpoolName": "Multi-session-Pooled"
       },
       "friendlyName": "Multi-session Pooled",
       "description": "Multi-session pooled desktop host pool",
@@ -82,7 +86,7 @@
       "id": {
         "subscriptionId": "2b9dd21c-8f1d-44aa-a344-4527243840c7",
         "resourceGroup": "nw-salesdemo-resources-rg",
-        "hostpoolName": "RemoteApp Pooled"
+        "hostpoolName": "RemoteApp-Pooled"
       },
       "friendlyName": "RemoteApp Pooled",
       "description": "Multi-session pooled RemoteApp host pool",
@@ -103,7 +107,7 @@
       "id": {
         "subscriptionId": "2b9dd21c-8f1d-44aa-a344-4527243840c7",
         "resourceGroup": "nw-salesdemo-resources-rg",
-        "hostpoolName": "Single-Session Pooled"
+        "hostpoolName": "Single-Session-Pooled"
       },
       "friendlyName": "Single-Session Pooled",
       "description": "Single-session pooled desktop host pool",
@@ -124,7 +128,7 @@
       "id": {
         "subscriptionId": "2b9dd21c-8f1d-44aa-a344-4527243840c7",
         "resourceGroup": "nw-salesdemo-resources-rg",
-        "hostpoolName": "Personal Desktop"
+        "hostpoolName": "Personal-Desktop"
       },
       "friendlyName": "Personal Desktop",
       "description": "Personal desktop host pool with automatic assignment",
