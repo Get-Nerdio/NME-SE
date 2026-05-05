@@ -226,7 +226,8 @@ function Resolve-FslogixIdByName {
 function Compare-HostPoolWvdProps {
     param([PSCustomObject]$Live, [PSCustomObject]$Desired)
     if ($Live.loadBalancerType -ne $Desired.loadBalancingAlgorithm) { return $true }
-    if ($Live.maxSessionLimit  -ne $Desired.maxSessionLimit)        { return $true }
+    # Personal pools: NME always overrides maxSessionLimit to 999999 internally — skip comparison
+    if ($Desired.poolType -ne 'Personal' -and $Live.maxSessionLimit -ne $Desired.maxSessionLimit) { return $true }
     return $false
 }
 
@@ -814,9 +815,14 @@ if ($DesiredState.storageAccounts) {
                         $storageUnlinked++
                         Write-Log "Storage '$liveAcct/$liveShare' unlinked from NME. NOTE: Azure resource '$liveAcct' in '$liveRg' still exists and will accrue costs until manually deleted." 'WARN'
                     } catch {
-                        # 404 means the share is already gone from NME's perspective — treat as success
+                        # 404 — already gone from NME's perspective
                         if ($_.Exception.Message -match '404') {
                             Write-Log "Storage '$liveAcct/$liveShare' already removed from NME (404). Skipping."
+                        } elseif ($_.Exception.Message -match '500') {
+                            # 500 typically means NME's service principal lacks access to the storage account's
+                            # subscription (common for accounts linked by other users in a shared NME instance).
+                            # Log as WARN only — do not fail the job.
+                            Write-Log "Cannot unlink storage '$liveAcct/$liveShare' — NME returned 500 (likely the NME service account lacks access to subscription '$liveSub'). Unlink manually via NME portal if needed." 'WARN'
                         } else {
                             Add-NonFatalError "Failed to unlink storage '$liveAcct/$liveShare': $($_.Exception.Message)"
                         }
@@ -1168,8 +1174,8 @@ if ($RemoveUndefinedResources) {
             $strayHosts = Invoke-NmeApi -Method GET -Uri "$strayUrl/host"
             if (-not $strayHosts) { $strayHosts = @() }
             foreach ($sh in $strayHosts) {
-                # NME session host names may be in "poolname/vmname" format — use only the vm part
-                $shVmName = if ($sh.name -match '/') { ($sh.name -split '/', 2)[1] } else { $sh.name }
+                # NME returns session hosts with a 'hostName' field (e.g. "vm-abc-0.domain.com")
+                $shVmName = $sh.hostName
                 Write-Log "Removing session host '$shVmName' from '$($liveHp.Name)'..."
                 try {
                     $shResult = Invoke-NmeApi -Method DELETE -Uri "$strayUrl/host/$([uri]::EscapeDataString($shVmName))"
