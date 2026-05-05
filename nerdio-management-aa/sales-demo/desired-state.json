@@ -107,10 +107,10 @@
       "id": {
         "subscriptionId": "2b9dd21c-8f1d-44aa-a344-4527243840c7",
         "resourceGroup": "nw-salesdemo-resources-rg",
-        "hostpoolName": "Single-Session-Pooled"
+        "hostpoolName": "Single-User-Pooled"
       },
-      "friendlyName": "Single-Session Pooled",
-      "description": "Single-session pooled desktop host pool",
+      "friendlyName": "Single User Pooled",
+      "description": "Single User pooled desktop host pool",
       "poolType": "Pooled",
       "isDesktop": true,
       "isSingleUser": true,
