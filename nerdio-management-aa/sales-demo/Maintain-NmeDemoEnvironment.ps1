@@ -1172,7 +1172,7 @@ if ($RemoveUndefinedResources) {
             Add-NonFatalError "Failed to disable auto-scale on '$($liveHp.Name)' (continuing removal): $($_.Exception.Message)"
         }
 
-        # Step 2 — Remove all session hosts
+        # Step 2 — Remove all session hosts via NME API; fall back to Az cmdlets for orphaned records
         try {
             $strayHosts = Invoke-NmeApi -Method GET -Uri "$strayUrl/host"
             if (-not $strayHosts) { $strayHosts = @() }
@@ -1180,7 +1180,21 @@ if ($RemoveUndefinedResources) {
                 # NME returns session hosts with a 'hostName' field (e.g. "vm-abc-0.domain.com")
                 $shVmName = $sh.hostName
                 if ([string]::IsNullOrWhiteSpace($shVmName)) {
-                    Write-Log "Session host with null/empty hostName on '$($liveHp.Name)' — skipping." 'WARN'
+                    # Orphaned WVD registration with no VM — remove directly via Az cmdlets
+                    Write-Log "Session host with null hostName on '$($liveHp.Name)' — attempting Az WVD direct removal..."
+                    try {
+                        $azHosts = Get-AzWvdSessionHost -ResourceGroupName $liveHp.ResourceGroupName `
+                            -HostPoolName $liveHp.Name -SubscriptionId $SubscriptionId -ErrorAction SilentlyContinue
+                        foreach ($azSh in $azHosts) {
+                            $azShName = ($azSh.Name -split '/')[1]  # "poolname/hostname" → "hostname"
+                            Write-Log "Removing orphaned WVD session host '$azShName' via Az cmdlet..."
+                            Remove-AzWvdSessionHost -ResourceGroupName $liveHp.ResourceGroupName `
+                                -HostPoolName $liveHp.Name -Name $azShName -Force -ErrorAction Stop | Out-Null
+                            Write-Log "Orphaned session host '$azShName' removed."
+                        }
+                    } catch {
+                        Add-NonFatalError "Failed to remove orphaned session hosts on '$($liveHp.Name)' via Az cmdlet: $($_.Exception.Message)"
+                    }
                     continue
                 }
                 Write-Log "Removing session host '$shVmName' from '$($liveHp.Name)'..."
