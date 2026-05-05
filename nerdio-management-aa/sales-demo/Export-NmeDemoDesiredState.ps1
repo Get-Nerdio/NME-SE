@@ -41,9 +41,6 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-# PowerShell 5.1 in Azure Automation defaults to TLS 1.0/1.1 — force TLS 1.2
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-
 #region Helpers
 
 function Write-Log {
@@ -313,7 +310,7 @@ foreach ($hp in $liveHostPools) {
             fslogixConfigName      = $fslConfigName
             autoScale              = [ordered]@{
                 isEnabled           = $asConfig.isEnabled
-                vmSize              = $asConfig.vmTemplate.vmSize
+                vmSize              = $asConfig.vmTemplate.size
                 hostPoolCapacity    = $asConfig.hostPoolCapacity
                 minActiveHostsCount = $asConfig.minActiveHostsCount
             }
@@ -324,7 +321,7 @@ foreach ($hp in $liveHostPools) {
         }
 
         $hpEntries += $hpEntry
-        Write-Log "Exported '$hpName' (poolType=$poolType, isDesktop=$($hpEntry.isDesktop), vmSize=$($asConfig.vmTemplate.vmSize))."
+        Write-Log "Exported '$hpName' (poolType=$poolType, isDesktop=$($hpEntry.isDesktop), vmSize=$($asConfig.vmTemplate.size))."
     } catch {
         Write-Log "Failed to export host pool '$hpName': $($_.Exception.Message)" 'WARN'
     }

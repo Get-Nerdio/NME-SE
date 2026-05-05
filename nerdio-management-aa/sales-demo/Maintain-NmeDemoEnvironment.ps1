@@ -255,7 +255,7 @@ function Compare-HpAutoScale {
     if ($Live.isEnabled           -ne $Desired.isEnabled)          { return $true }
     if ($Live.hostPoolCapacity    -ne $Desired.hostPoolCapacity)   { return $true }
     if ($Live.minActiveHostsCount -ne $Desired.minActiveHostsCount) { return $true }
-    if ($Live.vmTemplate.vmSize   -ne $Desired.vmSize)             { return $true }
+    if ($Live.vmTemplate.size   -ne $Desired.vmSize)             { return $true }
     return $false
 }
 
@@ -427,7 +427,7 @@ foreach ($hp in $liveHostPools) {
             fslogixConfigName       = $fslConfigName
             autoScale               = [ordered]@{
                 isEnabled           = $asConfig.isEnabled
-                vmSize              = $asConfig.vmTemplate.vmSize
+                vmSize              = $asConfig.vmTemplate.size
                 hostPoolCapacity    = $asConfig.hostPoolCapacity
                 minActiveHostsCount = $asConfig.minActiveHostsCount
             }
@@ -766,7 +766,7 @@ foreach ($entry in $DesiredState.hostPools) {
                     $asConfig.hostPoolCapacity    = $entry.autoScale.hostPoolCapacity
                     $asConfig.minActiveHostsCount = $entry.autoScale.minActiveHostsCount
                     if ($asConfig.vmTemplate) {
-                        $asConfig.vmTemplate.vmSize = $entry.autoScale.vmSize
+                        $asConfig.vmTemplate.size = $entry.autoScale.vmSize
                     }
                     $asResult = Invoke-NmeApi -Method PUT -Uri "$hpUrl/auto-scale" -Body ($asConfig | ConvertTo-Json -Depth 20)
                     if ($asResult.job.id) {
@@ -844,14 +844,14 @@ foreach ($entry in $DesiredState.hostPools) {
                     $liveAs = Invoke-NmeApi -Method GET -Uri "$hpUrl/auto-scale"
                 }
                 if (Compare-HpAutoScale -Live $liveAs -Desired $entry.autoScale) {
-                    Write-Log "Auto-scale config drifted on '$hpName' (isEnabled=$($liveAs.isEnabled), vmSize=$($liveAs.vmTemplate.vmSize), capacity=$($liveAs.hostPoolCapacity), minActive=$($liveAs.minActiveHostsCount))."
+                    Write-Log "Auto-scale config drifted on '$hpName' (isEnabled=$($liveAs.isEnabled), vmSize=$($liveAs.vmTemplate.size), capacity=$($liveAs.hostPoolCapacity), minActive=$($liveAs.minActiveHostsCount))."
                     if (-not $WhatIf) {
                         # Read-modify-write: patch only the 4 desired-state fields
                         $liveAs.isEnabled           = $entry.autoScale.isEnabled
                         $liveAs.hostPoolCapacity    = $entry.autoScale.hostPoolCapacity
                         $liveAs.minActiveHostsCount = $entry.autoScale.minActiveHostsCount
                         if ($liveAs.vmTemplate) {
-                            $liveAs.vmTemplate.vmSize = $entry.autoScale.vmSize
+                            $liveAs.vmTemplate.size = $entry.autoScale.vmSize
                         }
                         $asResult = Invoke-NmeApi -Method PUT -Uri "$hpUrl/auto-scale" -Body ($liveAs | ConvertTo-Json -Depth 20)
                         if ($asResult.job.id) {
