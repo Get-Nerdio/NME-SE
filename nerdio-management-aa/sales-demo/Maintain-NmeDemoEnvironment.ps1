@@ -916,10 +916,10 @@ if ($DesiredState.images) {
                         }
                         $imgBody = @{ jobPayload = $imgPayload } | ConvertTo-Json -Depth 10
                         $imgResult = Invoke-NmeApi -Method POST -Uri "$NmeUri/api/v1/desktop-image/create-from-library" -Body $imgBody
-                        if ($imgResult.job.id) {
-                            Wait-NmeJob -JobId $imgResult.job.id -Description "create desktop image '$($entry.name)'"
-                        }
-                        Write-Log "Desktop image '$($entry.name)' created."
+                        # Image builds take 20-45 minutes — don't block the runbook waiting.
+                        # The image will appear in NME on the next reconcile run.
+                        $imgJobId = if ($imgResult.job.id) { $imgResult.job.id } else { $imgResult.id }
+                        Write-Log "Desktop image '$($entry.name)' build queued (job: $imgJobId). Will be available after build completes."
                     } catch {
                         Add-NonFatalError "Failed to create desktop image '$($entry.name)': $($_.Exception.Message)"
                     }
