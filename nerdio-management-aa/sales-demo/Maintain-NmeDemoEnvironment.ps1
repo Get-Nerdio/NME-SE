@@ -320,9 +320,10 @@ function Invoke-NmeSql {
         $cmd.Parameters.AddWithValue($k, $Parameters[$k]) | Out-Null
     }
     if ($AsDataTable) {
-        $adapter = New-Object System.Data.SqlClient.SqlDataAdapter($cmd)
-        $dt      = New-Object System.Data.DataTable
-        $adapter.Fill($dt) | Out-Null
+        $dt     = New-Object System.Data.DataTable
+        $reader = $cmd.ExecuteReader()
+        $dt.Load($reader)
+        $reader.Close()
         return $dt
     } else {
         return $cmd.ExecuteNonQuery()
@@ -1574,6 +1575,7 @@ if ($RemoveUndefinedResources -and $SqlConnection) {
             continue
         }
 
+        Write-Log "$($pt.Table): $($liveRows.Rows.Count) row(s) found."
         foreach ($row in $liveRows.Rows) {
             $liveName = $row.ProfileName
             if ([System.DBNull]::Value.Equals($liveName) -or [string]::IsNullOrWhiteSpace($liveName)) { continue }
