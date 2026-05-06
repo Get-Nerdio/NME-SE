@@ -320,11 +320,17 @@ function Invoke-NmeSql {
         $cmd.Parameters.AddWithValue($k, $Parameters[$k]) | Out-Null
     }
     if ($AsDataTable) {
-        $dt     = New-Object System.Data.DataTable
-        $reader = $cmd.ExecuteReader()
-        $dt.Load($reader)
+        $reader  = $cmd.ExecuteReader()
+        $results = [System.Collections.Generic.List[PSObject]]::new()
+        while ($reader.Read()) {
+            $obj = [ordered]@{}
+            for ($i = 0; $i -lt $reader.FieldCount; $i++) {
+                $obj[$reader.GetName($i)] = if ($reader.IsDBNull($i)) { $null } else { $reader.GetValue($i) }
+            }
+            $results.Add([PSCustomObject]$obj)
+        }
         $reader.Close()
-        return $dt
+        return $results
     } else {
         return $cmd.ExecuteNonQuery()
     }
@@ -1575,10 +1581,10 @@ if ($RemoveUndefinedResources -and $SqlConnection) {
             continue
         }
 
-        Write-Log "$($pt.Table): $($liveRows.Rows.Count) row(s) found."
-        foreach ($row in $liveRows.Rows) {
+        Write-Log "$($pt.Table): $($liveRows.Count) row(s) found."
+        foreach ($row in $liveRows) {
             $liveName = $row.ProfileName
-            if ([System.DBNull]::Value.Equals($liveName) -or [string]::IsNullOrWhiteSpace($liveName)) { continue }
+            if ([string]::IsNullOrWhiteSpace($liveName)) { continue }
             if ($liveName -iin $desiredNames) { continue }
 
             Write-Log "$($pt.Table) '$liveName' not in desired state. Removing..."
