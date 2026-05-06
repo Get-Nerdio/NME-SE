@@ -790,11 +790,6 @@ if ($null -ne $DesiredState.scriptedActions) {
     foreach ($live in $liveScriptedActions) {
         $inDs = $DesiredState.scriptedActions | Where-Object { $_.name -ieq $live.name }
         if (-not $inDs) {
-            # Skip repository-linked scripted actions — NME does not allow deleting them
-            if ($live.repositoryScriptedActionId -or $live.isRepositoryLinked) {
-                Write-Log "Scripted action '$($live.name)' (id=$($live.id)) is repository-linked — skipping."
-                continue
-            }
             if ($RemoveUndefinedResources) {
                 Write-Log "Scripted action '$($live.name)' (id=$($live.id)) not in desired state. Removing..."
                 if (-not $WhatIf) {
