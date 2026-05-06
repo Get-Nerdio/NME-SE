@@ -866,13 +866,22 @@ if ($DesiredState.images) {
     }
 
     foreach ($entry in $DesiredState.images) {
-        $match = $liveImages | Where-Object { $_.name -ieq $entry.name }
+        # Derive a valid Azure VM name (max 15 chars, alphanumeric + hyphens).
+        # NME image list returns "vmname (timestamp)" — match by VM name as last segment of ARM id.
+        if ($entry.vmName) {
+            $imgVmName = ($entry.vmName -replace '[^a-zA-Z0-9-]', '-').ToLower()
+        } else {
+            $imgVmName = ($entry.name -replace '[^a-zA-Z0-9]', '-').ToLower()
+        }
+        if ($imgVmName.Length -gt 15) { $imgVmName = $imgVmName.Substring(0, 15).TrimEnd('-') }
+
+        $match = $liveImages | Where-Object { ($_.id -split '/')[-1] -ieq $imgVmName }
         if (-not $match) {
             if ($entry.sourceImageId) {
                 # Required fields present — create the image via create-from-library
                 $imgRg  = if ($entry.resourceGroup) { $entry.resourceGroup } else { $DesiredState.workspace.resourceGroup }
                 $imgSub = $DesiredState.workspace.subscriptionId
-                $imgVmSize     = if ($entry.vmSize)     { $entry.vmSize }     else { 'Standard_D2s_v5' }
+                $imgVmSize      = if ($entry.vmSize)      { $entry.vmSize }      else { 'Standard_D2s_v5' }
                 $imgStorageType = if ($entry.storageType) { $entry.storageType } else { 'StandardSSD_LRS' }
 
                 if (-not $imgNetId) {
@@ -880,14 +889,15 @@ if ($DesiredState.images) {
                     continue
                 }
 
-                Write-Log "Desktop image '$($entry.name)' not found in NME. Creating from source '$($entry.sourceImageId)'..."
+                Write-Log "Desktop image '$($entry.name)' (vm: $imgVmName) not found in NME. Creating from source '$($entry.sourceImageId)'..."
                 if (-not $WhatIf) {
                     try {
                         $imgPayload = [ordered]@{
-                            imageId        = [ordered]@{ subscriptionId = $imgSub; resourceGroup = $imgRg; name = $entry.name }
+                            imageId        = [ordered]@{ subscriptionId = $imgSub; resourceGroup = $imgRg; name = $imgVmName }
                             sourceImageId  = $entry.sourceImageId
                             vmSize         = $imgVmSize
                             storageType    = $imgStorageType
+                            diskSize       = $null
                             networkId      = $imgNetId
                             subnet         = $imgSubnet
                             scriptedActions       = @()
@@ -906,22 +916,27 @@ if ($DesiredState.images) {
                         Add-NonFatalError "Failed to create desktop image '$($entry.name)': $($_.Exception.Message)"
                     }
                 } else {
-                    Write-Log "[WHATIF] Would create desktop image '$($entry.name)' from '$($entry.sourceImageId)' using $imgVmSize in '$imgRg'."
+                    Write-Log "[WHATIF] Would create desktop image '$($entry.name)' (vm: $imgVmName) from '$($entry.sourceImageId)' using $imgVmSize in '$imgRg'."
                 }
             } else {
                 Write-Log "Desktop image '$($entry.name)' not found in NME. Add 'sourceImageId' to the desired state entry to enable automatic creation." 'WARN'
             }
         } else {
-            Write-Log "Desktop image '$($entry.name)' exists (id=$($match.id))."
+            Write-Log "Desktop image '$($entry.name)' exists (vm: $imgVmName, id=$($match.id))."
         }
     }
 } else {
     Write-Log "No images defined in desired state. Skipping."
 }
 
-# Stray images
+# Stray images — match live image VM name (last segment of ARM id) against desired vm names
 foreach ($live in $liveImages) {
-    $inDs = $DesiredState.images | Where-Object { $_.name -ieq $live.name }
+    $liveVmName = ($live.id -split '/')[-1]
+    $inDs = $DesiredState.images | Where-Object {
+        $dsVmName = if ($_.vmName) { ($_.vmName -replace '[^a-zA-Z0-9-]', '-').ToLower() } else { ($_.name -replace '[^a-zA-Z0-9]', '-').ToLower() }
+        if ($dsVmName.Length -gt 15) { $dsVmName = $dsVmName.Substring(0, 15).TrimEnd('-') }
+        $dsVmName -ieq $liveVmName
+    }
     if (-not $inDs) {
         if ($RemoveUndefinedResources) {
             Write-Log "Desktop image '$($live.name)' not in desired state. Removing..."
@@ -1142,7 +1157,7 @@ foreach ($entry in $DesiredState.hostPools) {
                     Write-Log "FSLogix assignment drifted on '$hpName'."
                     if (-not $WhatIf) {
                         $fslAssignBody = @{ enable = $true; type = 'Predefined'; predefinedConfigId = $resolvedFslId } | ConvertTo-Json
-                        Invoke-NmeApi -Method PATCH -Uri "$hpUrl/fslogix" -Body $fslAssignBody | Out-Null
+                        Invoke-NmeApi -Method PUT -Uri "$hpUrl/fslogix" -Body $fslAssignBody | Out-Null
                         Write-Log "FSLogix assignment corrected on '$hpName'."
                     } else {
                         Write-Log "[WHATIF] Would correct FSLogix assignment on '$hpName'."
