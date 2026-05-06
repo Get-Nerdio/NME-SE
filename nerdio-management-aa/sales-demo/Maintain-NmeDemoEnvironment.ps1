@@ -152,7 +152,16 @@ function Invoke-NmeApi {
         SkipCertificateCheck = $true
     }
     if ($Body) { $params['Body'] = $Body }
-    return Invoke-RestMethod @params
+    try {
+        return Invoke-RestMethod @params
+    } catch {
+        # Attach the response body to the exception so callers can log detail
+        $detail = $_.ErrorDetails.Message
+        if ($detail) {
+            throw [System.Exception]::new("$($_.Exception.Message) — $detail", $_.Exception)
+        }
+        throw
+    }
 }
 
 function Get-GitDesiredState {
@@ -897,7 +906,7 @@ if ($DesiredState.images) {
                             sourceImageId  = $entry.sourceImageId
                             vmSize         = $imgVmSize
                             storageType    = $imgStorageType
-                            diskSize       = $null
+                            diskSize       = if ($entry.diskSize) { [int]$entry.diskSize } else { 128 }
                             networkId      = $imgNetId
                             subnet         = $imgSubnet
                             scriptedActions       = @()
@@ -905,7 +914,6 @@ if ($DesiredState.images) {
                             scriptedActionTarget  = 'Clone'
                             description    = if ($entry.description) { $entry.description } else { '' }
                         }
-                        if ($entry.diskSize) { $imgPayload['diskSize'] = [int]$entry.diskSize }
                         $imgBody = @{ jobPayload = $imgPayload } | ConvertTo-Json -Depth 10
                         $imgResult = Invoke-NmeApi -Method POST -Uri "$NmeUri/api/v1/desktop-image/create-from-library" -Body $imgBody
                         if ($imgResult.job.id) {
