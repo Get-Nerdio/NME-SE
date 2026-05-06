@@ -286,6 +286,49 @@ function Add-NonFatalError {
     Write-Log $Message 'WARN'
 }
 
+function Get-NmeSqlConnection {
+    <#
+    .SYNOPSIS
+      Opens an authenticated connection to the NME SQL database using managed identity.
+      Returns $null (with a WARN log) if connection fails — callers must guard on $null.
+    #>
+    param([string]$ServerFqdn, [string]$DatabaseName)
+    try {
+        $token = (Get-AzAccessToken -ResourceUrl 'https://database.windows.net/').Token
+        $conn  = New-Object System.Data.SqlClient.SqlConnection
+        $conn.ConnectionString = "Server=$ServerFqdn;Database=$DatabaseName;Encrypt=True;TrustServerCertificate=False;"
+        $conn.AccessToken      = $token
+        $conn.Open()
+        return $conn
+    } catch {
+        Write-Log "Unable to connect to NME SQL ($ServerFqdn / $DatabaseName): $($_.Exception.Message). SQL-based profile cleanup will be skipped." 'WARN'
+        return $null
+    }
+}
+
+function Invoke-NmeSql {
+    param(
+        [System.Data.SqlClient.SqlConnection]$Connection,
+        [string]$Query,
+        [hashtable]$Parameters = @{},
+        [switch]$AsDataTable
+    )
+    $cmd = $Connection.CreateCommand()
+    $cmd.CommandText  = $Query
+    $cmd.CommandTimeout = 30
+    foreach ($k in $Parameters.Keys) {
+        $cmd.Parameters.AddWithValue($k, $Parameters[$k]) | Out-Null
+    }
+    if ($AsDataTable) {
+        $adapter = New-Object System.Data.SqlClient.SqlDataAdapter($cmd)
+        $dt      = New-Object System.Data.DataTable
+        $adapter.Fill($dt) | Out-Null
+        return $dt
+    } else {
+        return $cmd.ExecuteNonQuery()
+    }
+}
+
 #endregion
 
 #region 2 — Variables
@@ -309,17 +352,28 @@ if (-not $LocalDesiredStateFile) {
 $script:NonFatalErrors = @()
 $script:DesiredStateSha = $null
 
+# SQL variables — optional; SQL-based profile cleanup is skipped if not set.
+# Set {Prefix}SqlServer (FQDN) and {Prefix}SqlDatabase in the Automation Account.
+$SqlServerFqdn   = $null
+$SqlDatabaseName = $null
+try { $SqlServerFqdn   = Get-AutomationVariable -Name "${VariablePrefix}SqlServer"   -ErrorAction Stop } catch {}
+try { $SqlDatabaseName = Get-AutomationVariable -Name "${VariablePrefix}SqlDatabase" -ErrorAction Stop } catch {}
+
 # Counters
-$hpCreated       = 0
-$hpUpdated       = 0
-$hpRemoved       = 0
-$hpImported      = 0
-$fslCreated      = 0
-$fslUpdated      = 0
-$asCreated       = 0
-$imagesRemoved   = 0
-$storageUnlinked = 0
-$vnetsUnlinked   = 0
+$hpCreated              = 0
+$hpUpdated              = 0
+$hpRemoved              = 0
+$hpImported             = 0
+$fslCreated             = 0
+$fslUpdated             = 0
+$fslRemoved             = 0
+$asCreated              = 0
+$asRemoved              = 0
+$scriptedActionsRemoved = 0
+$sqlProfilesRemoved     = 0
+$imagesRemoved          = 0
+$storageUnlinked        = 0
+$vnetsUnlinked          = 0
 
 Write-Log "=== Maintain-NmeDemoEnvironment starting (WhatIf=$WhatIf, RemoveUndefinedResources=$RemoveUndefinedResources) ==="
 
@@ -348,6 +402,17 @@ try {
 }
 
 $ErrorActionPreference = 'Continue'
+
+# SQL connection (optional — only needed for SQL-based profile cleanup)
+$SqlConnection = $null
+if ($RemoveUndefinedResources) {
+    if ($SqlServerFqdn -and $SqlDatabaseName) {
+        $SqlConnection = Get-NmeSqlConnection -ServerFqdn $SqlServerFqdn -DatabaseName $SqlDatabaseName
+        if ($SqlConnection) { Write-Log "Connected to NME SQL ($SqlServerFqdn / $SqlDatabaseName)." }
+    } else {
+        Write-Log "SQL variables ${VariablePrefix}SqlServer / ${VariablePrefix}SqlDatabase not set — SQL-based profile cleanup will be skipped." 'WARN'
+    }
+}
 
 #endregion
 
@@ -619,11 +684,26 @@ foreach ($entry in $DesiredState.fslogixConfigs) {
     }
 }
 
-# Log stray FSLogix configs (no ARM tag surface to gate removal)
+# Stray FSLogix configs
 foreach ($live in $liveFslogix) {
     $inDs = $DesiredState.fslogixConfigs | Where-Object { $_.name -eq $live.name }
     if (-not $inDs) {
-        Write-Log "FSLogix config '$($live.name)' is not in desired state (stray). Manual review recommended." 'WARN'
+        if ($RemoveUndefinedResources) {
+            Write-Log "FSLogix config '$($live.name)' not in desired state. Removing..."
+            if (-not $WhatIf) {
+                try {
+                    Invoke-NmeApi -Method DELETE -Uri "$NmeUri/api/v1/fslogix/$($live.id)" | Out-Null
+                    $fslRemoved++
+                    Write-Log "FSLogix config '$($live.name)' removed."
+                } catch {
+                    Add-NonFatalError "Failed to remove FSLogix config '$($live.name)': $($_.Exception.Message)"
+                }
+            } else {
+                Write-Log "[WHATIF] Would remove FSLogix config '$($live.name)'."
+            }
+        } else {
+            Write-Log "FSLogix config '$($live.name)' is not in desired state (stray). Run with -RemoveUndefinedResources to remove." 'WARN'
+        }
     }
 }
 
@@ -667,12 +747,68 @@ foreach ($entry in $DesiredState.autoScaleProfiles) {
     }
 }
 
-# Log stray auto-scale profiles
+# Stray auto-scale profiles
 foreach ($live in $liveAutoScale) {
     $inDs = $DesiredState.autoScaleProfiles | Where-Object { $_.name -eq $live.name }
     if (-not $inDs) {
-        Write-Log "Auto-scale profile '$($live.name)' is not in desired state (stray). Manual review recommended." 'WARN'
+        if ($RemoveUndefinedResources) {
+            Write-Log "Auto-scale profile '$($live.name)' not in desired state. Removing..."
+            if (-not $WhatIf) {
+                try {
+                    Invoke-NmeApi -Method DELETE -Uri "$NmeUri/api/v1/auto-scale-profile/$($live.id)" | Out-Null
+                    $asRemoved++
+                    Write-Log "Auto-scale profile '$($live.name)' removed."
+                } catch {
+                    Add-NonFatalError "Failed to remove auto-scale profile '$($live.name)': $($_.Exception.Message)"
+                }
+            } else {
+                Write-Log "[WHATIF] Would remove auto-scale profile '$($live.name)'."
+            }
+        } else {
+            Write-Log "Auto-scale profile '$($live.name)' is not in desired state (stray). Run with -RemoveUndefinedResources to remove." 'WARN'
+        }
     }
+}
+
+#endregion
+
+#region 9b — Reconcile Scripted Actions
+
+Write-Log "--- Reconcile Scripted Actions ---"
+
+# Only enforced when scriptedActions section is explicitly defined in desired state.
+# Local (non-repository) scripted actions not in the list are logged as stray,
+# and removed when -RemoveUndefinedResources is set.
+if ($null -ne $DesiredState.scriptedActions) {
+    $liveScriptedActions = Invoke-NmeApi -Method GET -Uri "$NmeUri/api/v1/scripted-actions"
+    if (-not $liveScriptedActions) { $liveScriptedActions = @() }
+
+    foreach ($live in $liveScriptedActions) {
+        $inDs = $DesiredState.scriptedActions | Where-Object { $_.name -ieq $live.name }
+        if (-not $inDs) {
+            if ($RemoveUndefinedResources) {
+                Write-Log "Scripted action '$($live.name)' (id=$($live.id)) not in desired state. Removing..."
+                if (-not $WhatIf) {
+                    try {
+                        $deleteBody = @{ force = $true } | ConvertTo-Json
+                        Invoke-NmeApi -Method DELETE -Uri "$NmeUri/api/v1/scripted-actions/$($live.id)" -Body $deleteBody | Out-Null
+                        $scriptedActionsRemoved++
+                        Write-Log "Scripted action '$($live.name)' removed."
+                    } catch {
+                        Add-NonFatalError "Failed to remove scripted action '$($live.name)': $($_.Exception.Message)"
+                    }
+                } else {
+                    Write-Log "[WHATIF] Would remove scripted action '$($live.name)'."
+                }
+            } else {
+                Write-Log "Scripted action '$($live.name)' is not in desired state (stray). Run with -RemoveUndefinedResources to remove." 'WARN'
+            }
+        } else {
+            Write-Log "Scripted action '$($live.name)' is in desired state."
+        }
+    }
+} else {
+    Write-Log "No 'scriptedActions' section in desired state — skipping scripted action enforcement."
 }
 
 #endregion
@@ -1340,6 +1476,104 @@ if ($RemoveUndefinedResources) {
 
 #endregion
 
+#region 13b — Remove Stray NME Profiles via SQL
+
+# Removes profile types that have no NME REST API endpoint for deletion.
+# Each type is only enforced if the corresponding section is defined in desired-state.json.
+# Requires {Prefix}SqlServer and {Prefix}SqlDatabase AA variables and appropriate SQL
+# permissions on the NME database (db_datareader + db_datawriter). If the SQL connection
+# could not be established, this region is skipped and a WARN is logged in region 3.
+#
+# Supported profile types:
+#   rdpConfigs  → RdpPropertiesConfigurations table
+#   adConfigs   → ADConfigurations table  (domain join configs)
+#
+# To enforce a type, add the section to desired-state.json with the names to keep:
+#   "rdpConfigs": [{"name": "Default RDP"}]
+#   "adConfigs":  [{"name": "MyDomain-Config"}]
+# An empty array means "remove all profiles of this type".
+
+if ($RemoveUndefinedResources -and $SqlConnection) {
+
+    # Definition table: desired-state key → SQL table, name column, FK null-outs before delete
+    $sqlProfileTypes = @(
+        @{
+            DsKey      = 'rdpConfigs'
+            Table      = 'RdpPropertiesConfigurations'
+            NameCol    = 'Name'
+            PreCleanup = @(
+                "UPDATE HostPoolProperties SET RdpPropertiesConfig = NULL WHERE RdpPropertiesConfig IN (SELECT Id FROM RdpPropertiesConfigurations WHERE Name = @Name)"
+            )
+        },
+        @{
+            DsKey      = 'adConfigs'
+            Table      = 'ADConfigurations'
+            NameCol    = 'FriendlyName'
+            PreCleanup = @(
+                "UPDATE HostPoolADConfigurations SET ADConfigId = NULL WHERE ADConfigId IN (SELECT Id FROM ADConfigurations WHERE FriendlyName = @Name)"
+                "UPDATE HostPoolScriptedActionConfigurations SET ActiveDirectoryId = NULL WHERE ActiveDirectoryId IN (SELECT Id FROM ADConfigurations WHERE FriendlyName = @Name)"
+            )
+        }
+    )
+
+    foreach ($pt in $sqlProfileTypes) {
+        $dsKey = $pt.DsKey
+        # Skip if section not defined in desired state
+        if ($null -eq $DesiredState.PSObject.Properties[$dsKey] -or
+            $null -eq $DesiredState.$dsKey) {
+            continue
+        }
+
+        Write-Log "--- Enforce $dsKey via SQL ---"
+        $desiredNames = @($DesiredState.$dsKey | ForEach-Object { $_.name })
+
+        try {
+            $liveRows = Invoke-NmeSql -Connection $SqlConnection `
+                -Query "SELECT Id, [$($pt.NameCol)] AS ProfileName FROM [$($pt.Table)]" `
+                -AsDataTable
+        } catch {
+            Add-NonFatalError "Failed to query $($pt.Table): $($_.Exception.Message)"
+            continue
+        }
+
+        foreach ($row in $liveRows.Rows) {
+            $liveName = $row.ProfileName
+            if ($liveName -iin $desiredNames) { continue }
+
+            Write-Log "$($pt.Table) '$liveName' not in desired state. Removing..."
+            if (-not $WhatIf) {
+                try {
+                    foreach ($preQ in $pt.PreCleanup) {
+                        Invoke-NmeSql -Connection $SqlConnection -Query $preQ `
+                            -Parameters @{ '@Name' = $liveName } | Out-Null
+                    }
+                    $deleted = Invoke-NmeSql -Connection $SqlConnection `
+                        -Query "DELETE FROM [$($pt.Table)] WHERE [$($pt.NameCol)] = @Name" `
+                        -Parameters @{ '@Name' = $liveName }
+                    if ($deleted -gt 0) {
+                        $sqlProfilesRemoved++
+                        Write-Log "$($pt.Table) '$liveName' removed."
+                    }
+                } catch {
+                    Add-NonFatalError "Failed to remove $($pt.Table) '$liveName': $($_.Exception.Message)"
+                }
+            } else {
+                Write-Log "[WHATIF] Would remove $($pt.Table) '$liveName'."
+            }
+        }
+    }
+
+} elseif ($RemoveUndefinedResources -and -not $SqlConnection) {
+    Write-Log "SQL connection unavailable — skipping SQL-based profile cleanup." 'WARN'
+}
+
+# Close SQL connection if open
+if ($SqlConnection -and $SqlConnection.State -eq 'Open') {
+    $SqlConnection.Close()
+}
+
+#endregion
+
 #region 14 — Session Host Count Advisory
 
 if (-not $SkipSessionHostCheck) {
@@ -1393,12 +1627,14 @@ if (-not $SkipSessionHostCheck) {
 #region 15 — Summary
 
 Write-Log "=== Summary ==="
-Write-Log "Host pools  — imported: $hpImported, created: $hpCreated, updated: $hpUpdated, removed: $hpRemoved"
-Write-Log "FSLogix     — created: $fslCreated, updated: $fslUpdated"
-Write-Log "Auto-scale  — created: $asCreated"
-Write-Log "Images      — removed: $imagesRemoved (stray)"
-Write-Log "Storage     — unlinked: $storageUnlinked (stray)"
-Write-Log "VNets       — unlinked: $vnetsUnlinked (stray)"
+Write-Log "Host pools       — imported: $hpImported, created: $hpCreated, updated: $hpUpdated, removed: $hpRemoved"
+Write-Log "FSLogix configs  — created: $fslCreated, updated: $fslUpdated, removed: $fslRemoved"
+Write-Log "Auto-scale       — created: $asCreated, removed: $asRemoved"
+Write-Log "Scripted actions — removed: $scriptedActionsRemoved (stray)"
+Write-Log "SQL profiles     — removed: $sqlProfilesRemoved (stray)"
+Write-Log "Images           — removed: $imagesRemoved (stray)"
+Write-Log "Storage          — unlinked: $storageUnlinked (stray)"
+Write-Log "VNets            — unlinked: $vnetsUnlinked (stray)"
 
 if ($script:NonFatalErrors.Count -gt 0) {
     Write-Log "$($script:NonFatalErrors.Count) non-fatal error(s) occurred:" 'WARN'

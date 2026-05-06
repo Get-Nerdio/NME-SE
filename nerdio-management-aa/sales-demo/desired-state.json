@@ -90,6 +90,7 @@
       "description": "Windows 11 single-session for personal desktops"
     }
   ],
+  "scriptedActions": [],
   "hostPools": [
     {
       "id": {
