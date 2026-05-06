@@ -54,10 +54,20 @@
   ],
   "images": [
     {
-      "name": "Multisession Image"
+      "name": "Multisession Image",
+      "resourceGroup": "nw-salesdemo-resources-rg",
+      "sourceImageId": "MicrosoftWindowsDesktop:windows-11:win11-24h2-avd:latest",
+      "vmSize": "Standard_D2s_v5",
+      "storageType": "StandardSSD_LRS",
+      "description": "Windows 11 multi-session for pooled host pools"
     },
     {
-      "name": "Personal Desktop Image"
+      "name": "Personal Desktop Image",
+      "resourceGroup": "nw-salesdemo-resources-rg",
+      "sourceImageId": "MicrosoftWindowsDesktop:windows-11:win11-24h2-ent:latest",
+      "vmSize": "Standard_D2s_v5",
+      "storageType": "StandardSSD_LRS",
+      "description": "Windows 11 single-session for personal desktops"
     }
   ],
   "hostPools": [

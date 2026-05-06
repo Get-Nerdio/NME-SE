@@ -855,10 +855,63 @@ $liveImages = Invoke-NmeApi -Method GET -Uri "$NmeUri/api/v1/desktop-image"
 if (-not $liveImages) { $liveImages = @() }
 
 if ($DesiredState.images) {
+    # Derive network info from the first vnet in desired state (used as the build VM's network)
+    $imgVnet   = $null
+    $imgSubnet = $null
+    $imgNetId  = $null
+    if ($DesiredState.vnets -and @($DesiredState.vnets).Count -gt 0) {
+        $imgVnet   = @($DesiredState.vnets)[0]
+        $imgSubnet = $imgVnet.subnetName
+        $imgNetId  = "/subscriptions/$($imgVnet.subscriptionId)/resourceGroups/$($imgVnet.resourceGroupName)/providers/Microsoft.Network/virtualNetworks/$($imgVnet.networkName)"
+    }
+
     foreach ($entry in $DesiredState.images) {
         $match = $liveImages | Where-Object { $_.name -ieq $entry.name }
         if (-not $match) {
-            Write-Log "Desktop image '$($entry.name)' not found in NME. Create it manually in the Desktop Images page." 'WARN'
+            if ($entry.sourceImageId) {
+                # Required fields present — create the image via create-from-library
+                $imgRg  = if ($entry.resourceGroup) { $entry.resourceGroup } else { $DesiredState.workspace.resourceGroup }
+                $imgSub = $DesiredState.workspace.subscriptionId
+                $imgVmSize     = if ($entry.vmSize)     { $entry.vmSize }     else { 'Standard_D2s_v5' }
+                $imgStorageType = if ($entry.storageType) { $entry.storageType } else { 'StandardSSD_LRS' }
+
+                if (-not $imgNetId) {
+                    Write-Log "Cannot create image '$($entry.name)' — no vnets defined in desired state to use as build network." 'WARN'
+                    continue
+                }
+
+                Write-Log "Desktop image '$($entry.name)' not found in NME. Creating from source '$($entry.sourceImageId)'..."
+                if (-not $WhatIf) {
+                    try {
+                        $imgBody = @{
+                            jobPayload = @{
+                                imageId        = @{ subscriptionId = $imgSub; resourceGroup = $imgRg; name = $entry.name }
+                                sourceImageId  = $entry.sourceImageId
+                                vmSize         = $imgVmSize
+                                storageType    = $imgStorageType
+                                diskSize       = $null
+                                networkId      = $imgNetId
+                                subnet         = $imgSubnet
+                                scriptedActions       = @()
+                                applicationsTarget    = 'Clone'
+                                scriptedActionTarget  = 'Clone'
+                                description    = if ($entry.description) { $entry.description } else { '' }
+                            }
+                        } | ConvertTo-Json -Depth 10
+                        $imgResult = Invoke-NmeApi -Method POST -Uri "$NmeUri/api/v1/desktop-image/create-from-library" -Body $imgBody
+                        if ($imgResult.job.id) {
+                            Wait-NmeJob -JobId $imgResult.job.id -Description "create desktop image '$($entry.name)'"
+                        }
+                        Write-Log "Desktop image '$($entry.name)' created."
+                    } catch {
+                        Add-NonFatalError "Failed to create desktop image '$($entry.name)': $($_.Exception.Message)"
+                    }
+                } else {
+                    Write-Log "[WHATIF] Would create desktop image '$($entry.name)' from '$($entry.sourceImageId)' using $imgVmSize in '$imgRg'."
+                }
+            } else {
+                Write-Log "Desktop image '$($entry.name)' not found in NME. Add 'sourceImageId' to the desired state entry to enable automatic creation." 'WARN'
+            }
         } else {
             Write-Log "Desktop image '$($entry.name)' exists (id=$($match.id))."
         }
