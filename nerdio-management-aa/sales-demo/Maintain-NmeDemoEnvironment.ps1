@@ -883,21 +883,20 @@ if ($DesiredState.images) {
                 Write-Log "Desktop image '$($entry.name)' not found in NME. Creating from source '$($entry.sourceImageId)'..."
                 if (-not $WhatIf) {
                     try {
-                        $imgBody = @{
-                            jobPayload = @{
-                                imageId        = @{ subscriptionId = $imgSub; resourceGroup = $imgRg; name = $entry.name }
-                                sourceImageId  = $entry.sourceImageId
-                                vmSize         = $imgVmSize
-                                storageType    = $imgStorageType
-                                diskSize       = $null
-                                networkId      = $imgNetId
-                                subnet         = $imgSubnet
-                                scriptedActions       = @()
-                                applicationsTarget    = 'Clone'
-                                scriptedActionTarget  = 'Clone'
-                                description    = if ($entry.description) { $entry.description } else { '' }
-                            }
-                        } | ConvertTo-Json -Depth 10
+                        $imgPayload = [ordered]@{
+                            imageId        = [ordered]@{ subscriptionId = $imgSub; resourceGroup = $imgRg; name = $entry.name }
+                            sourceImageId  = $entry.sourceImageId
+                            vmSize         = $imgVmSize
+                            storageType    = $imgStorageType
+                            networkId      = $imgNetId
+                            subnet         = $imgSubnet
+                            scriptedActions       = @()
+                            applicationsTarget    = 'Clone'
+                            scriptedActionTarget  = 'Clone'
+                            description    = if ($entry.description) { $entry.description } else { '' }
+                        }
+                        if ($entry.diskSize) { $imgPayload['diskSize'] = [int]$entry.diskSize }
+                        $imgBody = @{ jobPayload = $imgPayload } | ConvertTo-Json -Depth 10
                         $imgResult = Invoke-NmeApi -Method POST -Uri "$NmeUri/api/v1/desktop-image/create-from-library" -Body $imgBody
                         if ($imgResult.job.id) {
                             Wait-NmeJob -JobId $imgResult.job.id -Description "create desktop image '$($entry.name)'"
