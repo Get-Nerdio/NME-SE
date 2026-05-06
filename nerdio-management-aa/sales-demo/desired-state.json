@@ -91,6 +91,14 @@
     }
   ],
   "scriptedActions": [],
+  "rdpConfigs": [
+    {"name": "StandardRDP"},
+    {"name": "DenyCopyPaste"}
+  ],
+  "adConfigs": [
+    {"name": "OnPremAD"},
+    {"name": "EntraID"}
+  ],
   "hostPools": [
     {
       "id": {
