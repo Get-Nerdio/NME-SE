@@ -688,6 +688,10 @@ foreach ($entry in $DesiredState.fslogixConfigs) {
 foreach ($live in $liveFslogix) {
     $inDs = $DesiredState.fslogixConfigs | Where-Object { $_.name -eq $live.name }
     if (-not $inDs) {
+        if ($live.isDefault) {
+            Write-Log "FSLogix config '$($live.name)' is the NME default — cannot remove. Consider reassigning the default in NME first." 'WARN'
+            continue
+        }
         if ($RemoveUndefinedResources) {
             Write-Log "FSLogix config '$($live.name)' not in desired state. Removing..."
             if (-not $WhatIf) {
@@ -786,6 +790,11 @@ if ($null -ne $DesiredState.scriptedActions) {
     foreach ($live in $liveScriptedActions) {
         $inDs = $DesiredState.scriptedActions | Where-Object { $_.name -ieq $live.name }
         if (-not $inDs) {
+            # Skip repository-linked scripted actions — NME does not allow deleting them
+            if ($live.repositoryScriptedActionId -or $live.isRepositoryLinked) {
+                Write-Log "Scripted action '$($live.name)' (id=$($live.id)) is repository-linked — skipping."
+                continue
+            }
             if ($RemoveUndefinedResources) {
                 Write-Log "Scripted action '$($live.name)' (id=$($live.id)) not in desired state. Removing..."
                 if (-not $WhatIf) {
@@ -795,7 +804,12 @@ if ($null -ne $DesiredState.scriptedActions) {
                         $scriptedActionsRemoved++
                         Write-Log "Scripted action '$($live.name)' removed."
                     } catch {
-                        Add-NonFatalError "Failed to remove scripted action '$($live.name)': $($_.Exception.Message)"
+                        $errMsg = $_.Exception.Message
+                        if ($errMsg -match 'repository-linked') {
+                            Write-Log "Scripted action '$($live.name)' is repository-linked — skipping."
+                        } else {
+                            Add-NonFatalError "Failed to remove scripted action '$($live.name)': $errMsg"
+                        }
                     }
                 } else {
                     Write-Log "[WHATIF] Would remove scripted action '$($live.name)'."
@@ -1566,6 +1580,7 @@ if ($RemoveUndefinedResources -and $SqlConnection) {
 
         foreach ($row in $liveRows.Rows) {
             $liveName = $row.ProfileName
+            if ([System.DBNull]::Value.Equals($liveName) -or [string]::IsNullOrWhiteSpace($liveName)) { continue }
             if ($liveName -iin $desiredNames) { continue }
 
             Write-Log "$($pt.Table) '$liveName' not in desired state. Removing..."
