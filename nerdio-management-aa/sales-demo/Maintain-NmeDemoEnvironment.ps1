@@ -811,74 +811,86 @@ if ($DesiredState.storageAccounts) {
 
     # Stray storage — unlink any share not in desired state.
     # NME unlink is non-destructive: the Azure storage account and file share are NOT deleted.
-    # For RGs where NME's SP lacks access, we temporarily grant Contributor, unlink, then remove the grant.
-    foreach ($live in $liveStorage) {
-        $inDs = $DesiredState.storageAccounts | Where-Object {
+    # Strategy: grant NME's SP Contributor on all affected RGs up front, wait once for RBAC
+    # propagation, then unlink all, then clean up all grants. This avoids per-account wait multipliers.
+    $strayAccounts = @($liveStorage | Where-Object {
+        $live = $_
+        -not ($DesiredState.storageAccounts | Where-Object {
             $expectedId = "/subscriptions/$($_.subscriptionId)/resourceGroups/$($_.resourceGroup)/providers/Microsoft.Storage/storageAccounts/$($_.accountName)/fileServices/default/shares/$($_.shareName)"
             $expectedId -ieq $live.id
-        }
-        if (-not $inDs) {
-            if ($RemoveUndefinedResources) {
-                # Parse ARM resource ID: /subscriptions/{sub}/resourceGroups/{rg}/providers/Microsoft.Storage/storageAccounts/{acct}/fileServices/default/shares/{share}
-                $idParts   = $live.id -split '/'
-                $liveSub   = $idParts[2]
-                $liveRg    = $idParts[4]
-                $liveAcct  = $idParts[8]
-                $liveShare = $idParts[12]
-                Write-Log "Storage '$liveAcct/$liveShare' not in desired state. Unlinking from NME (Azure resource NOT deleted — remove manually to avoid ongoing costs)..." 'WARN'
-                if (-not $WhatIf) {
-                    $roleAssigned = $false
-                    # Temporarily grant NME's SP Contributor on this RG so NME can perform its cleanup
-                    if ($nmeSpObjectId) {
-                        try {
-                            $existingRole = Get-AzRoleAssignment -ObjectId $nmeSpObjectId `
-                                -RoleDefinitionName 'Contributor' -ResourceGroupName $liveRg `
-                                -ErrorAction SilentlyContinue
-                            if (-not $existingRole) {
-                                New-AzRoleAssignment -ObjectId $nmeSpObjectId `
-                                    -RoleDefinitionName 'Contributor' -ResourceGroupName $liveRg `
-                                    -ErrorAction Stop | Out-Null
-                                Write-Log "Granted NME SP Contributor on '$liveRg' (temporary — will remove after unlink)."
-                                $roleAssigned = $true
-                                # Allow time for Azure RBAC to propagate before NME makes its call
-                                Start-Sleep -Seconds 30
-                            }
-                        } catch {
-                            Write-Log "Cannot grant NME SP Contributor on '$liveRg' (AA managed identity may lack User Access Administrator): $($_.Exception.Message). Attempting unlink anyway." 'WARN'
-                        }
+        })
+    })
+
+    if ($strayAccounts.Count -gt 0 -and $RemoveUndefinedResources -and -not $WhatIf) {
+        # Pass 1: grant Contributor on each unique stray RG where NME's SP lacks access
+        $grantsApplied = @{}   # RG → $true if we added a new grant
+        if ($nmeSpObjectId) {
+            $strayRgs = @($strayAccounts | ForEach-Object { ($_.id -split '/')[4] }) | Select-Object -Unique
+            foreach ($rg in $strayRgs) {
+                try {
+                    $existing = Get-AzRoleAssignment -ObjectId $nmeSpObjectId `
+                        -RoleDefinitionName 'Contributor' -ResourceGroupName $rg -ErrorAction SilentlyContinue
+                    if (-not $existing) {
+                        New-AzRoleAssignment -ObjectId $nmeSpObjectId `
+                            -RoleDefinitionName 'Contributor' -ResourceGroupName $rg -ErrorAction Stop | Out-Null
+                        Write-Log "Granted NME SP Contributor on '$rg' (temporary)."
+                        $grantsApplied[$rg] = $true
                     }
-                    try {
-                        $unlinkUrl = "$NmeUri/api/v1/storage/azure-files/$liveSub/$liveRg/$liveAcct/$liveShare/link"
-                        Invoke-NmeApi -Method DELETE -Uri $unlinkUrl | Out-Null
-                        $storageUnlinked++
-                        Write-Log "Storage '$liveAcct/$liveShare' unlinked from NME. NOTE: '$liveAcct' in '$liveRg' still exists in Azure — delete manually to stop billing." 'WARN'
-                    } catch {
-                        if ($_.Exception.Message -match '404') {
-                            Write-Log "Storage '$liveAcct/$liveShare' already removed from NME (404). Skipping."
-                        } elseif ($_.Exception.Message -match '500') {
-                            Write-Log "Cannot unlink storage '$liveAcct/$liveShare' — NME returned 500. Unlink manually via NME portal." 'WARN'
-                        } else {
-                            Add-NonFatalError "Failed to unlink storage '$liveAcct/$liveShare': $($_.Exception.Message)"
-                        }
-                    } finally {
-                        # Remove the temporary role assignment regardless of unlink outcome
-                        if ($roleAssigned -and $nmeSpObjectId) {
-                            try {
-                                Remove-AzRoleAssignment -ObjectId $nmeSpObjectId `
-                                    -RoleDefinitionName 'Contributor' -ResourceGroupName $liveRg `
-                                    -ErrorAction SilentlyContinue | Out-Null
-                                Write-Log "Removed temporary Contributor assignment for NME SP on '$liveRg'."
-                            } catch {
-                                Write-Log "Could not remove temporary role assignment on '$liveRg': $($_.Exception.Message)" 'WARN'
-                            }
-                        }
-                    }
-                } else {
-                    Write-Log "[WHATIF] Would grant NME SP Contributor on '$liveRg', unlink '$liveAcct/$liveShare', then remove grant."
+                } catch {
+                    Write-Log "Cannot grant NME SP Contributor on '$rg' (AA managed identity may lack User Access Administrator): $($_.Exception.Message)." 'WARN'
                 }
-            } else {
-                Write-Log "Storage '$($live.id)' is not in desired state (stray). Run with -RemoveUndefinedResources to unlink." 'WARN'
             }
+            if ($grantsApplied.Count -gt 0) {
+                Write-Log "Waiting 90s for RBAC propagation across $($grantsApplied.Count) resource group(s)..."
+                Start-Sleep -Seconds 90
+            }
+        }
+
+        # Pass 2: attempt unlink for all stray accounts
+        foreach ($live in $strayAccounts) {
+            $idParts   = $live.id -split '/'
+            $liveSub   = $idParts[2]
+            $liveRg    = $idParts[4]
+            $liveAcct  = $idParts[8]
+            $liveShare = $idParts[12]
+            Write-Log "Unlinking stray storage '$liveAcct/$liveShare' from NME (Azure resource NOT deleted — remove manually to avoid ongoing costs)..." 'WARN'
+            try {
+                $unlinkUrl = "$NmeUri/api/v1/storage/azure-files/$liveSub/$liveRg/$liveAcct/$liveShare/link"
+                Invoke-NmeApi -Method DELETE -Uri $unlinkUrl | Out-Null
+                $storageUnlinked++
+                Write-Log "Storage '$liveAcct/$liveShare' unlinked. NOTE: '$liveAcct' in '$liveRg' still exists in Azure — delete manually to stop billing." 'WARN'
+            } catch {
+                if ($_.Exception.Message -match '404') {
+                    Write-Log "Storage '$liveAcct/$liveShare' already removed from NME (404). Skipping."
+                } elseif ($_.Exception.Message -match '500') {
+                    Write-Log "Cannot unlink '$liveAcct/$liveShare' — NME returned 500. Unlink manually via NME portal." 'WARN'
+                } else {
+                    Add-NonFatalError "Failed to unlink storage '$liveAcct/$liveShare': $($_.Exception.Message)"
+                }
+            }
+        }
+
+        # Pass 3: remove all temporary grants
+        foreach ($rg in $grantsApplied.Keys) {
+            try {
+                Remove-AzRoleAssignment -ObjectId $nmeSpObjectId `
+                    -RoleDefinitionName 'Contributor' -ResourceGroupName $rg `
+                    -ErrorAction SilentlyContinue | Out-Null
+                Write-Log "Removed temporary Contributor grant for NME SP on '$rg'."
+            } catch {
+                Write-Log "Could not remove temporary role assignment on '$rg': $($_.Exception.Message)" 'WARN'
+            }
+        }
+    } elseif ($strayAccounts.Count -gt 0 -and $RemoveUndefinedResources -and $WhatIf) {
+        foreach ($live in $strayAccounts) {
+            $liveRg    = ($live.id -split '/')[4]
+            $liveAcct  = ($live.id -split '/')[8]
+            $liveShare = ($live.id -split '/')[12]
+            Write-Log "[WHATIF] Would grant NME SP Contributor on '$liveRg', unlink '$liveAcct/$liveShare', then remove grant."
+        }
+    } elseif ($strayAccounts.Count -gt 0) {
+        foreach ($live in $strayAccounts) {
+            Write-Log "Storage '$($live.id)' is not in desired state (stray). Run with -RemoveUndefinedResources to unlink." 'WARN'
         }
     }
 } else {
