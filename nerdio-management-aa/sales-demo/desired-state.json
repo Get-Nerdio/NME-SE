@@ -99,6 +99,9 @@
     {"name": "OnPremAD"},
     {"name": "EntraID"}
   ],
+  "vmProfiles": [],
+  "capacityProfiles": [],
+  "scriptedActionProfiles": [],
   "hostPools": [
     {
       "id": {

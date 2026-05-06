@@ -1489,8 +1489,11 @@ if ($RemoveUndefinedResources) {
 #   adConfigs   → ADConfigurations table  (domain join configs)
 #
 # To enforce a type, add the section to desired-state.json with the names to keep:
-#   "rdpConfigs": [{"name": "Default RDP"}]
-#   "adConfigs":  [{"name": "MyDomain-Config"}]
+#   "rdpConfigs":              [{"name": "Default RDP"}]
+#   "adConfigs":               [{"name": "MyDomain-Config"}]
+#   "vmProfiles":              [{"name": "MyVmProfile"}]
+#   "capacityProfiles":        [{"name": "MyCapacityProfile"}]
+#   "scriptedActionProfiles":  [{"name": "MyScriptedActionProfile"}]
 # An empty array means "remove all profiles of this type".
 
 if ($RemoveUndefinedResources -and $SqlConnection) {
@@ -1512,6 +1515,31 @@ if ($RemoveUndefinedResources -and $SqlConnection) {
             PreCleanup = @(
                 "UPDATE HostPoolADConfigurations SET ADConfigId = NULL WHERE ADConfigId IN (SELECT Id FROM ADConfigurations WHERE FriendlyName = @Name)"
                 "UPDATE HostPoolScriptedActionConfigurations SET ActiveDirectoryId = NULL WHERE ActiveDirectoryId IN (SELECT Id FROM ADConfigurations WHERE FriendlyName = @Name)"
+            )
+        },
+        @{
+            DsKey      = 'vmProfiles'
+            Table      = 'VmDeploymentProfiles'
+            NameCol    = 'Name'
+            PreCleanup = @(
+                "UPDATE HostPoolProperties SET VmDeploymentProfileId = NULL WHERE VmDeploymentProfileId IN (SELECT Id FROM VmDeploymentProfiles WHERE Name = @Name)"
+            )
+        },
+        @{
+            DsKey      = 'capacityProfiles'
+            Table      = 'CapacityExtenderProfiles'
+            NameCol    = 'Name'
+            PreCleanup = @(
+                "UPDATE HostPoolProperties SET CapacityExtenderProfileId = NULL WHERE CapacityExtenderProfileId IN (SELECT Id FROM CapacityExtenderProfiles WHERE Name = @Name)"
+            )
+        },
+        @{
+            DsKey      = 'scriptedActionProfiles'
+            Table      = 'HostPoolScriptedActionProfiles'
+            NameCol    = 'Name'
+            PreCleanup = @(
+                "DELETE FROM HostPoolScriptedActionConfigurations WHERE ProfileId IN (SELECT Id FROM HostPoolScriptedActionProfiles WHERE Name = @Name)"
+                "UPDATE HostPoolProperties SET ScriptedActionsProfileId = NULL WHERE ScriptedActionsProfileId IN (SELECT Id FROM HostPoolScriptedActionProfiles WHERE Name = @Name)"
             )
         }
     )
