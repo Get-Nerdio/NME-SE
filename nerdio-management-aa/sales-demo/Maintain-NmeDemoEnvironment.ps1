@@ -787,11 +787,11 @@ if ($null -ne $DesiredState.scriptedActions) {
     $liveScriptedActions = Invoke-NmeApi -Method GET -Uri "$NmeUri/api/v1/scripted-actions"
     if (-not $liveScriptedActions) { $liveScriptedActions = @() }
 
+    $repoLinkedSkipped = 0
     foreach ($live in $liveScriptedActions) {
         $inDs = $DesiredState.scriptedActions | Where-Object { $_.name -ieq $live.name }
         if (-not $inDs) {
             if ($RemoveUndefinedResources) {
-                Write-Log "Scripted action '$($live.name)' (id=$($live.id)) not in desired state. Removing..."
                 if (-not $WhatIf) {
                     try {
                         $deleteBody = @{ force = $true } | ConvertTo-Json
@@ -801,7 +801,7 @@ if ($null -ne $DesiredState.scriptedActions) {
                     } catch {
                         $errMsg = $_.Exception.Message
                         if ($errMsg -match 'repository-linked') {
-                            Write-Log "Scripted action '$($live.name)' is repository-linked — skipping."
+                            $repoLinkedSkipped++
                         } else {
                             Add-NonFatalError "Failed to remove scripted action '$($live.name)': $errMsg"
                         }
@@ -812,9 +812,10 @@ if ($null -ne $DesiredState.scriptedActions) {
             } else {
                 Write-Log "Scripted action '$($live.name)' is not in desired state (stray). Run with -RemoveUndefinedResources to remove." 'WARN'
             }
-        } else {
-            Write-Log "Scripted action '$($live.name)' is in desired state."
         }
+    }
+    if ($repoLinkedSkipped -gt 0) {
+        Write-Log "Skipped $repoLinkedSkipped repository-linked scripted action(s) — cannot be deleted via API."
     }
 } else {
     Write-Log "No 'scriptedActions' section in desired state — skipping scripted action enforcement."
@@ -1561,7 +1562,7 @@ if ($RemoveUndefinedResources -and $SqlConnection) {
             continue
         }
 
-        Write-Log "--- Enforce $dsKey via SQL ---"
+        Write-Log "--- Enforce $dsKey via SQL (keep: $(@($DesiredState.$dsKey | ForEach-Object { $_.name }) -join ', ')) ---"
         $desiredNames = @($DesiredState.$dsKey | ForEach-Object { $_.name })
 
         try {
