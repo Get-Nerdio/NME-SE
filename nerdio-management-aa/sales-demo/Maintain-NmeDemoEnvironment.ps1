@@ -265,6 +265,9 @@ function Compare-HpAutoScale {
     }
     if ($Live.vmTemplate.size   -ne $Desired.vmSize)    { return $true }
     if ($Live.vmTemplate.prefix -ne $DesiredPrefix)     { return $true }
+    # Optional fields — only compared when explicitly set in desired state
+    if ($Desired.scalingMode      -and $Live.scalingMode      -ne $Desired.scalingMode)      { return $true }
+    if ($Desired.autoScaleCriteria -and $Live.autoScaleCriteria -ne $Desired.autoScaleCriteria) { return $true }
     return $false
 }
 
@@ -913,10 +916,15 @@ foreach ($entry in $DesiredState.hostPools) {
     $hpRg   = $entry.id.resourceGroup
     $hpSub  = $entry.id.subscriptionId
     $hpUrl  = "$NmeUri/api/v1/arm/hostpool/$hpSub/$hpRg/$([uri]::EscapeDataString($hpName))"
-    # Derive VM name prefix: strip non-alphanumeric, lowercase, max 9 chars
-    # NME appends -{????} (5 chars) at VM creation; Windows computer names are limited to 15 chars total
-    $hpVmPrefix = ($hpName -replace '[^a-zA-Z0-9]', '').ToLower()
-    if ($hpVmPrefix.Length -gt 9) { $hpVmPrefix = $hpVmPrefix.Substring(0, 9) }
+    # VM name prefix: use explicit vmNamePrefix from desired state if provided; otherwise derive from pool name.
+    # NME appends -{????} (5 chars) at VM creation; Windows computer names are limited to 15 chars total.
+    if ($entry.autoScale.vmNamePrefix) {
+        $hpVmPrefix = ($entry.autoScale.vmNamePrefix -replace '[^a-zA-Z0-9]', '').ToLower()
+        if ($hpVmPrefix.Length -gt 9) { $hpVmPrefix = $hpVmPrefix.Substring(0, 9) }
+    } else {
+        $hpVmPrefix = ($hpName -replace '[^a-zA-Z0-9]', '').ToLower()
+        if ($hpVmPrefix.Length -gt 9) { $hpVmPrefix = $hpVmPrefix.Substring(0, 9) }
+    }
     $hpVmPrefixTemplate = "$hpVmPrefix-{????}"
 
     Write-Log "Processing host pool '$hpName'..."
@@ -1018,6 +1026,8 @@ foreach ($entry in $DesiredState.hostPools) {
                         $asConfig.vmTemplate.size   = $entry.autoScale.vmSize
                         $asConfig.vmTemplate.prefix = $hpVmPrefixTemplate
                     }
+                    if ($entry.autoScale.scalingMode)       { $asConfig.scalingMode       = $entry.autoScale.scalingMode }
+                    if ($entry.autoScale.autoScaleCriteria) { $asConfig.autoScaleCriteria = $entry.autoScale.autoScaleCriteria }
                     $asResult = Invoke-NmeApi -Method PUT -Uri "$hpUrl/auto-scale" -Body ($asConfig | ConvertTo-Json -Depth 20)
                     if ($asResult.job.id) {
                         Wait-NmeJob -JobId $asResult.job.id -Description "configure auto-scale on '$hpName'"
@@ -1117,6 +1127,8 @@ foreach ($entry in $DesiredState.hostPools) {
                             $liveAs.vmTemplate.size   = $entry.autoScale.vmSize
                             $liveAs.vmTemplate.prefix = $hpVmPrefixTemplate
                         }
+                        if ($entry.autoScale.scalingMode)       { $liveAs.scalingMode       = $entry.autoScale.scalingMode }
+                        if ($entry.autoScale.autoScaleCriteria) { $liveAs.autoScaleCriteria = $entry.autoScale.autoScaleCriteria }
                         $asResult = Invoke-NmeApi -Method PUT -Uri "$hpUrl/auto-scale" -Body ($liveAs | ConvertTo-Json -Depth 20)
                         if ($asResult.job.id) {
                             Wait-NmeJob -JobId $asResult.job.id -Description "update auto-scale config on '$hpName'"
@@ -1172,31 +1184,16 @@ if ($RemoveUndefinedResources) {
             Add-NonFatalError "Failed to disable auto-scale on '$($liveHp.Name)' (continuing removal): $($_.Exception.Message)"
         }
 
-        # Step 2 — Remove all session hosts via NME API; fall back to Az cmdlets for orphaned records
+        # Step 2 — Remove all session hosts via NME API; wait up to 60s for records to clear;
+        #           fall back to Az cmdlets only if orphaned records remain after the wait.
         try {
             $strayHosts = Invoke-NmeApi -Method GET -Uri "$strayUrl/host"
             if (-not $strayHosts) { $strayHosts = @() }
+
+            # Remove hosts with known names via NME DropVM jobs
             foreach ($sh in $strayHosts) {
-                # NME returns session hosts with a 'hostName' field (e.g. "vm-abc-0.domain.com")
                 $shVmName = $sh.hostName
-                if ([string]::IsNullOrWhiteSpace($shVmName)) {
-                    # Orphaned WVD registration with no VM — remove directly via Az cmdlets
-                    Write-Log "Session host with null hostName on '$($liveHp.Name)' — attempting Az WVD direct removal..."
-                    try {
-                        $azHosts = Get-AzWvdSessionHost -ResourceGroupName $liveHp.ResourceGroupName `
-                            -HostPoolName $liveHp.Name -SubscriptionId $SubscriptionId -ErrorAction SilentlyContinue
-                        foreach ($azSh in $azHosts) {
-                            $azShName = ($azSh.Name -split '/')[1]  # "poolname/hostname" → "hostname"
-                            Write-Log "Removing orphaned WVD session host '$azShName' via Az cmdlet..."
-                            Remove-AzWvdSessionHost -ResourceGroupName $liveHp.ResourceGroupName `
-                                -HostPoolName $liveHp.Name -Name $azShName -Force -ErrorAction Stop | Out-Null
-                            Write-Log "Orphaned session host '$azShName' removed."
-                        }
-                    } catch {
-                        Add-NonFatalError "Failed to remove orphaned session hosts on '$($liveHp.Name)' via Az cmdlet: $($_.Exception.Message)"
-                    }
-                    continue
-                }
+                if ([string]::IsNullOrWhiteSpace($shVmName)) { continue }
                 Write-Log "Removing session host '$shVmName' from '$($liveHp.Name)'..."
                 try {
                     # jobPayload wrapper required by SessionHostRemove schema
@@ -1209,8 +1206,45 @@ if ($RemoveUndefinedResources) {
                     Add-NonFatalError "Failed to remove session host '$shVmName' from '$($liveHp.Name)': $($_.Exception.Message)"
                 }
             }
+
+            # Wait up to 60s for NME to finish clearing session host records before resorting to Az cmdlets.
+            # After DropVM jobs complete there can be a brief delay before WVD deregisters the hosts.
+            $waitSecs   = 0
+            $maxWaitSecs = 60
+            do {
+                $remaining = Invoke-NmeApi -Method GET -Uri "$strayUrl/host"
+                if (-not $remaining) { $remaining = @() }
+                $nullHosts = @($remaining | Where-Object { [string]::IsNullOrWhiteSpace($_.hostName) })
+                if ($nullHosts.Count -eq 0) { break }
+                if ($waitSecs -ge $maxWaitSecs) { break }
+                Write-Log "Waiting for NME to clear $($nullHosts.Count) orphaned session host record(s) ($waitSecs/$maxWaitSecs s)..."
+                Start-Sleep -Seconds 15
+                $waitSecs += 15
+            } while ($true)
+
+            # Fall back to Az cmdlets for any orphaned records that remain after the wait
+            $remaining = Invoke-NmeApi -Method GET -Uri "$strayUrl/host"
+            if (-not $remaining) { $remaining = @() }
+            $nullHosts = @($remaining | Where-Object { [string]::IsNullOrWhiteSpace($_.hostName) })
+            if ($nullHosts.Count -gt 0) {
+                Write-Log "$($nullHosts.Count) orphaned session host record(s) remain after ${maxWaitSecs}s — removing via Az WVD cmdlets..."
+                try {
+                    $azHosts = Get-AzWvdSessionHost -ResourceGroupName $liveHp.ResourceGroupName `
+                        -HostPoolName $liveHp.Name -SubscriptionId $SubscriptionId -ErrorAction SilentlyContinue
+                    if (-not $azHosts) { $azHosts = @() }
+                    foreach ($azSh in $azHosts) {
+                        $azShName = ($azSh.Name -split '/')[1]  # "poolname/hostname" → "hostname"
+                        Write-Log "Removing orphaned WVD session host '$azShName' via Az cmdlet..."
+                        Remove-AzWvdSessionHost -ResourceGroupName $liveHp.ResourceGroupName `
+                            -HostPoolName $liveHp.Name -Name $azShName -Force -ErrorAction Stop | Out-Null
+                        Write-Log "Orphaned session host '$azShName' removed."
+                    }
+                } catch {
+                    Add-NonFatalError "Failed to remove orphaned session hosts on '$($liveHp.Name)' via Az cmdlet: $($_.Exception.Message)"
+                }
+            }
         } catch {
-            Add-NonFatalError "Failed to enumerate session hosts on '$($liveHp.Name)' (continuing removal): $($_.Exception.Message)"
+            Add-NonFatalError "Failed to enumerate/remove session hosts on '$($liveHp.Name)' (continuing removal): $($_.Exception.Message)"
         }
 
         # Step 3 — Delete the host pool

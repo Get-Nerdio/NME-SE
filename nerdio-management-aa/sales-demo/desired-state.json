@@ -1,5 +1,5 @@
 {
-  "schemaVersion": "1.0",
+  "schemaVersion": "1.1",
   "lastUpdated": "2026-05-05T00:00:00Z",
   "workspace": {
     "subscriptionId": "2b9dd21c-8f1d-44aa-a344-4527243840c7",
@@ -78,6 +78,9 @@
       "autoScale": {
         "isEnabled": true,
         "vmSize": "Standard_D2s_v5",
+        "vmNamePrefix": "mspooled",
+        "scalingMode": "WorkingHours",
+        "autoScaleCriteria": "AvgActiveSessions",
         "hostPoolCapacity": 2,
         "minActiveHostsCount": 1
       }
@@ -99,6 +102,9 @@
       "autoScale": {
         "isEnabled": true,
         "vmSize": "Standard_D2s_v5",
+        "vmNamePrefix": "remoteapp",
+        "scalingMode": "WorkingHours",
+        "autoScaleCriteria": "AvgActiveSessions",
         "hostPoolCapacity": 2,
         "minActiveHostsCount": 1
       }
@@ -120,6 +126,9 @@
       "autoScale": {
         "isEnabled": true,
         "vmSize": "Standard_D2s_v5",
+        "vmNamePrefix": "supool",
+        "scalingMode": "WorkingHours",
+        "autoScaleCriteria": "AvgActiveSessions",
         "hostPoolCapacity": 2,
         "minActiveHostsCount": 1
       }
@@ -142,6 +151,8 @@
       "autoScale": {
         "isEnabled": true,
         "vmSize": "Standard_D2s_v5",
+        "vmNamePrefix": "personal",
+        "scalingMode": "UserDriven",
         "hostPoolCapacity": 2,
         "minActiveHostsCount": 1
       }
