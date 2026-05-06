@@ -22,19 +22,39 @@
       "resourceGroup": "nw-salesdemo-resources-rg",
       "accountName": "nwsdfslsa",
       "shareName": "profiles"
+    },
+    {
+      "subscriptionId": "2b9dd21c-8f1d-44aa-a344-4527243840c7",
+      "resourceGroup": "nw-salesdemo-resources-rg",
+      "accountName": "nmedemoadsa",
+      "shareName": "profiles"
     }
   ],
   "fslogixConfigs": [
     {
-      "name": "DemoFSLogix-Standard",
+      "name": "FSLogix-EntraStorage",
       "isDefault": false,
       "properties": {
         "profileContainer": {
           "locations": [
-            "\\\\nmest1labsa.file.core.windows.net\\profiles"
+            "\\\\nwsdfslsa.file.core.windows.net\\profiles"
           ]
         },
         "entraIdKerberos": true,
+        "cloudCache": false,
+        "pageBlobs": false
+      }
+    },
+    {
+      "name": "FSLogix-ADStorage",
+      "isDefault": false,
+      "properties": {
+        "profileContainer": {
+          "locations": [
+            "\\\\nmedemoadsa.file.core.windows.net\\profiles"
+          ]
+        },
+        "entraIdKerberos": false,
         "cloudCache": false,
         "pageBlobs": false
       }
@@ -56,7 +76,7 @@
     {
       "name": "Multisession Image",
       "resourceGroup": "nw-salesdemo-resources-rg",
-      "sourceImageId": "MicrosoftWindowsDesktop:windows-11:win11-24h2-avd:latest",
+      "sourceImageId": "MicrosoftWindowsDesktop/windows-11/win11-24h2-avd/latest",
       "vmSize": "Standard_D2s_v5",
       "storageType": "StandardSSD_LRS",
       "description": "Windows 11 multi-session for pooled host pools"
@@ -64,7 +84,7 @@
     {
       "name": "Personal Desktop Image",
       "resourceGroup": "nw-salesdemo-resources-rg",
-      "sourceImageId": "MicrosoftWindowsDesktop:windows-11:win11-24h2-ent:latest",
+      "sourceImageId": "MicrosoftWindowsDesktop/windows-11/win11-24h2-ent/latest",
       "vmSize": "Standard_D2s_v5",
       "storageType": "StandardSSD_LRS",
       "description": "Windows 11 single-session for personal desktops"
