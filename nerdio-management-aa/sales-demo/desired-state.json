@@ -99,9 +99,15 @@
     {"name": "OnPremAD"},
     {"name": "EntraID"}
   ],
-  "vmProfiles": [],
-  "capacityProfiles": [],
-  "scriptedActionProfiles": [],
+  "vmProfiles": [
+    {"name": "TrackedVMProfile"}
+  ],
+  "capacityProfiles": [
+    {"name": "CapacityExtender"}
+  ],
+  "scriptedActionProfiles": [
+    {"name": "Scripted Actions Profile"}
+  ],
   "hostPools": [
     {
       "id": {
