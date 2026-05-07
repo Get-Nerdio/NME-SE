@@ -299,7 +299,8 @@ function Compare-CclConfig {
     param([PSCustomObject]$Live, [PSCustomObject]$Desired)
     if ($null -ne $Desired.displayName       -and $Live.displayName       -ne $Desired.displayName)       { return $true }
     if ($null -ne $Desired.defaultReportType -and $Live.defaultReportType -ne $Desired.defaultReportType) { return $true }
-    if ($null -ne $Desired.isDefault         -and $Live.isDefault         -ne $Desired.isDefault)         { return $true }
+    # NME API only accepts isDefault=true (omit to leave false); only flag drift when desired is true
+    if ($Desired.isDefault -eq $true -and $Live.isDefault -ne $true) { return $true }
     return $false
 }
 
@@ -902,7 +903,8 @@ if ($null -ne $DesiredState.profiles.cclConfigs) {
                     $cclPatch = @{}
                     if ($null -ne $entry.displayName)       { $cclPatch['displayName']       = $entry.displayName }
                     if ($null -ne $entry.defaultReportType) { $cclPatch['defaultReportType'] = $entry.defaultReportType }
-                    if ($null -ne $entry.isDefault)         { $cclPatch['isDefault']         = $entry.isDefault }
+                    # NME API only accepts isDefault=true; omit the field entirely when false
+                    if ($entry.isDefault -eq $true)         { $cclPatch['isDefault']         = $true }
                     try {
                         $patchResult = Invoke-NmeApi -Method PATCH -Uri "$NmeUri/api/v1/user-cost-attribution/configuration/$($live.id)" -Body ($cclPatch | ConvertTo-Json)
                         if ($patchResult.job.id) {
@@ -1242,7 +1244,12 @@ foreach ($live in $liveImages) {
             Write-Log "Desktop image '$($live.name)' not in desired state. Removing..."
             if (-not $WhatIf) {
                 try {
-                    Invoke-NmeApi -Method DELETE -Uri "$NmeUri/api/v1/desktop-image/$($live.id)" | Out-Null
+                    # $live.id is an ARM resource ID — parse subscriptionId, resourceGroup, name
+                    $imgIdParts  = $live.id -split '/'
+                    $imgDelSub   = $imgIdParts[2]
+                    $imgDelRg    = $imgIdParts[4]
+                    $imgDelName  = $imgIdParts[-1]
+                    Invoke-NmeApi -Method DELETE -Uri "$NmeUri/api/v1/desktop-image/$imgDelSub/$imgDelRg/$imgDelName" | Out-Null
                     $imagesRemoved++
                     Write-Log "Desktop image '$($live.name)' removed."
                 } catch {
