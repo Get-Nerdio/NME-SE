@@ -238,24 +238,31 @@ function Resolve-FslogixIdByName {
 
 function Compare-HostPoolWvdProps {
     param([PSCustomObject]$Live, [PSCustomObject]$Desired)
-    if ($Live.loadBalancerType -ne $Desired.loadBalancingAlgorithm) { return $true }
+    # Only compare fields that are explicitly set in desired state (null = don't care)
+    if ($null -ne $Desired.loadBalancingAlgorithm -and $Live.loadBalancerType -ne $Desired.loadBalancingAlgorithm) { return $true }
     # Personal pools: NME always overrides maxSessionLimit to 999999 internally — skip comparison
-    if ($Desired.poolType -ne 'Personal' -and $Live.maxSessionLimit -ne $Desired.maxSessionLimit) { return $true }
+    if ($null -ne $Desired.maxSessionLimit -and $Desired.poolType -ne 'Personal' -and $Live.maxSessionLimit -ne $Desired.maxSessionLimit) { return $true }
     return $false
 }
 
 function Compare-FslogixConfig {
     param([PSCustomObject]$Live, [PSCustomObject]$Desired)
-    if ($Live.isDefault -ne $Desired.isDefault) { return $true }
-    if ($Live.properties.entraIdKerberos -ne $Desired.properties.entraIdKerberos) { return $true }
-    if ($Live.properties.cloudCache      -ne $Desired.properties.cloudCache)      { return $true }
-    if ($Live.properties.pageBlobs       -ne $Desired.properties.pageBlobs)       { return $true }
-    # Compare profile container locations (order-insensitive)
-    $liveLocations    = @($Live.properties.profileContainer.locations    | Sort-Object)
-    $desiredLocations = @($Desired.properties.profileContainer.locations | Sort-Object)
-    if ($liveLocations.Count -ne $desiredLocations.Count) { return $true }
-    for ($i = 0; $i -lt $liveLocations.Count; $i++) {
-        if ($liveLocations[$i] -ne $desiredLocations[$i]) { return $true }
+    # Only compare fields that are explicitly set in desired state (null = don't care)
+    if ($null -ne $Desired.isDefault -and $Live.isDefault -ne $Desired.isDefault) { return $true }
+    $dp = $Desired.properties
+    if ($null -ne $dp) {
+        if ($null -ne $dp.entraIdKerberos -and $Live.properties.entraIdKerberos -ne $dp.entraIdKerberos) { return $true }
+        if ($null -ne $dp.cloudCache      -and $Live.properties.cloudCache      -ne $dp.cloudCache)      { return $true }
+        if ($null -ne $dp.pageBlobs       -and $Live.properties.pageBlobs       -ne $dp.pageBlobs)       { return $true }
+        if ($null -ne $dp.profileContainer -and $null -ne $dp.profileContainer.locations) {
+            # Compare profile container locations (order-insensitive)
+            $liveLocations    = @($Live.properties.profileContainer.locations | Sort-Object)
+            $desiredLocations = @($dp.profileContainer.locations              | Sort-Object)
+            if ($liveLocations.Count -ne $desiredLocations.Count) { return $true }
+            for ($i = 0; $i -lt $liveLocations.Count; $i++) {
+                if ($liveLocations[$i] -ne $desiredLocations[$i]) { return $true }
+            }
+        }
     }
     return $false
 }
@@ -269,18 +276,19 @@ function Compare-HpFslogixAssignment {
 }
 
 function Compare-HpAutoScale {
-    param([PSCustomObject]$Live, [PSCustomObject]$Desired, [string]$DesiredPrefix, [string]$PoolType = 'Pooled')
-    if ($Live.isEnabled -ne $Desired.isEnabled) { return $true }
+    # $DesiredPrefix: pre-computed "{prefix}-{????}" string, or $null if vmNamePrefix not in desired state
+    param([PSCustomObject]$Live, [PSCustomObject]$Desired, [string]$DesiredPrefix = $null, [string]$PoolType = 'Pooled')
+    # Only compare fields that are explicitly set in desired state (null = don't care)
+    if ($null -ne $Desired.isEnabled -and $Live.isEnabled -ne $Desired.isEnabled) { return $true }
     # Personal pools: NME does not surface hostPoolCapacity/minActiveHostsCount — skip comparison
     if ($PoolType -ne 'Personal') {
-        if ($Live.hostPoolCapacity    -ne $Desired.hostPoolCapacity)    { return $true }
-        if ($Live.minActiveHostsCount -ne $Desired.minActiveHostsCount) { return $true }
+        if ($null -ne $Desired.hostPoolCapacity    -and $Live.hostPoolCapacity    -ne $Desired.hostPoolCapacity)    { return $true }
+        if ($null -ne $Desired.minActiveHostsCount -and $Live.minActiveHostsCount -ne $Desired.minActiveHostsCount) { return $true }
     }
-    if ($Live.vmTemplate.size   -ne $Desired.vmSize)    { return $true }
-    if ($Live.vmTemplate.prefix -ne $DesiredPrefix)     { return $true }
-    # Optional fields — only compared when explicitly set in desired state
-    if ($Desired.scalingMode      -and $Live.scalingMode      -ne $Desired.scalingMode)      { return $true }
-    if ($Desired.autoScaleCriteria -and $Live.autoScaleCriteria -ne $Desired.autoScaleCriteria) { return $true }
+    if ($null -ne $Desired.vmSize    -and $Live.vmTemplate.size   -ne $Desired.vmSize)    { return $true }
+    if ($DesiredPrefix               -and $Live.vmTemplate.prefix -ne $DesiredPrefix)     { return $true }
+    if ($null -ne $Desired.scalingMode       -and $Live.scalingMode       -ne $Desired.scalingMode)       { return $true }
+    if ($null -ne $Desired.autoScaleCriteria -and $Live.autoScaleCriteria -ne $Desired.autoScaleCriteria) { return $true }
     return $false
 }
 
@@ -632,19 +640,20 @@ foreach ($entry in $DesiredState.profiles.fslogix) {
     if (-not $live) {
         Write-Log "FSLogix config '$($entry.name)' not found. Creating..."
         if (-not $WhatIf) {
+            # Unspecified boolean/array fields default to $false / @() for create
             $fslBody = @{
                 name      = $entry.name
-                isDefault = $entry.isDefault
+                isDefault = $entry.isDefault ?? $false
                 properties = @{
                     installer        = @{ version = ''; forceUpdate = $false }
                     profileContainer = @{
-                        locations = @($entry.properties.profileContainer.locations)
+                        locations = @($entry.properties.profileContainer.locations ?? @())
                         options   = ''
                     }
                     officeContainer  = @{ locations = @(); options = '' }
-                    cloudCache       = $entry.properties.cloudCache
-                    pageBlobs        = $entry.properties.pageBlobs
-                    entraIdKerberos  = $entry.properties.entraIdKerberos
+                    cloudCache       = $entry.properties.cloudCache      ?? $false
+                    pageBlobs        = $entry.properties.pageBlobs        ?? $false
+                    entraIdKerberos  = $entry.properties.entraIdKerberos  ?? $false
                     redirectionsXml  = ''
                     exclusions       = @{ exclusionMode = 'None' }
                     appServiceRegistryOptions = @{ registryOptionsMode = 'None'; registryOptions = '' }
@@ -666,25 +675,21 @@ foreach ($entry in $DesiredState.profiles.fslogix) {
     } elseif (Compare-FslogixConfig -Live $live -Desired $entry) {
         Write-Log "FSLogix config '$($entry.name)' has drifted. Updating..."
         if (-not $WhatIf) {
-            $patchBody = @{
-                name      = $entry.name
-                isDefault = $entry.isDefault
-                properties = @{
-                    installer        = @{ version = ''; forceUpdate = $false }
-                    profileContainer = @{
-                        locations = @($entry.properties.profileContainer.locations)
-                        options   = ''
-                    }
-                    officeContainer  = @{ locations = @(); options = '' }
-                    cloudCache       = $entry.properties.cloudCache
-                    pageBlobs        = $entry.properties.pageBlobs
-                    entraIdKerberos  = $entry.properties.entraIdKerberos
-                    redirectionsXml  = ''
-                    exclusions       = @{ exclusionMode = 'None' }
-                    appServiceRegistryOptions = @{ registryOptionsMode = 'None'; registryOptions = '' }
-                    logRegistryOptions        = @{ registryOptionsMode = 'None'; registryOptions = '' }
+            # Read-modify-write: fetch live state and only overwrite specified fields
+            $liveFull = Invoke-NmeApi -Method GET -Uri "$NmeUri/api/v1/fslogix"
+            $liveFull = @($liveFull) | Where-Object { $_.id -eq $live.id }
+            if (-not $liveFull) { $liveFull = $live }
+            if ($null -ne $entry.isDefault) { $liveFull.isDefault = $entry.isDefault }
+            $dp = $entry.properties
+            if ($null -ne $dp) {
+                if ($null -ne $dp.entraIdKerberos) { $liveFull.properties.entraIdKerberos = $dp.entraIdKerberos }
+                if ($null -ne $dp.cloudCache)      { $liveFull.properties.cloudCache      = $dp.cloudCache }
+                if ($null -ne $dp.pageBlobs)       { $liveFull.properties.pageBlobs       = $dp.pageBlobs }
+                if ($null -ne $dp.profileContainer -and $null -ne $dp.profileContainer.locations) {
+                    $liveFull.properties.profileContainer.locations = @($dp.profileContainer.locations)
                 }
-            } | ConvertTo-Json -Depth 10
+            }
+            $patchBody = $liveFull | ConvertTo-Json -Depth 10
             try {
                 Invoke-NmeApi -Method PATCH -Uri "$NmeUri/api/v1/fslogix/$($live.id)" -Body $patchBody | Out-Null
                 $fslUpdated++
@@ -745,14 +750,14 @@ foreach ($entry in $DesiredState.profiles.autoScale) {
 
     if (-not $live) {
         Write-Log "Auto-scale profile '$($entry.name)' not found. Create it manually in NME (mode=$($entry.mode))." 'WARN'
-    } elseif ($live.mode -ne $entry.mode) {
+    } elseif ($null -ne $entry.mode -and $live.mode -ne $entry.mode) {
         Write-Log "Auto-scale profile '$($entry.name)' mode drifted ('$($live.mode)' → '$($entry.mode)'). Updating..."
         if (-not $WhatIf) {
-            $asPatchBody = @{
-                name        = $entry.name
-                description = $entry.description
-                mode        = $entry.mode
-            } | ConvertTo-Json -Depth 5
+            # Only include fields that are explicitly set in desired state
+            $asPatch = @{ name = $entry.name }
+            if ($null -ne $entry.mode)        { $asPatch['mode']        = $entry.mode }
+            if ($null -ne $entry.description) { $asPatch['description'] = $entry.description }
+            $asPatchBody = $asPatch | ConvertTo-Json -Depth 5
             try {
                 Invoke-NmeApi -Method PATCH -Uri "$NmeUri/api/v1/auto-scale-profile/$($live.id)" -Body $asPatchBody | Out-Null
                 Write-Log "Auto-scale profile '$($entry.name)' updated."
@@ -1155,16 +1160,20 @@ foreach ($entry in $DesiredState.hostPools) {
     $hpRg   = $entry.id.resourceGroup
     $hpSub  = $entry.id.subscriptionId
     $hpUrl  = "$NmeUri/api/v1/arm/hostpool/$hpSub/$hpRg/$([uri]::EscapeDataString($hpName))"
-    # VM name prefix: use explicit vmNamePrefix from desired state if provided; otherwise derive from pool name.
-    # NME appends -{????} (5 chars) at VM creation; Windows computer names are limited to 15 chars total.
+    # VM name prefix used in the create payload (always has a value — falls back to pool name).
+    # $hpVmPrefixEnforce is non-null only when vmNamePrefix is explicitly in desired state,
+    # so Compare-HpAutoScale skips the prefix drift check when it wasn't specified.
     if ($entry.autoScale.vmNamePrefix) {
-        $hpVmPrefix = ($entry.autoScale.vmNamePrefix -replace '[^a-zA-Z0-9]', '').ToLower()
-        if ($hpVmPrefix.Length -gt 9) { $hpVmPrefix = $hpVmPrefix.Substring(0, 9) }
+        $raw = ($entry.autoScale.vmNamePrefix -replace '[^a-zA-Z0-9]', '').ToLower()
+        if ($raw.Length -gt 9) { $raw = $raw.Substring(0, 9) }
+        $hpVmPrefixTemplate = "$raw-{????}"
+        $hpVmPrefixEnforce  = $hpVmPrefixTemplate
     } else {
-        $hpVmPrefix = ($hpName -replace '[^a-zA-Z0-9]', '').ToLower()
-        if ($hpVmPrefix.Length -gt 9) { $hpVmPrefix = $hpVmPrefix.Substring(0, 9) }
+        $raw = ($hpName -replace '[^a-zA-Z0-9]', '').ToLower()
+        if ($raw.Length -gt 9) { $raw = $raw.Substring(0, 9) }
+        $hpVmPrefixTemplate = "$raw-{????}"   # create only
+        $hpVmPrefixEnforce  = $null           # not specified — skip drift check
     }
-    $hpVmPrefixTemplate = "$hpVmPrefix-{????}"
 
     Write-Log "Processing host pool '$hpName'..."
 
@@ -1303,10 +1312,11 @@ foreach ($entry in $DesiredState.hostPools) {
             if (Compare-HostPoolWvdProps -Live $liveWvd -Desired $entry) {
                 Write-Log "WVD props drifted on '$hpName' (loadBalancer='$($liveWvd.loadBalancerType)'→'$($entry.loadBalancingAlgorithm)', maxSession=$($liveWvd.maxSessionLimit)→$($entry.maxSessionLimit))."
                 if (-not $WhatIf) {
-                    $wvdBody = @{
-                        loadBalancerType = $entry.loadBalancingAlgorithm
-                        maxSessionLimit  = $entry.maxSessionLimit
-                    } | ConvertTo-Json
+                    # Only include fields that are explicitly set in desired state
+                    $wvdPatch = @{}
+                    if ($null -ne $entry.loadBalancingAlgorithm)                               { $wvdPatch['loadBalancerType'] = $entry.loadBalancingAlgorithm }
+                    if ($null -ne $entry.maxSessionLimit -and $entry.poolType -ne 'Personal')  { $wvdPatch['maxSessionLimit']  = [int]$entry.maxSessionLimit }
+                    $wvdBody   = $wvdPatch | ConvertTo-Json
                     $wvdResult = Invoke-NmeApi -Method PATCH -Uri "$hpUrl/wvd" -Body $wvdBody
                     if ($wvdResult.job.id) {
                         Wait-NmeJob -JobId $wvdResult.job.id -Description "update WVD props on '$hpName'"
@@ -1352,22 +1362,22 @@ foreach ($entry in $DesiredState.hostPools) {
                     Invoke-NmeApi -Method POST -Uri "$hpUrl/auto-scale" | Out-Null
                     $liveAs = Invoke-NmeApi -Method GET -Uri "$hpUrl/auto-scale"
                 }
-                if (Compare-HpAutoScale -Live $liveAs -Desired $entry.autoScale -DesiredPrefix $hpVmPrefixTemplate -PoolType $entry.poolType) {
+                if (Compare-HpAutoScale -Live $liveAs -Desired $entry.autoScale -DesiredPrefix $hpVmPrefixEnforce -PoolType $entry.poolType) {
                     Write-Log "Auto-scale config drifted on '$hpName' (isEnabled=$($liveAs.isEnabled), vmSize=$($liveAs.vmTemplate.size), prefix='$($liveAs.vmTemplate.prefix)', capacity=$($liveAs.hostPoolCapacity), minActive=$($liveAs.minActiveHostsCount))."
                     if (-not $WhatIf) {
-                        # Read-modify-write: patch only the desired-state fields
+                        # Read-modify-write: only overwrite fields that are explicitly set in desired state
                         # Personal pools don't support hostPoolCapacity/minActiveHostsCount
-                        $liveAs.isEnabled = $entry.autoScale.isEnabled
+                        if ($null -ne $entry.autoScale.isEnabled) { $liveAs.isEnabled = $entry.autoScale.isEnabled }
                         if ($entry.poolType -ne 'Personal') {
-                            $liveAs.hostPoolCapacity    = $entry.autoScale.hostPoolCapacity
-                            $liveAs.minActiveHostsCount = $entry.autoScale.minActiveHostsCount
+                            if ($null -ne $entry.autoScale.hostPoolCapacity)    { $liveAs.hostPoolCapacity    = $entry.autoScale.hostPoolCapacity }
+                            if ($null -ne $entry.autoScale.minActiveHostsCount) { $liveAs.minActiveHostsCount = $entry.autoScale.minActiveHostsCount }
                         }
                         if ($liveAs.vmTemplate) {
-                            $liveAs.vmTemplate.size   = $entry.autoScale.vmSize
-                            $liveAs.vmTemplate.prefix = $hpVmPrefixTemplate
+                            if ($null -ne $entry.autoScale.vmSize)      { $liveAs.vmTemplate.size   = $entry.autoScale.vmSize }
+                            if ($entry.autoScale.vmNamePrefix)          { $liveAs.vmTemplate.prefix = $hpVmPrefixTemplate }
                         }
-                        if ($entry.autoScale.scalingMode)       { $liveAs.scalingMode       = $entry.autoScale.scalingMode }
-                        if ($entry.autoScale.autoScaleCriteria) { $liveAs.autoScaleCriteria = $entry.autoScale.autoScaleCriteria }
+                        if ($null -ne $entry.autoScale.scalingMode)       { $liveAs.scalingMode       = $entry.autoScale.scalingMode }
+                        if ($null -ne $entry.autoScale.autoScaleCriteria) { $liveAs.autoScaleCriteria = $entry.autoScale.autoScaleCriteria }
                         $asResult = Invoke-NmeApi -Method PUT -Uri "$hpUrl/auto-scale" -Body ($liveAs | ConvertTo-Json -Depth 20)
                         if ($asResult.job.id) {
                             Wait-NmeJob -JobId $asResult.job.id -Description "update auto-scale config on '$hpName'"
