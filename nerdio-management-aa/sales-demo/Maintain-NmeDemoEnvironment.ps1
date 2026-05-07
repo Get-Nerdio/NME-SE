@@ -863,11 +863,13 @@ if ($null -ne $DesiredState.profiles.scriptedActions) {
 if ($null -ne $DesiredState.profiles.cclConfigs) {
     Write-Log "--- Reconcile CCL Configurations ---"
 
-    $liveCcl = @(Invoke-NmeApi -Method GET -Uri "$NmeUri/api/v1/user-cost-attribution/configuration")
+    $liveCcl = Invoke-NmeApi -Method GET -Uri "$NmeUri/api/v1/user-cost-attribution/configuration"
     if (-not $liveCcl) { $liveCcl = @() }
+    Write-Log "Live CCL configs ($(@($liveCcl).Count)): $((@($liveCcl) | ForEach-Object { "id=$($_.id) displayName='$($_.displayName)'" }) -join '; ')"
 
     foreach ($entry in $DesiredState.profiles.cclConfigs) {
         $live = $liveCcl | Where-Object { $_.displayName -ieq $entry.displayName }
+        Write-Log "CCL match for '$($entry.displayName)': $(if ($live) { "found id=$($live.id) displayName='$($live.displayName)'" } else { 'not found' })"
 
         if (-not $live) {
             Write-Log "CCL config '$($entry.displayName)' not found. Creating..."
@@ -887,7 +889,7 @@ if ($null -ne $DesiredState.profiles.cclConfigs) {
                         Wait-NmeJob -JobId $cclResult.job.id -Description "create CCL config '$($entry.displayName)'"
                     }
                     Write-Log "CCL config '$($entry.displayName)' created."
-                    $liveCcl = @(Invoke-NmeApi -Method GET -Uri "$NmeUri/api/v1/user-cost-attribution/configuration")
+                    $liveCcl = Invoke-NmeApi -Method GET -Uri "$NmeUri/api/v1/user-cost-attribution/configuration"
                     if (-not $liveCcl) { $liveCcl = @() }
                 } catch {
                     Add-NonFatalError "Failed to create CCL config '$($entry.displayName)': $($_.Exception.Message)"
@@ -1301,12 +1303,12 @@ foreach ($entry in $DesiredState.hostPools) {
     # $hpVmPrefixEnforce is non-null only when vmNamePrefix is explicitly in desired state,
     # so Compare-HpAutoScale skips the prefix drift check when it wasn't specified.
     if ($entry.autoScale.vmNamePrefix) {
-        $raw = ($entry.autoScale.vmNamePrefix -replace '[^a-zA-Z0-9]', '').ToLower()
+        $raw = ($entry.autoScale.vmNamePrefix -replace '[^a-zA-Z0-9]', '')
         if ($raw.Length -gt 9) { $raw = $raw.Substring(0, 9) }
         $hpVmPrefixTemplate = "$raw-{????}"
         $hpVmPrefixEnforce  = $hpVmPrefixTemplate
     } else {
-        $raw = ($hpName -replace '[^a-zA-Z0-9]', '').ToLower()
+        $raw = ($hpName -replace '[^a-zA-Z0-9]', '')
         if ($raw.Length -gt 9) { $raw = $raw.Substring(0, 9) }
         $hpVmPrefixTemplate = "$raw-{????}"   # create only
         $hpVmPrefixEnforce  = $null           # not specified — skip drift check
