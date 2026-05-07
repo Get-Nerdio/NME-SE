@@ -1385,6 +1385,27 @@ foreach ($entry in $DesiredState.hostPools) {
 
         if ($driftFound) { $hpUpdated++ } else { Write-Log "Host pool '$hpName' is correctly configured." }
     }
+
+    # ── User assignment ──────────────────────────────────────────────────────────
+    # Ensure every user listed in desired-state users[] is assigned to this pool.
+    # Runs after both create and update paths. Extra users already on the pool are
+    # never removed — assignment enforcement is strictly additive.
+    if ($entry.users -and @($entry.users).Count -gt 0) {
+        if ($WhatIf) {
+            Write-Log "[WHATIF] Would assign users on '$hpName': $(@($entry.users) -join ', ')."
+        } else {
+            try {
+                $assignBody = @{ users = @($entry.users) } | ConvertTo-Json
+                $assignResult = Invoke-NmeApi -Method POST -Uri "$hpUrl/assign" -Body $assignBody
+                if ($assignResult.job.id) {
+                    Wait-NmeJob -JobId $assignResult.job.id -Description "assign users on '$hpName'"
+                }
+                Write-Log "User assignment confirmed on '$hpName': $(@($entry.users) -join ', ')."
+            } catch {
+                Add-NonFatalError "Failed to assign users on '$hpName': $($_.Exception.Message)"
+            }
+        }
+    }
 }
 
 # ── REMOVAL PASS ─────────────────────────────────────────────────────────────
