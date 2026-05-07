@@ -898,7 +898,11 @@ if ($null -ne $DesiredState.profiles.cclConfigs) {
         } else {
             # Check PATCH-able fields for drift
             if (Compare-CclConfig -Live $live -Desired $entry) {
-                Write-Log "CCL config '$($entry.displayName)' has drifted. Updating..."
+                $cclDriftDetails = @()
+                if ($null -ne $entry.displayName       -and $live.displayName       -ne $entry.displayName)       { $cclDriftDetails += "displayName: '$($live.displayName)' -> '$($entry.displayName)'" }
+                if ($null -ne $entry.defaultReportType -and $live.defaultReportType -ne $entry.defaultReportType) { $cclDriftDetails += "defaultReportType: '$($live.defaultReportType)' -> '$($entry.defaultReportType)'" }
+                if ($entry.isDefault -eq $true -and $live.isDefault -ne $true)                                    { $cclDriftDetails += "isDefault: '$($live.isDefault)' -> true" }
+                Write-Log "CCL config '$($entry.displayName)' has drifted ($($cclDriftDetails -join '; ')). Updating..."
                 if (-not $WhatIf) {
                     $cclPatch = @{}
                     if ($null -ne $entry.displayName)       { $cclPatch['displayName']       = $entry.displayName }
@@ -1171,10 +1175,11 @@ if ($DesiredState.images) {
     foreach ($entry in $DesiredState.images) {
         # Derive a valid Azure VM name (max 15 chars, alphanumeric + hyphens).
         # NME image list returns "vmname (timestamp)" — match by VM name as last segment of ARM id.
+        # Case is preserved from the desired state; the match against live images is case-insensitive.
         if ($entry.vmName) {
-            $imgVmName = ($entry.vmName -replace '[^a-zA-Z0-9-]', '-').ToLower()
+            $imgVmName = ($entry.vmName -replace '[^a-zA-Z0-9-]', '-')
         } else {
-            $imgVmName = ($entry.name -replace '[^a-zA-Z0-9]', '-').ToLower()
+            $imgVmName = ($entry.name -replace '[^a-zA-Z0-9]', '-')
         }
         if ($imgVmName.Length -gt 15) { $imgVmName = $imgVmName.Substring(0, 15).TrimEnd('-') }
 
@@ -1235,7 +1240,7 @@ if ($DesiredState.images) {
 foreach ($live in $liveImages) {
     $liveVmName = ($live.id -split '/')[-1]
     $inDs = $DesiredState.images | Where-Object {
-        $dsVmName = if ($_.vmName) { ($_.vmName -replace '[^a-zA-Z0-9-]', '-').ToLower() } else { ($_.name -replace '[^a-zA-Z0-9]', '-').ToLower() }
+        $dsVmName = if ($_.vmName) { ($_.vmName -replace '[^a-zA-Z0-9-]', '-') } else { ($_.name -replace '[^a-zA-Z0-9]', '-') }
         if ($dsVmName.Length -gt 15) { $dsVmName = $dsVmName.Substring(0, 15).TrimEnd('-') }
         $dsVmName -ieq $liveVmName
     }
@@ -1249,7 +1254,9 @@ foreach ($live in $liveImages) {
                     $imgDelSub   = $imgIdParts[2]
                     $imgDelRg    = $imgIdParts[4]
                     $imgDelName  = $imgIdParts[-1]
-                    Invoke-NmeApi -Method DELETE -Uri "$NmeUri/api/v1/desktop-image/$imgDelSub/$imgDelRg/$imgDelName" | Out-Null
+                    Write-Log "Removing desktop image '$($live.name)' (sub=$imgDelSub rg=$imgDelRg vm=$imgDelName)..."
+                    # NME ARM-scoped delete follows the /api/v1/arm/ prefix pattern (same as host pools)
+                    Invoke-NmeApi -Method DELETE -Uri "$NmeUri/api/v1/arm/desktop-image/$imgDelSub/$imgDelRg/$imgDelName" | Out-Null
                     $imagesRemoved++
                     Write-Log "Desktop image '$($live.name)' removed."
                 } catch {
