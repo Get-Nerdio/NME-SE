@@ -32,7 +32,7 @@
   ],
   "images": [
     {
-      "name": "Multisession Image",
+      "name": "MultiUserImg",
       "resourceGroup": "nw-salesdemo-resources-rg",
       "sourceImageId": "MicrosoftWindowsDesktop/windows-11/win11-24h2-avd/latest",
       "vmSize": "Standard_D2s_v5",
@@ -40,7 +40,15 @@
       "description": "Windows 11 multi-session for pooled host pools"
     },
     {
-      "name": "Personal Desktop Image",
+      "name": "PersonalImg",
+      "resourceGroup": "nw-salesdemo-resources-rg",
+      "sourceImageId": "MicrosoftWindowsDesktop/windows-11/win11-24h2-ent/latest",
+      "vmSize": "Standard_D2s_v5",
+      "storageType": "StandardSSD_LRS",
+      "description": "Windows 11 single-session for personal desktops"
+    },
+    {
+      "name": "Img-64gb",
       "resourceGroup": "nw-salesdemo-resources-rg",
       "sourceImageId": "MicrosoftWindowsDesktop/windows-11/win11-24h2-ent/latest",
       "vmSize": "Standard_D2s_v5",
@@ -93,28 +101,44 @@
     ],
     "scriptedActions": [],
     "rdpConfigs": [
-      {"name": "StandardRDP"},
-      {"name": "DenyCopyPaste"}
+      {
+        "name": "StandardRDP"
+      },
+      {
+        "name": "DenyCopyPaste"
+      }
     ],
     "adConfigs": [
-      {"name": "OnPremAD"},
-      {"name": "EntraID"}
+      {
+        "name": "OnPremAD"
+      },
+      {
+        "name": "EntraID"
+      }
     ],
     "vmProfiles": [
-      {"name": "TrackedVMProfile"}
+      {
+        "name": "TrackedVMProfile"
+      }
     ],
     "capacityProfiles": [
-      {"name": "CapacityExtender"}
+      {
+        "name": "CapacityExtender"
+      }
     ],
     "scriptedActionProfiles": [
-      {"name": "Scripted Actions Profile"}
+      {
+        "name": "Scripted Actions Profile"
+      }
     ],
     "cclConfigs": [
       {
         "displayName": "NME Demo Environment",
         "defaultReportType": null,
         "isDefault": false,
-        "subscriptionsIds": ["2b9dd21c-8f1d-44aa-a344-4527243840c7"],
+        "subscriptionsIds": [
+          "2b9dd21c-8f1d-44aa-a344-4527243840c7"
+        ],
         "workspaceIds": [],
         "tags": {},
         "useDefaultTags": true,
