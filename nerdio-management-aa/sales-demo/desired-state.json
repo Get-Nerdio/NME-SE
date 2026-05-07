@@ -108,6 +108,18 @@
     ],
     "scriptedActionProfiles": [
       {"name": "Scripted Actions Profile"}
+    ],
+    "cclConfigs": [
+      {
+        "displayName": "NME Demo Environment",
+        "defaultReportType": null,
+        "isDefault": false,
+        "subscriptionsIds": ["2b9dd21c-8f1d-44aa-a344-4527243840c7"],
+        "workspaceIds": [],
+        "tags": {},
+        "useDefaultTags": true,
+        "includeAllCosts": false
+      }
     ]
   },
   "hostPools": [

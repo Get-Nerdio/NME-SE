@@ -292,6 +292,17 @@ function Compare-HpAutoScale {
     return $false
 }
 
+function Compare-CclConfig {
+    # Returns $true if any PATCH-able field differs (displayName, defaultReportType, isDefault).
+    # Immutable fields (subscriptionsIds, workspaceIds, tags, etc.) are not compared here —
+    # they are only used during creation; drift on those fields is logged as a WARN.
+    param([PSCustomObject]$Live, [PSCustomObject]$Desired)
+    if ($null -ne $Desired.displayName       -and $Live.displayName       -ne $Desired.displayName)       { return $true }
+    if ($null -ne $Desired.defaultReportType -and $Live.defaultReportType -ne $Desired.defaultReportType) { return $true }
+    if ($null -ne $Desired.isDefault         -and $Live.isDefault         -ne $Desired.isDefault)         { return $true }
+    return $false
+}
+
 function Add-NonFatalError {
     param([string]$Message)
     $script:NonFatalErrors += $Message
@@ -842,6 +853,118 @@ if ($null -ne $DesiredState.profiles.scriptedActions) {
     }
 } else {
     Write-Log "No 'profiles.scriptedActions' section in desired state — skipping scripted action enforcement."
+}
+
+#endregion
+
+#region 9c — Reconcile User Cost Attribution (CCL) Configurations
+
+if ($null -ne $DesiredState.profiles.cclConfigs) {
+    Write-Log "--- Reconcile CCL Configurations ---"
+
+    $liveCcl = @(Invoke-NmeApi -Method GET -Uri "$NmeUri/api/v1/user-cost-attribution/configuration")
+    if (-not $liveCcl) { $liveCcl = @() }
+
+    foreach ($entry in $DesiredState.profiles.cclConfigs) {
+        $live = $liveCcl | Where-Object { $_.displayName -ieq $entry.displayName }
+
+        if (-not $live) {
+            Write-Log "CCL config '$($entry.displayName)' not found. Creating..."
+            if (-not $WhatIf) {
+                $cclBody = @{
+                    displayName      = $entry.displayName
+                    defaultReportType = $entry.defaultReportType
+                    subscriptionsIds = @($entry.subscriptionsIds ?? @())
+                    workspaceIds     = @($entry.workspaceIds     ?? @())
+                    tags             = if ($entry.tags) { $entry.tags } else { @{} }
+                    useDefaultTags   = $entry.useDefaultTags   ?? $true
+                    includeAllCosts  = $entry.includeAllCosts  ?? $false
+                } | ConvertTo-Json -Depth 5
+                try {
+                    $cclResult = Invoke-NmeApi -Method POST -Uri "$NmeUri/api/v1/user-cost-attribution/configuration" -Body $cclBody
+                    if ($cclResult.job.id) {
+                        Wait-NmeJob -JobId $cclResult.job.id -Description "create CCL config '$($entry.displayName)'"
+                    }
+                    Write-Log "CCL config '$($entry.displayName)' created."
+                    $liveCcl = @(Invoke-NmeApi -Method GET -Uri "$NmeUri/api/v1/user-cost-attribution/configuration")
+                    if (-not $liveCcl) { $liveCcl = @() }
+                } catch {
+                    Add-NonFatalError "Failed to create CCL config '$($entry.displayName)': $($_.Exception.Message)"
+                }
+            } else {
+                Write-Log "[WHATIF] Would create CCL config '$($entry.displayName)'."
+            }
+        } else {
+            # Check PATCH-able fields for drift
+            if (Compare-CclConfig -Live $live -Desired $entry) {
+                Write-Log "CCL config '$($entry.displayName)' has drifted. Updating..."
+                if (-not $WhatIf) {
+                    $cclPatch = @{}
+                    if ($null -ne $entry.displayName)       { $cclPatch['displayName']       = $entry.displayName }
+                    if ($null -ne $entry.defaultReportType) { $cclPatch['defaultReportType'] = $entry.defaultReportType }
+                    if ($null -ne $entry.isDefault)         { $cclPatch['isDefault']         = $entry.isDefault }
+                    try {
+                        $patchResult = Invoke-NmeApi -Method PATCH -Uri "$NmeUri/api/v1/user-cost-attribution/configuration/$($live.id)" -Body ($cclPatch | ConvertTo-Json)
+                        if ($patchResult.job.id) {
+                            Wait-NmeJob -JobId $patchResult.job.id -Description "update CCL config '$($entry.displayName)'"
+                        }
+                        Write-Log "CCL config '$($entry.displayName)' updated."
+                    } catch {
+                        Add-NonFatalError "Failed to update CCL config '$($entry.displayName)': $($_.Exception.Message)"
+                    }
+                } else {
+                    Write-Log "[WHATIF] Would update CCL config '$($entry.displayName)'."
+                }
+            }
+
+            # Warn on immutable fields that differ — can only be fixed by delete + recreate
+            $immutableDrift = @()
+            if ($null -ne $entry.subscriptionsIds) {
+                $liveSubs = @($live.subscriptionsIds | Sort-Object)
+                $desSubs  = @($entry.subscriptionsIds | Sort-Object)
+                if (($liveSubs -join ',') -ne ($desSubs -join ',')) { $immutableDrift += 'subscriptionsIds' }
+            }
+            if ($null -ne $entry.workspaceIds) {
+                $liveWs = @($live.workspaceIds | Sort-Object)
+                $desWs  = @($entry.workspaceIds | Sort-Object)
+                if (($liveWs -join ',') -ne ($desWs -join ',')) { $immutableDrift += 'workspaceIds' }
+            }
+            if ($null -ne $entry.includeAllCosts -and $live.includeAllCosts -ne $entry.includeAllCosts) { $immutableDrift += 'includeAllCosts' }
+            if ($null -ne $entry.useDefaultTags  -and $live.useDefaultTags  -ne $entry.useDefaultTags)  { $immutableDrift += 'useDefaultTags' }
+            if ($immutableDrift.Count -gt 0) {
+                Write-Log "CCL config '$($entry.displayName)' has drift on immutable field(s): $($immutableDrift -join ', '). Delete and recreate to apply." 'WARN'
+            }
+
+            if (-not (Compare-CclConfig -Live $live -Desired $entry) -and $immutableDrift.Count -eq 0) {
+                Write-Log "CCL config '$($entry.displayName)' is correct."
+            }
+        }
+    }
+
+    # Stray CCL configs
+    foreach ($live in $liveCcl) {
+        $inDs = $DesiredState.profiles.cclConfigs | Where-Object { $_.displayName -ieq $live.displayName }
+        if (-not $inDs) {
+            if ($RemoveUndefinedResources) {
+                Write-Log "CCL config '$($live.displayName)' not in desired state. Removing..."
+                if (-not $WhatIf) {
+                    try {
+                        $delResult = Invoke-NmeApi -Method DELETE -Uri "$NmeUri/api/v1/user-cost-attribution/configuration/$($live.id)"
+                        if ($delResult.job.id) {
+                            Wait-NmeJob -JobId $delResult.job.id -Description "delete CCL config '$($live.displayName)'"
+                        }
+                        Write-Log "CCL config '$($live.displayName)' removed."
+                    } catch {
+                        Add-NonFatalError "Failed to remove CCL config '$($live.displayName)': $($_.Exception.Message)"
+                    }
+                } else {
+                    Write-Log "[WHATIF] Would remove CCL config '$($live.displayName)'."
+                }
+            } else {
+                Write-Log "CCL config '$($live.displayName)' is not in desired state (stray). Run with -RemoveUndefinedResources to remove." 'WARN'
+            }
+        }
+    }
 }
 
 #endregion
