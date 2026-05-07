@@ -30,48 +30,6 @@
       "shareName": "profiles"
     }
   ],
-  "fslogixConfigs": [
-    {
-      "name": "FSLogix-EntraStorage",
-      "isDefault": false,
-      "properties": {
-        "profileContainer": {
-          "locations": [
-            "\\\\nwsdfslsa.file.core.windows.net\\profiles"
-          ]
-        },
-        "entraIdKerberos": true,
-        "cloudCache": false,
-        "pageBlobs": false
-      }
-    },
-    {
-      "name": "FSLogix-ADStorage",
-      "isDefault": false,
-      "properties": {
-        "profileContainer": {
-          "locations": [
-            "\\\\nmedemoadsa.file.core.windows.net\\profiles"
-          ]
-        },
-        "entraIdKerberos": false,
-        "cloudCache": false,
-        "pageBlobs": false
-      }
-    }
-  ],
-  "autoScaleProfiles": [
-    {
-      "name": "DemoAutoScale-Pooled",
-      "mode": "WorkingHours",
-      "description": "Pooled host pool scaling - business hours"
-    },
-    {
-      "name": "DemoAutoScale-Personal",
-      "mode": "UserDriven",
-      "description": "Personal desktop scaling - user-driven"
-    }
-  ],
   "images": [
     {
       "name": "Multisession Image",
@@ -90,24 +48,68 @@
       "description": "Windows 11 single-session for personal desktops"
     }
   ],
-  "scriptedActions": [],
-  "rdpConfigs": [
-    {"name": "StandardRDP"},
-    {"name": "DenyCopyPaste"}
-  ],
-  "adConfigs": [
-    {"name": "OnPremAD"},
-    {"name": "EntraID"}
-  ],
-  "vmProfiles": [
-    {"name": "TrackedVMProfile"}
-  ],
-  "capacityProfiles": [
-    {"name": "CapacityExtender"}
-  ],
-  "scriptedActionProfiles": [
-    {"name": "Scripted Actions Profile"}
-  ],
+  "profiles": {
+    "fslogix": [
+      {
+        "name": "FSLogix-EntraStorage",
+        "isDefault": false,
+        "properties": {
+          "profileContainer": {
+            "locations": [
+              "\\\\nwsdfslsa.file.core.windows.net\\profiles"
+            ]
+          },
+          "entraIdKerberos": true,
+          "cloudCache": false,
+          "pageBlobs": false
+        }
+      },
+      {
+        "name": "FSLogix-ADStorage",
+        "isDefault": false,
+        "properties": {
+          "profileContainer": {
+            "locations": [
+              "\\\\nmedemoadsa.file.core.windows.net\\profiles"
+            ]
+          },
+          "entraIdKerberos": false,
+          "cloudCache": false,
+          "pageBlobs": false
+        }
+      }
+    ],
+    "autoScale": [
+      {
+        "name": "DemoAutoScale-Pooled",
+        "mode": "WorkingHours",
+        "description": "Pooled host pool scaling - business hours"
+      },
+      {
+        "name": "DemoAutoScale-Personal",
+        "mode": "UserDriven",
+        "description": "Personal desktop scaling - user-driven"
+      }
+    ],
+    "scriptedActions": [],
+    "rdpConfigs": [
+      {"name": "StandardRDP"},
+      {"name": "DenyCopyPaste"}
+    ],
+    "adConfigs": [
+      {"name": "OnPremAD"},
+      {"name": "EntraID"}
+    ],
+    "vmProfiles": [
+      {"name": "TrackedVMProfile"}
+    ],
+    "capacityProfiles": [
+      {"name": "CapacityExtender"}
+    ],
+    "scriptedActionProfiles": [
+      {"name": "Scripted Actions Profile"}
+    ]
+  },
   "hostPools": [
     {
       "id": {

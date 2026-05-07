@@ -329,12 +329,14 @@ foreach ($hp in $liveHostPools) {
 
 # Assemble final document
 $desiredState = [ordered]@{
-    schemaVersion    = '1.0'
-    lastUpdated      = (Get-Date -Format 'o')
-    workspace        = $wsEntry
-    fslogixConfigs   = $fslEntries
-    autoScaleProfiles = $asEntries
-    hostPools        = $hpEntries
+    schemaVersion = '1.1'
+    lastUpdated   = (Get-Date -Format 'o')
+    workspace     = $wsEntry
+    profiles      = [ordered]@{
+        fslogix    = $fslEntries
+        autoScale  = $asEntries
+    }
+    hostPools     = $hpEntries
 }
 
 $outputJson = $desiredState | ConvertTo-Json -Depth 20

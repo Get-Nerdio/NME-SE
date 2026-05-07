@@ -33,6 +33,7 @@
     - Az.DesktopVirtualization (Get-AzWvdHostPool, host reads)
     - Az.Resources       (Update-AzTag)
     - Az.Storage         (New-AzStorageAccount, New-AzRmStorageShare)
+    - Az.Websites        (Get-AzWebApp — for NME App Service restart after SQL cleanup)
 
   Automation Account Variables (prefixed with VariablePrefix, default 'SalesDemo'):
     - {Prefix}TenantId              NME API app registration tenant ID
@@ -47,6 +48,9 @@
     - {Prefix}GitRepoBranch         Branch containing desired-state.json
     - {Prefix}GitFilePath           Repo-relative path to desired-state.json
     - {Prefix}GitPat                GitHub PAT with contents:read+write (encrypted)
+    - {Prefix}NmeAppResourceGroup   (Optional) Resource group containing the NME App Service.
+                                    If not set, app is discovered via Get-AzWebApp by name.
+                                    Required for profile-cache flush after SQL cleanup.
 
   Managed Identity Permissions:
     - Azure RBAC Reader on ScopedResourceGroup (read ARM tags on host pools)
@@ -366,6 +370,12 @@ $SqlDatabaseName = $null
 try { $SqlServerFqdn   = Get-AutomationVariable -Name "${VariablePrefix}SqlServer"   -ErrorAction Stop } catch {}
 try { $SqlDatabaseName = Get-AutomationVariable -Name "${VariablePrefix}SqlDatabase" -ErrorAction Stop } catch {}
 
+# NME App Service resource group — used to restart the app after SQL profile cleanup,
+# which is required to flush the NME in-memory profile cache.
+# If not set, a restart is attempted by discovering the app from the NME URI.
+$NmeAppResourceGroup = $null
+try { $NmeAppResourceGroup = Get-AutomationVariable -Name "${VariablePrefix}NmeAppResourceGroup" -ErrorAction Stop } catch {}
+
 # Counters
 $hpCreated              = 0
 $hpUpdated              = 0
@@ -423,6 +433,7 @@ if ($RemoveUndefinedResources) {
 
 #endregion
 
+
 #region 4 — Load Desired State
 
 $ErrorActionPreference = 'Stop'
@@ -444,7 +455,7 @@ $DesiredState = $rawJson | ConvertFrom-Json
 if (-not $DesiredState.workspace -or -not $DesiredState.hostPools) {
     throw "desired-state.json is missing required 'workspace' or 'hostPools' keys."
 }
-Write-Log "Desired state loaded: $($DesiredState.hostPools.Count) host pool(s), $($DesiredState.fslogixConfigs.Count) FSLogix config(s), $($DesiredState.autoScaleProfiles.Count) auto-scale profile(s)."
+Write-Log "Desired state loaded: $($DesiredState.hostPools.Count) host pool(s), $($DesiredState.profiles.fslogix.Count) FSLogix config(s), $($DesiredState.profiles.autoScale.Count) auto-scale profile(s)."
 
 $ErrorActionPreference = 'Continue'
 
@@ -615,7 +626,7 @@ if (-not $wsMatch) {
 
 Write-Log "--- Reconcile FSLogix Configs ---"
 
-foreach ($entry in $DesiredState.fslogixConfigs) {
+foreach ($entry in $DesiredState.profiles.fslogix) {
     $live = $liveFslogix | Where-Object { $_.name -eq $entry.name }
 
     if (-not $live) {
@@ -693,7 +704,7 @@ foreach ($entry in $DesiredState.fslogixConfigs) {
 
 # Stray FSLogix configs
 foreach ($live in $liveFslogix) {
-    $inDs = $DesiredState.fslogixConfigs | Where-Object { $_.name -eq $live.name }
+    $inDs = $DesiredState.profiles.fslogix | Where-Object { $_.name -eq $live.name }
     if (-not $inDs) {
         if ($live.isDefault) {
             Write-Log "FSLogix config '$($live.name)' is the NME default — cannot remove. Consider reassigning the default in NME first." 'WARN'
@@ -729,7 +740,7 @@ Write-Log "--- Reconcile Auto-Scale Profiles ---"
 # they must be created manually in NME since the full schedule configuration
 # cannot be derived from the desired-state schema.
 
-foreach ($entry in $DesiredState.autoScaleProfiles) {
+foreach ($entry in $DesiredState.profiles.autoScale) {
     $live = $liveAutoScale | Where-Object { $_.name -eq $entry.name }
 
     if (-not $live) {
@@ -760,7 +771,7 @@ foreach ($entry in $DesiredState.autoScaleProfiles) {
 
 # Stray auto-scale profiles
 foreach ($live in $liveAutoScale) {
-    $inDs = $DesiredState.autoScaleProfiles | Where-Object { $_.name -eq $live.name }
+    $inDs = $DesiredState.profiles.autoScale | Where-Object { $_.name -eq $live.name }
     if (-not $inDs) {
         if ($RemoveUndefinedResources) {
             Write-Log "Auto-scale profile '$($live.name)' not in desired state. Removing..."
@@ -790,13 +801,13 @@ Write-Log "--- Reconcile Scripted Actions ---"
 # Only enforced when scriptedActions section is explicitly defined in desired state.
 # Local (non-repository) scripted actions not in the list are logged as stray,
 # and removed when -RemoveUndefinedResources is set.
-if ($null -ne $DesiredState.scriptedActions) {
+if ($null -ne $DesiredState.profiles.scriptedActions) {
     $liveScriptedActions = Invoke-NmeApi -Method GET -Uri "$NmeUri/api/v1/scripted-actions"
     if (-not $liveScriptedActions) { $liveScriptedActions = @() }
 
     $repoLinkedSkipped = 0
     foreach ($live in $liveScriptedActions) {
-        $inDs = $DesiredState.scriptedActions | Where-Object { $_.name -ieq $live.name }
+        $inDs = $DesiredState.profiles.scriptedActions | Where-Object { $_.name -ieq $live.name }
         if (-not $inDs) {
             if ($RemoveUndefinedResources) {
                 if (-not $WhatIf) {
@@ -825,7 +836,7 @@ if ($null -ne $DesiredState.scriptedActions) {
         Write-Log "Skipped $repoLinkedSkipped repository-linked scripted action(s) — cannot be deleted via API."
     }
 } else {
-    Write-Log "No 'scriptedActions' section in desired state — skipping scripted action enforcement."
+    Write-Log "No 'profiles.scriptedActions' section in desired state — skipping scripted action enforcement."
 }
 
 #endregion
@@ -1505,12 +1516,14 @@ if ($RemoveUndefinedResources) {
 #   rdpConfigs  → RdpPropertiesConfigurations table
 #   adConfigs   → ADConfigurations table  (domain join configs)
 #
-# To enforce a type, add the section to desired-state.json with the names to keep:
-#   "rdpConfigs":              [{"name": "Default RDP"}]
-#   "adConfigs":               [{"name": "MyDomain-Config"}]
-#   "vmProfiles":              [{"name": "MyVmProfile"}]
-#   "capacityProfiles":        [{"name": "MyCapacityProfile"}]
-#   "scriptedActionProfiles":  [{"name": "MyScriptedActionProfile"}]
+# To enforce a type, add the section under "profiles" in desired-state.json:
+#   "profiles": {
+#     "rdpConfigs":             [{"name": "Default RDP"}],
+#     "adConfigs":              [{"name": "MyDomain-Config"}],
+#     "vmProfiles":             [{"name": "MyVmProfile"}],
+#     "capacityProfiles":       [{"name": "MyCapacityProfile"}],
+#     "scriptedActionProfiles": [{"name": "MyScriptedActionProfile"}]
+#   }
 # An empty array means "remove all profiles of this type".
 
 if ($RemoveUndefinedResources -and $SqlConnection) {
@@ -1564,13 +1577,13 @@ if ($RemoveUndefinedResources -and $SqlConnection) {
     foreach ($pt in $sqlProfileTypes) {
         $dsKey = $pt.DsKey
         # Skip if section not defined in desired state
-        if ($null -eq $DesiredState.PSObject.Properties[$dsKey] -or
-            $null -eq $DesiredState.$dsKey) {
+        $dsSection = $DesiredState.profiles.$dsKey
+        if ($null -eq $dsSection) {
             continue
         }
 
-        Write-Log "--- Enforce $dsKey via SQL (keep: $(@($DesiredState.$dsKey | ForEach-Object { $_.name }) -join ', ')) ---"
-        $desiredNames = @($DesiredState.$dsKey | ForEach-Object { $_.name })
+        Write-Log "--- Enforce $dsKey via SQL (keep: $(@($dsSection | ForEach-Object { $_.name }) -join ', ')) ---"
+        $desiredNames = @($dsSection | ForEach-Object { $_.name })
 
         try {
             $liveRows = Invoke-NmeSql -Connection $SqlConnection `
@@ -1617,6 +1630,51 @@ if ($RemoveUndefinedResources -and $SqlConnection) {
 # Close SQL connection if open
 if ($SqlConnection -and $SqlConnection.State -eq 'Open') {
     $SqlConnection.Close()
+}
+
+# If SQL profiles were removed, restart the NME App Service to flush its in-memory cache.
+# NME loads profiles (VM deployment, RDP, AD configs, capacity, scripted action profiles)
+# at startup — direct SQL deletions are invisible to the running app until it restarts.
+if ($sqlProfilesRemoved -gt 0 -and -not $WhatIf) {
+    try {
+        # Derive app service name from the NME URI subdomain (e.g. "nw-demo-xyz.azurewebsites.net" → "nw-demo-xyz")
+        $nmeAppName = ([System.Uri]$NmeUri).Host.Split('.')[0]
+
+        # Find the resource group if not configured
+        if (-not $NmeAppResourceGroup) {
+            $app = Get-AzWebApp -Name $nmeAppName -ErrorAction SilentlyContinue
+            if ($app) { $NmeAppResourceGroup = $app.ResourceGroup }
+        }
+
+        if ($NmeAppResourceGroup) {
+            Write-Log "Restarting NME App Service '$nmeAppName' (rg: $NmeAppResourceGroup) to flush profile cache..."
+            $restartUri = "https://management.azure.com/subscriptions/$SubscriptionId/resourceGroups/$NmeAppResourceGroup/providers/Microsoft.Web/sites/$nmeAppName/restart?api-version=2022-03-01&softRestart=false"
+            Invoke-AzRestMethod -Uri $restartUri -Method POST -ErrorAction Stop | Out-Null
+            Write-Log "App Service restart triggered. Waiting 90s for NME to come back online..."
+            Start-Sleep -Seconds 90
+
+            # Verify NME API is reachable again
+            $retries = 0
+            while ($retries -lt 10) {
+                try {
+                    Invoke-RestMethod -Uri "$NmeUri/api/v1/test" -Headers (Get-NmeHeaders) -TimeoutSec 15 -ErrorAction Stop | Out-Null
+                    Write-Log "NME API is back online."
+                    break
+                } catch {
+                    $retries++
+                    Write-Log "NME not yet ready (attempt $retries/10)..."
+                    Start-Sleep -Seconds 15
+                }
+            }
+            if ($retries -ge 10) {
+                Add-NonFatalError "NME App Service was restarted but API did not become reachable within expected time."
+            }
+        } else {
+            Write-Log "Could not determine NME App Service resource group — skipping restart. Set '${VariablePrefix}NmeAppResourceGroup' AA variable to enable." 'WARN'
+        }
+    } catch {
+        Add-NonFatalError "Failed to restart NME App Service: $($_.Exception.Message)"
+    }
 }
 
 #endregion
