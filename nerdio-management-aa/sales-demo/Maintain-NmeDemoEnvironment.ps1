@@ -310,6 +310,42 @@ function Add-NonFatalError {
     Write-Log $Message 'WARN'
 }
 
+$script:GraphHeaders = $null
+
+function Get-GraphHeaders {
+    if (-not $script:GraphHeaders) {
+        $token = (Get-AzAccessToken -ResourceUrl 'https://graph.microsoft.com/').Token
+        $script:GraphHeaders = @{
+            Authorization    = "Bearer $token"
+            ConsistencyLevel = 'eventual'
+        }
+    }
+    return $script:GraphHeaders
+}
+
+function Resolve-EntraGroupId {
+    param([string]$DisplayName)
+    try {
+        $filter = [uri]::EscapeDataString("displayName eq '$DisplayName'")
+        $result = Invoke-RestMethod `
+            -Uri     "https://graph.microsoft.com/v1.0/groups?`$filter=$filter&`$select=id,displayName" `
+            -Headers (Get-GraphHeaders) `
+            -Method  GET `
+            -ErrorAction Stop
+        if (-not $result.value -or $result.value.Count -eq 0) {
+            Add-NonFatalError "Entra group '$DisplayName' not found via Graph."
+            return $null
+        }
+        if ($result.value.Count -gt 1) {
+            Write-Log "Multiple Entra groups match '$DisplayName' — using first result (id=$($result.value[0].id))." 'WARN'
+        }
+        return $result.value[0].id
+    } catch {
+        Add-NonFatalError "Failed to resolve Entra group '$DisplayName' via Graph: $($_.Exception.Message)"
+        return $null
+    }
+}
+
 function Confirm-ArmTag {
     param([string]$ResourceId, [string]$TagName, [string]$TagValue)
     if (-not $TagName) { return }
@@ -1599,23 +1635,49 @@ foreach ($entry in $DesiredState.hostPools) {
         if ($driftFound) { $hpUpdated++ } else { Write-Log "Host pool '$hpName' is correctly configured." }
     }
 
-    # ── User assignment ──────────────────────────────────────────────────────────
-    # Ensure every user listed in desired-state users[] is assigned to this pool.
-    # Runs after both create and update paths. Extra users already on the pool are
-    # never removed — assignment enforcement is strictly additive.
-    if ($entry.users -and @($entry.users).Count -gt 0) {
+    # ── User and group assignment ────────────────────────────────────────────────
+    # users[]  — UPNs or Object IDs; passed directly to the API.
+    # groups[] — Entra group display names; resolved to Object IDs via Graph
+    #            (requires Group.Read.All on the managed identity).
+    # Assignment is strictly additive — principals already on the pool are never removed.
+    $hasUsers  = $entry.users  -and @($entry.users).Count  -gt 0
+    $hasGroups = $entry.groups -and @($entry.groups).Count -gt 0
+
+    if ($hasUsers -or $hasGroups) {
         if ($WhatIf) {
-            Write-Log "[WHATIF] Would assign users on '$hpName': $(@($entry.users) -join ', ')."
+            $wParts = @()
+            if ($hasUsers)  { $wParts += "users: $(@($entry.users)  -join ', ')" }
+            if ($hasGroups) { $wParts += "groups: $(@($entry.groups) -join ', ')" }
+            Write-Log "[WHATIF] Would assign on '$hpName': $($wParts -join '; ')."
         } else {
-            try {
-                $assignBody = @{ users = @($entry.users) } | ConvertTo-Json
-                $assignResult = Invoke-NmeApi -Method POST -Uri "$hpUrl/assign" -Body $assignBody
-                if ($assignResult.job.id) {
-                    Wait-NmeJob -JobId $assignResult.job.id -Description "assign users on '$hpName'"
+            $resolvedGroupIds = @()
+            if ($hasGroups) {
+                foreach ($groupName in $entry.groups) {
+                    $gid = Resolve-EntraGroupId -DisplayName $groupName
+                    if ($gid) {
+                        $resolvedGroupIds += $gid
+                        Write-Log "Resolved group '$groupName' → $gid"
+                    }
                 }
-                Write-Log "User assignment confirmed on '$hpName': $(@($entry.users) -join ', ')."
-            } catch {
-                Add-NonFatalError "Failed to assign users on '$hpName': $($_.Exception.Message)"
+            }
+
+            $assignPayload = @{}
+            if ($hasUsers)                     { $assignPayload['users']  = @($entry.users) }
+            if ($resolvedGroupIds.Count -gt 0) { $assignPayload['groups'] = $resolvedGroupIds }
+
+            if ($assignPayload.Count -gt 0) {
+                try {
+                    $assignResult = Invoke-NmeApi -Method POST -Uri "$hpUrl/assign" -Body ($assignPayload | ConvertTo-Json -Depth 5)
+                    if ($assignResult.job.id) {
+                        Wait-NmeJob -JobId $assignResult.job.id -Description "assign users/groups on '$hpName'"
+                    }
+                    $logParts = @()
+                    if ($hasUsers)                     { $logParts += "users: $(@($entry.users) -join ', ')" }
+                    if ($resolvedGroupIds.Count -gt 0) { $logParts += "groups: $(@($entry.groups) -join ', ')" }
+                    Write-Log "Assignment confirmed on '$hpName': $($logParts -join '; ')."
+                } catch {
+                    Add-NonFatalError "Failed to assign users/groups on '$hpName': $($_.Exception.Message)"
+                }
             }
         }
     }
