@@ -518,9 +518,8 @@ $imagesRemoved          = 0
 $storageUnlinked        = 0
 $vnetsUnlinked          = 0
 
-# PS 5.1 defaults to TLS 1.0. Use SystemDefault (0) so the OS negotiates the highest
-# supported version — required because the NME App Service enforces a minimum of TLS 1.3.
-[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::SystemDefault
+# PS 5.1 defaults to TLS 1.0 — force TLS 1.2 for all Invoke-RestMethod calls in this session.
+[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
 
 Write-Log "=== Maintain-NmeDemoEnvironment starting (WhatIf=$WhatIf, RemoveUndefinedResources=$RemoveUndefinedResources) ==="
 
