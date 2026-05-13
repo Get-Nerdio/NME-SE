@@ -1863,85 +1863,93 @@ if ($RemoveUndefinedResources) {
 
 #endregion
 
-#region 13b — Remove Stray NME Profiles via SQL
+#region 13b — Reconcile NME Profiles via SQL
 
-# Removes profile types that have no NME REST API endpoint for deletion.
-# Each type is only enforced if the corresponding section is defined in desired-state.json.
-# Requires {Prefix}SqlServer and {Prefix}SqlDatabase AA variables and appropriate SQL
-# permissions on the NME database (db_datareader + db_datawriter). If the SQL connection
-# could not be established, this region is skipped and a WARN is logged in region 3.
+# Reconciles profile types that have no NME REST API endpoint for listing or deletion.
+# Each type is only checked if the corresponding section is defined in desired-state.json.
+# Requires {Prefix}SqlServer and {Prefix}SqlDatabase AA variables and db_datareader +
+# db_datawriter roles on the NME database. If the SQL connection could not be established,
+# this region is skipped with a WARN logged in region 3.
 #
-# Supported profile types:
-#   rdpConfigs  → RdpPropertiesConfigurations table
-#   adConfigs   → ADConfigurations table  (domain join configs)
+# Stray items are always reported as warnings. Deletion only occurs with -RemoveUndefinedResources.
+# An empty array in desired state means "remove all items of this type".
 #
-# To enforce a type, add the section under "profiles" in desired-state.json:
-#   "profiles": {
-#     "rdpConfigs":             [{"name": "Default RDP"}],
-#     "adConfigs":              [{"name": "MyDomain-Config"}],
-#     "vmProfiles":             [{"name": "MyVmProfile"}],
-#     "capacityProfiles":       [{"name": "MyCapacityProfile"}],
-#     "scriptedActionProfiles": [{"name": "MyScriptedActionProfile"}]
-#   }
-# An empty array means "remove all profiles of this type".
+# Supported types (desired-state key → SQL table):
+#   rdpConfigs             → RdpPropertiesConfigurations
+#   adConfigs              → ADConfigurations
+#   vmProfiles             → VmDeploymentProfiles
+#   capacityProfiles       → CapacityExtenderProfiles
+#   scriptedActionProfiles → HostPoolScriptedActionProfiles
+#   costModels             → AvdModels           (TCO estimation / cost models)
+#   customRoles            → RoleDefinitions     (NME custom RBAC roles)
 
-if ($RemoveUndefinedResources -and $SqlConnection) {
+# Definition table: desired-state profiles key → SQL table, name column, FK cleanup before delete
+$sqlProfileTypes = @(
+    @{
+        DsKey      = 'rdpConfigs'
+        Table      = 'RdpPropertiesConfigurations'
+        NameCol    = 'Name'
+        PreCleanup = @(
+            "UPDATE HostPoolProperties SET RdpPropertiesConfig = NULL WHERE RdpPropertiesConfig IN (SELECT Id FROM RdpPropertiesConfigurations WHERE Name = @Name)"
+        )
+    },
+    @{
+        DsKey      = 'adConfigs'
+        Table      = 'ADConfigurations'
+        NameCol    = 'FriendlyName'
+        PreCleanup = @(
+            "UPDATE HostPoolADConfigurations SET ADConfigId = NULL WHERE ADConfigId IN (SELECT Id FROM ADConfigurations WHERE FriendlyName = @Name)"
+            "UPDATE HostPoolScriptedActionConfigurations SET ActiveDirectoryId = NULL WHERE ActiveDirectoryId IN (SELECT Id FROM ADConfigurations WHERE FriendlyName = @Name)"
+        )
+    },
+    @{
+        DsKey      = 'vmProfiles'
+        Table      = 'VmDeploymentProfiles'
+        NameCol    = 'Name'
+        PreCleanup = @(
+            "UPDATE HostPoolProperties SET VmDeploymentProfileId = NULL WHERE VmDeploymentProfileId IN (SELECT Id FROM VmDeploymentProfiles WHERE Name = @Name)"
+        )
+    },
+    @{
+        DsKey      = 'capacityProfiles'
+        Table      = 'CapacityExtenderProfiles'
+        NameCol    = 'Name'
+        PreCleanup = @(
+            "UPDATE HostPoolProperties SET CapacityExtenderProfileId = NULL WHERE CapacityExtenderProfileId IN (SELECT Id FROM CapacityExtenderProfiles WHERE Name = @Name)"
+        )
+    },
+    @{
+        DsKey      = 'scriptedActionProfiles'
+        Table      = 'HostPoolScriptedActionProfiles'
+        NameCol    = 'Name'
+        PreCleanup = @(
+            "DELETE FROM HostPoolScriptedActionConfigurations WHERE ProfileId IN (SELECT Id FROM HostPoolScriptedActionProfiles WHERE Name = @Name)"
+            "UPDATE HostPoolProperties SET ScriptedActionsProfileId = NULL WHERE ScriptedActionsProfileId IN (SELECT Id FROM HostPoolScriptedActionProfiles WHERE Name = @Name)"
+        )
+    },
+    @{
+        DsKey      = 'costModels'
+        Table      = 'AvdModels'
+        NameCol    = 'Name'
+        PreCleanup = @()
+    },
+    @{
+        DsKey      = 'customRoles'
+        Table      = 'RoleDefinitions'
+        NameCol    = 'Name'
+        PreCleanup = @(
+            "DELETE FROM RoleAssignments WHERE RoleId IN (SELECT Id FROM RoleDefinitions WHERE Name = @Name)"
+        )
+    }
+)
 
-    # Definition table: desired-state key → SQL table, name column, FK null-outs before delete
-    $sqlProfileTypes = @(
-        @{
-            DsKey      = 'rdpConfigs'
-            Table      = 'RdpPropertiesConfigurations'
-            NameCol    = 'Name'
-            PreCleanup = @(
-                "UPDATE HostPoolProperties SET RdpPropertiesConfig = NULL WHERE RdpPropertiesConfig IN (SELECT Id FROM RdpPropertiesConfigurations WHERE Name = @Name)"
-            )
-        },
-        @{
-            DsKey      = 'adConfigs'
-            Table      = 'ADConfigurations'
-            NameCol    = 'FriendlyName'
-            PreCleanup = @(
-                "UPDATE HostPoolADConfigurations SET ADConfigId = NULL WHERE ADConfigId IN (SELECT Id FROM ADConfigurations WHERE FriendlyName = @Name)"
-                "UPDATE HostPoolScriptedActionConfigurations SET ActiveDirectoryId = NULL WHERE ActiveDirectoryId IN (SELECT Id FROM ADConfigurations WHERE FriendlyName = @Name)"
-            )
-        },
-        @{
-            DsKey      = 'vmProfiles'
-            Table      = 'VmDeploymentProfiles'
-            NameCol    = 'Name'
-            PreCleanup = @(
-                "UPDATE HostPoolProperties SET VmDeploymentProfileId = NULL WHERE VmDeploymentProfileId IN (SELECT Id FROM VmDeploymentProfiles WHERE Name = @Name)"
-            )
-        },
-        @{
-            DsKey      = 'capacityProfiles'
-            Table      = 'CapacityExtenderProfiles'
-            NameCol    = 'Name'
-            PreCleanup = @(
-                "UPDATE HostPoolProperties SET CapacityExtenderProfileId = NULL WHERE CapacityExtenderProfileId IN (SELECT Id FROM CapacityExtenderProfiles WHERE Name = @Name)"
-            )
-        },
-        @{
-            DsKey      = 'scriptedActionProfiles'
-            Table      = 'HostPoolScriptedActionProfiles'
-            NameCol    = 'Name'
-            PreCleanup = @(
-                "DELETE FROM HostPoolScriptedActionConfigurations WHERE ProfileId IN (SELECT Id FROM HostPoolScriptedActionProfiles WHERE Name = @Name)"
-                "UPDATE HostPoolProperties SET ScriptedActionsProfileId = NULL WHERE ScriptedActionsProfileId IN (SELECT Id FROM HostPoolScriptedActionProfiles WHERE Name = @Name)"
-            )
-        }
-    )
-
+if ($SqlConnection) {
     foreach ($pt in $sqlProfileTypes) {
         $dsKey = $pt.DsKey
-        # Skip if section not defined in desired state
         $dsSection = $DesiredState.profiles.$dsKey
-        if ($null -eq $dsSection) {
-            continue
-        }
+        if ($null -eq $dsSection) { continue }
 
-        Write-Log "--- Enforce $dsKey via SQL (keep: $(@($dsSection | ForEach-Object { $_.name }) -join ', ')) ---"
+        Write-Log "--- Reconcile $dsKey (keep: $(@($dsSection | ForEach-Object { $_.name }) -join ', ')) ---"
         $desiredNames = @($dsSection | ForEach-Object { $_.name })
 
         try {
@@ -1957,33 +1965,39 @@ if ($RemoveUndefinedResources -and $SqlConnection) {
         foreach ($row in $liveRows) {
             $liveName = $row.ProfileName
             if ([string]::IsNullOrWhiteSpace($liveName)) { continue }
-            if ($liveName -iin $desiredNames) { continue }
+            if ($liveName -iin $desiredNames) {
+                Write-Log "$dsKey '$liveName': OK"
+                continue
+            }
 
-            Write-Log "$($pt.Table) '$liveName' not in desired state. Removing..."
-            if (-not $WhatIf) {
-                try {
-                    foreach ($preQ in $pt.PreCleanup) {
-                        Invoke-NmeSql -Connection $SqlConnection -Query $preQ `
-                            -Parameters @{ '@Name' = $liveName } | Out-Null
+            if ($RemoveUndefinedResources) {
+                Write-Log "$dsKey '$liveName' not in desired state. Removing..."
+                if (-not $WhatIf) {
+                    try {
+                        foreach ($preQ in $pt.PreCleanup) {
+                            Invoke-NmeSql -Connection $SqlConnection -Query $preQ `
+                                -Parameters @{ '@Name' = $liveName } | Out-Null
+                        }
+                        $deleted = Invoke-NmeSql -Connection $SqlConnection `
+                            -Query "DELETE FROM [$($pt.Table)] WHERE [$($pt.NameCol)] = @Name" `
+                            -Parameters @{ '@Name' = $liveName }
+                        if ($deleted -gt 0) {
+                            $sqlProfilesRemoved++
+                            Write-Log "$dsKey '$liveName' removed."
+                        }
+                    } catch {
+                        Add-NonFatalError "Failed to remove $dsKey '$liveName': $($_.Exception.Message)"
                     }
-                    $deleted = Invoke-NmeSql -Connection $SqlConnection `
-                        -Query "DELETE FROM [$($pt.Table)] WHERE [$($pt.NameCol)] = @Name" `
-                        -Parameters @{ '@Name' = $liveName }
-                    if ($deleted -gt 0) {
-                        $sqlProfilesRemoved++
-                        Write-Log "$($pt.Table) '$liveName' removed."
-                    }
-                } catch {
-                    Add-NonFatalError "Failed to remove $($pt.Table) '$liveName': $($_.Exception.Message)"
+                } else {
+                    Write-Log "[WHATIF] Would remove $dsKey '$liveName'."
                 }
             } else {
-                Write-Log "[WHATIF] Would remove $($pt.Table) '$liveName'."
+                Write-Log "$dsKey '$liveName' is not in desired state (stray). Run with -RemoveUndefinedResources to remove." 'WARN'
             }
         }
     }
-
-} elseif ($RemoveUndefinedResources -and -not $SqlConnection) {
-    Write-Log "SQL connection unavailable — skipping SQL-based profile cleanup." 'WARN'
+} else {
+    Write-Log "SQL connection unavailable — skipping SQL-based profile reconciliation." 'WARN'
 }
 
 # Close SQL connection if open

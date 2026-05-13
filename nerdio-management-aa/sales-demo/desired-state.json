@@ -139,6 +139,16 @@
         "useDefaultTags": true,
         "includeAllCosts": false
       }
+    ],
+    "costModels": [
+      {
+        "name": "Example Model"
+      }
+    ],
+    "customRoles": [
+      {
+        "name": "Custom Role"
+      }
     ]
   },
   "hostPools": [
