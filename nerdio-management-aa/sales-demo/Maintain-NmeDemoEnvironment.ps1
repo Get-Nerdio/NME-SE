@@ -845,46 +845,60 @@ foreach ($live in $liveAutoScale) {
 
 #endregion
 
-#region 9b — Reconcile Scripted Actions
+#region 9b — Reconcile Scripted Actions (local only — repo-linked are skipped)
 
 Write-Log "--- Reconcile Scripted Actions ---"
 
 # Only enforced when scriptedActions section is explicitly defined in desired state.
-# Local (non-repository) scripted actions not in the list are logged as stray,
-# and removed when -RemoveUndefinedResources is set.
+# Repo-linked scripted actions (synced from a connected git repository in NME) are always
+# skipped — the NME API does not expose a repo-linkage field on GET, so detection relies on
+# catching the "repository-linked" error that NME returns when a DELETE is attempted. In the
+# non-removal path a single summary line replaces per-item warnings to avoid log noise.
 if ($null -ne $DesiredState.profiles.scriptedActions) {
     $liveScriptedActions = Invoke-NmeApi -Method GET -Uri "$NmeUri/api/v1/scripted-actions"
     if (-not $liveScriptedActions) { $liveScriptedActions = @() }
 
     $repoLinkedSkipped = 0
+    $strayLocalCount   = 0
+
     foreach ($live in $liveScriptedActions) {
         $inDs = $DesiredState.profiles.scriptedActions | Where-Object { $_.name -ieq $live.name }
-        if (-not $inDs) {
-            if ($RemoveUndefinedResources) {
-                if (-not $WhatIf) {
-                    try {
-                        $deleteBody = @{ force = $true } | ConvertTo-Json
-                        Invoke-NmeApi -Method DELETE -Uri "$NmeUri/api/v1/scripted-actions/$($live.id)" -Body $deleteBody | Out-Null
-                        $scriptedActionsRemoved++
-                        Write-Log "Scripted action '$($live.name)' removed."
-                    } catch {
-                        $errMsg = $_.Exception.Message
-                        if ($errMsg -match 'repository-linked') {
-                            $repoLinkedSkipped++
-                        } else {
-                            Add-NonFatalError "Failed to remove scripted action '$($live.name)': $errMsg"
-                        }
+        if ($inDs) { continue }
+
+        if ($RemoveUndefinedResources) {
+            if (-not $WhatIf) {
+                try {
+                    $deleteBody = @{ force = $true } | ConvertTo-Json
+                    Invoke-NmeApi -Method DELETE -Uri "$NmeUri/api/v1/scripted-actions/$($live.id)" -Body $deleteBody | Out-Null
+                    $scriptedActionsRemoved++
+                    Write-Log "Scripted action '$($live.name)' removed."
+                } catch {
+                    $errMsg = $_.Exception.Message
+                    if ($errMsg -match 'repository-linked') {
+                        $repoLinkedSkipped++
+                        Write-Log "Scripted action '$($live.name)' is repo-linked — skipping (managed by NME repository sync)."
+                    } else {
+                        Add-NonFatalError "Failed to remove scripted action '$($live.name)': $errMsg"
                     }
-                } else {
-                    Write-Log "[WHATIF] Would remove scripted action '$($live.name)'."
                 }
             } else {
-                Write-Log "Scripted action '$($live.name)' is not in desired state (stray). Run with -RemoveUndefinedResources to remove." 'WARN'
+                $strayLocalCount++
             }
+        } else {
+            $strayLocalCount++
+        }
+    }
+
+    # Summary lines (avoids per-item log noise from repo-linked scripts)
+    if ($strayLocalCount -gt 0) {
+        if ($RemoveUndefinedResources -and $WhatIf) {
+            Write-Log "[WHATIF] Would attempt to remove $strayLocalCount scripted action(s) not in desired state (repo-linked ones are skipped automatically)."
+        } elseif (-not $RemoveUndefinedResources) {
+            Write-Log "$strayLocalCount scripted action(s) not in desired state (may include repo-linked scripts which cannot be removed). Run with -RemoveUndefinedResources to remove local ones." 'WARN'
         }
     }
     if ($repoLinkedSkipped -gt 0) {
-        Write-Log "Skipped $repoLinkedSkipped repository-linked scripted action(s) — cannot be deleted via API."
+        Write-Log "Skipped $repoLinkedSkipped repository-linked scripted action(s)."
     }
 } else {
     Write-Log "No 'profiles.scriptedActions' section in desired state — skipping scripted action enforcement."
