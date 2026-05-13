@@ -518,8 +518,9 @@ $imagesRemoved          = 0
 $storageUnlinked        = 0
 $vnetsUnlinked          = 0
 
-# PS 5.1 defaults to TLS 1.0 — force TLS 1.2 for all web requests in this session
+# PS 5.1: force TLS 1.2 and suppress certificate validation (equivalent of -SkipCertificateCheck)
 [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+[System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
 
 Write-Log "=== Maintain-NmeDemoEnvironment starting (WhatIf=$WhatIf, RemoveUndefinedResources=$RemoveUndefinedResources) ==="
 
