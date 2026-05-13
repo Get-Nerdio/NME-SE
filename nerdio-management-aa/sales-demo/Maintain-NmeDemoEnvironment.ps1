@@ -550,15 +550,13 @@ try {
 
 $ErrorActionPreference = 'Continue'
 
-# SQL connection (optional — only needed for SQL-based profile cleanup)
+# SQL connection (optional — used for reconciling profile types with no REST API endpoint)
 $SqlConnection = $null
-if ($RemoveUndefinedResources) {
-    if ($SqlServerFqdn -and $SqlDatabaseName) {
-        $SqlConnection = Get-NmeSqlConnection -ServerFqdn $SqlServerFqdn -DatabaseName $SqlDatabaseName
-        if ($SqlConnection) { Write-Log "Connected to NME SQL ($SqlServerFqdn / $SqlDatabaseName)." }
-    } else {
-        Write-Log "SQL variables ${VariablePrefix}SqlServer / ${VariablePrefix}SqlDatabase not set — SQL-based profile cleanup will be skipped." 'WARN'
-    }
+if ($SqlServerFqdn -and $SqlDatabaseName) {
+    $SqlConnection = Get-NmeSqlConnection -ServerFqdn $SqlServerFqdn -DatabaseName $SqlDatabaseName
+    if ($SqlConnection) { Write-Log "Connected to NME SQL ($SqlServerFqdn / $SqlDatabaseName)." }
+} else {
+    Write-Log "SQL variables ${VariablePrefix}SqlServer / ${VariablePrefix}SqlDatabase not set — SQL-based profile reconciliation will be skipped." 'WARN'
 }
 
 #endregion
