@@ -535,8 +535,20 @@ Connect-AzAccount -Identity -SubscriptionId $SubscriptionId -ErrorAction Stop | 
 Write-Log "Connected to Azure subscription $SubscriptionId."
 
 # Skip certificate validation for Invoke-RestMethod calls (PS5.1 equivalent of -SkipCertificateCheck).
-# Must be set AFTER Connect-AzAccount — setting it before breaks MSAL token acquisition.
-[System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+# Must be set AFTER Connect-AzAccount (setting it before breaks MSAL token acquisition).
+# Script-block delegates fail in Azure Automation runspaces — compiled type required.
+if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
+    Add-Type @'
+using System.Net;
+using System.Security.Cryptography.X509Certificates;
+public class TrustAllCertsPolicy : ICertificatePolicy {
+    public bool CheckValidationResult(ServicePoint sp, X509Certificate cert, WebRequest req, int problem) {
+        return true;
+    }
+}
+'@
+}
+[System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
 
 $NmeHeaders = Get-NmeHeaders
 Write-Log "Connected to NME API at $NmeUri."
