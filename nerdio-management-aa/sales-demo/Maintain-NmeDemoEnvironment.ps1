@@ -518,6 +518,9 @@ $imagesRemoved          = 0
 $storageUnlinked        = 0
 $vnetsUnlinked          = 0
 
+# PS 5.1 defaults to TLS 1.0 — force TLS 1.2 for all web requests in this session
+[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+
 Write-Log "=== Maintain-NmeDemoEnvironment starting (WhatIf=$WhatIf, RemoveUndefinedResources=$RemoveUndefinedResources) ==="
 
 #endregion
@@ -535,7 +538,7 @@ Write-Log "Connected to NME API at $NmeUri."
 
 # Connectivity diagnostic — logs full exception chain if SSL fails
 try {
-    $null = Invoke-RestMethod -Uri "$NmeUri/api/v1/workspace" -Method GET -Headers $NmeHeaders -SkipCertificateCheck -ErrorAction Stop
+    $null = Invoke-RestMethod -Uri "$NmeUri/api/v1/workspace" -Method GET -Headers $NmeHeaders -ErrorAction Stop
     Write-Log "NME API connectivity: OK"
 } catch {
     $ex = $_.Exception
