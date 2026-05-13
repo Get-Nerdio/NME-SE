@@ -518,9 +518,9 @@ $imagesRemoved          = 0
 $storageUnlinked        = 0
 $vnetsUnlinked          = 0
 
-# PS 5.1: force TLS 1.2 and suppress certificate validation (equivalent of -SkipCertificateCheck)
+# PS 5.1 defaults to TLS 1.0 — force TLS 1.2 for all web requests in this session.
+# Note: ServerCertificateValidationCallback is set after Connect-AzAccount (see Region 3).
 [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
-[System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
 
 Write-Log "=== Maintain-NmeDemoEnvironment starting (WhatIf=$WhatIf, RemoveUndefinedResources=$RemoveUndefinedResources) ==="
 
@@ -533,6 +533,10 @@ $ErrorActionPreference = 'Stop'
 Disable-AzContextAutosave -Scope Process | Out-Null
 Connect-AzAccount -Identity -SubscriptionId $SubscriptionId -ErrorAction Stop | Out-Null
 Write-Log "Connected to Azure subscription $SubscriptionId."
+
+# Skip certificate validation for Invoke-RestMethod calls (PS5.1 equivalent of -SkipCertificateCheck).
+# Must be set AFTER Connect-AzAccount — setting it before breaks MSAL token acquisition.
+[System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
 
 $NmeHeaders = Get-NmeHeaders
 Write-Log "Connected to NME API at $NmeUri."
