@@ -172,21 +172,18 @@ function Wait-NmeJob {
     param([string]$JobId, [string]$Description)
     $timeoutSeconds = 600
     $elapsed = 0
-    $job = Invoke-RestMethod "$NmeUri/api/v1/job/$JobId" -Headers $NmeHeaders -SkipCertificateCheck
-    while ($job.jobStatus -in @('Pending', 'InProgress', 'Running')) {
+    $job = Invoke-RestMethod "$NmeUri/api/v1/job/$JobId" -Headers $NmeHeaders    while ($job.jobStatus -in @('Pending', 'InProgress', 'Running')) {
         if ($elapsed -ge $timeoutSeconds) {
             throw "Timeout waiting for $Description (job $JobId) after ${timeoutSeconds}s"
         }
         Write-Log "Waiting for $Description to complete (${elapsed}s elapsed)..."
         Start-Sleep -Seconds 10
         $elapsed += 10
-        $job = Invoke-RestMethod "$NmeUri/api/v1/job/$JobId" -Headers $NmeHeaders -SkipCertificateCheck
-    }
+        $job = Invoke-RestMethod "$NmeUri/api/v1/job/$JobId" -Headers $NmeHeaders    }
     if ($job.jobStatus -eq 'Failed') {
         $taskDetail = ''
         try {
-            $tasks = Invoke-RestMethod "$NmeUri/api/v1/job/$JobId/tasks" -Headers $NmeHeaders -SkipCertificateCheck
-            $taskDetail = ($tasks | ForEach-Object { "$($_.name): $($_.status) — $($_.resultPlain)" }) -join '; '
+            $tasks = Invoke-RestMethod "$NmeUri/api/v1/job/$JobId/tasks" -Headers $NmeHeaders            $taskDetail = ($tasks | ForEach-Object { "$($_.name): $($_.status) — $($_.resultPlain)" }) -join '; '
         } catch {}
         throw "NME job failed: $Description. Tasks: $taskDetail"
     }
@@ -203,7 +200,6 @@ function Invoke-NmeApi {
         Uri                  = $Uri
         Method               = $Method
         Headers              = $NmeHeaders
-        SkipCertificateCheck = $true
     }
     if ($Body) { $params['Body'] = $Body }
     try {
