@@ -138,7 +138,12 @@ function Wait-NmeJob {
         $job = Invoke-RestMethod "$NmeUri/api/v1/job/$JobId" -Headers $NmeHeaders -SkipCertificateCheck
     }
     if ($job.jobStatus -eq 'Failed') {
-        throw "NME job failed: $Description. Error: $($job.error.message)"
+        $taskDetail = ''
+        try {
+            $tasks = Invoke-RestMethod "$NmeUri/api/v1/job/$JobId/tasks" -Headers $NmeHeaders -SkipCertificateCheck
+            $taskDetail = ($tasks | ForEach-Object { "$($_.name): $($_.status) — $($_.resultPlain)" }) -join '; '
+        } catch {}
+        throw "NME job failed: $Description. Tasks: $taskDetail"
     }
     return $job
 }
