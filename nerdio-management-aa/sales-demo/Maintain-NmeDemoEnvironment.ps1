@@ -6,16 +6,25 @@
   This runbook reads a desired-state.json from a GitHub repository and ensures the live
   NME environment matches it. On every run it will:
 
-  1. Load desired state from GitHub (or a local file for testing)
-  2. Import any host pools tagged NME-SE-Manage=import into desired state and commit to git
-  3. Reconcile the AVD workspace (create if missing)
-  4. Reconcile FSLogix configurations (create or update)
-  5. Reconcile auto-scale profiles (create or update)
-  6. Reconcile host pools scoped to the demo resource group:
-       - Create missing host pools and apply full desired configuration
-       - Correct drifted settings (WVD props, FSLogix assignment, auto-scale config)
-       - Remove stray host pools not in desired state (unless tagged ignore)
-  7. Advise on session host availability and re-enable auto-scale if disabled
+   1. Load desired state from GitHub (or a local file for testing)
+   2. Import any host pools tagged NME-SE-Manage=import into desired state and commit to git
+   3. Reconcile the AVD workspace (create if missing, apply env tag)
+   4. Reconcile VNet registrations in NME (add if missing, remove stray if -RemoveUndefinedResources)
+   5. Reconcile storage accounts and Azure file shares (create if missing, apply env tag)
+   6. Reconcile desktop images in NME (create if missing, apply env tag, remove stray if -RemoveUndefinedResources)
+   7. Reconcile FSLogix configurations (create or update)
+   8. Reconcile auto-scale profiles (create or update)
+   9. Reconcile scripted actions (create if missing; stray actions are skipped if linked to a
+      git repo; stray unlinked actions are removed if -RemoveUndefinedResources)
+  10. Reconcile other NME profiles (RDP configs, AD configs, VM profiles, capacity profiles,
+      scripted action profiles, CCL cost configs) — create if missing
+  11. Reconcile host pools scoped to the demo resource group:
+        - Create missing host pools and apply full desired configuration
+        - Correct drifted settings (WVD props, FSLogix assignment, auto-scale config)
+        - Assign users (by UPN) and groups (by display name, resolved to GUID via Graph)
+        - Apply environment ARM tag; confirm tag on existing pools
+        - Remove stray host pools not in desired state (unless tagged ignore)
+  12. Advise on session host availability and re-enable auto-scale if disabled
 
   TAG BEHAVIOR (ARM tag 'NME-SE-Manage' on Azure host pool resources):
     import   — Ingest current live config into desired-state.json and commit to git.
@@ -24,18 +33,24 @@
     managed  — Same as no tag for reconciliation purposes.
     (no tag) — Normal managed resource: reconcile config, remove if not in desired state.
 
+  ENVIRONMENT TAG BEHAVIOR (ARM tag defined in desired-state.json under "tag"):
+    Every Azure resource this script creates or manages (workspace, storage accounts, desktop
+    images, host pools) will have the configured tag key/value applied. On maintenance runs the
+    tag is confirmed and re-applied if missing or incorrect via Update-AzTag -Operation Merge.
+
   PREREQUISITES
   =============
 
   Automation Account Modules:
     - Az.Accounts
-    - Az.Compute         (tag reads)
+    - Az.Compute              (image reads, tag operations)
     - Az.DesktopVirtualization (Get-AzWvdHostPool, host reads)
-    - Az.Resources       (Update-AzTag)
-    - Az.Storage         (New-AzStorageAccount, New-AzRmStorageShare)
-    - Az.Websites        (Get-AzWebApp — for NME App Service restart after SQL cleanup)
+    - Az.Resources            (Update-AzTag, Get-AzResource)
+    - Az.Storage              (New-AzStorageAccount, New-AzRmStorageShare)
+    - Az.Websites             (Get-AzWebApp — for NME App Service restart after SQL cleanup)
 
   Automation Account Variables (prefixed with VariablePrefix, default 'SalesDemo'):
+    Required:
     - {Prefix}TenantId              NME API app registration tenant ID
     - {Prefix}ClientId              NME API app registration client ID
     - {Prefix}ClientSecret          NME API app registration client secret (encrypted)
@@ -48,13 +63,43 @@
     - {Prefix}GitRepoBranch         Branch containing desired-state.json
     - {Prefix}GitFilePath           Repo-relative path to desired-state.json
     - {Prefix}GitPat                GitHub PAT with contents:read+write (encrypted)
-    - {Prefix}NmeAppResourceGroup   (Optional) Resource group containing the NME App Service.
+
+    Optional:
+    - {Prefix}NmeAppResourceGroup   Resource group containing the NME App Service.
                                     If not set, app is discovered via Get-AzWebApp by name.
                                     Required for profile-cache flush after SQL cleanup.
+    - {Prefix}SqlServer             Azure SQL server FQDN for NME database (e.g.
+                                    myserver.database.windows.net). Required for profile cleanup.
+    - {Prefix}SqlDatabase           NME SQL database name. Required for profile cleanup.
 
-  Managed Identity Permissions:
-    - Azure RBAC Reader on ScopedResourceGroup (read ARM tags on host pools)
-    - Azure RBAC Tag Contributor on ScopedResourceGroup (write NME-SE-Manage tag after import)
+  Automation Account Managed Identity Permissions:
+    Azure RBAC (on ScopedResourceGroup):
+    - Contributor                   Create/manage storage accounts, file shares, and ARM
+                                    resources; read and write ARM tags on all managed resources.
+
+    Azure RBAC (on NME App Service resource group, optional):
+    - Website Contributor           Restart the NME App Service after SQL profile cleanup.
+                                    Only required if profile cleanup is enabled.
+
+    Microsoft Graph app roles (granted to the MI service principal):
+    - Group.Read.All                Resolve Entra group display names to Object IDs for
+                                    host pool group assignments. Required if any host pool
+                                    in desired state has a 'groups' array.
+
+    Azure SQL database roles (on NME database, optional):
+    - db_datareader                 Read FSLogix profile records for cleanup reporting.
+    - db_datawriter                 Delete stale profile records during cleanup.
+                                    Grant both roles to the MI's object ID in the NME database.
+                                    Only required if profile cleanup is enabled.
+
+  NME Service Principal Permissions:
+    Azure RBAC (on ScopedResourceGroup):
+    - Contributor                   Create and manage AVD host pools, application groups,
+                                    session hosts, and related ARM resources.
+    - User Access Administrator     Write role assignments on AVD application groups.
+                                    Required to assign users and Entra groups to desktop
+                                    and RemoteApp application groups. Without this role,
+                                    host pool assignment jobs will fail with AuthorizationFailed.
 
 .PARAMETER VariablePrefix
   Prefix for Automation Account variables. Defaults to 'SalesDemo'.
@@ -547,6 +592,9 @@ if ($DemoTagName) {
     Write-Log "Environment tag: '$DemoTagName'='$DemoTagValue' (applied to all NME ARM resources)."
 }
 
+$DefaultSubId = if ($DesiredState.subscriptionId) { $DesiredState.subscriptionId } else { $null }
+$DefaultRg    = if ($DesiredState.resourceGroup)   { $DesiredState.resourceGroup }   else { $null }
+
 Write-Log "Desired state loaded: $($DesiredState.hostPools.Count) host pool(s), $($DesiredState.profiles.fslogix.Count) FSLogix config(s), $($DesiredState.profiles.autoScale.Count) auto-scale profile(s)."
 
 $ErrorActionPreference = 'Continue'
@@ -676,6 +724,8 @@ if ($hpImported -gt 0) {
 Write-Log "--- Reconcile Workspace ---"
 
 $ws = $DesiredState.workspace
+$wsEffSub = if ($ws.subscriptionId) { $ws.subscriptionId } else { $DefaultSubId }
+$wsEffRg  = if ($ws.resourceGroup)  { $ws.resourceGroup }  else { $DefaultRg }
 $wsMatch = $liveWorkspaces | Where-Object { $_.id.name -eq $ws.name }
 
 if (-not $wsMatch) {
@@ -685,8 +735,8 @@ if (-not $wsMatch) {
         if ($DemoTagName) { $wsTags[$DemoTagName] = $DemoTagValue }
         $wsBody = @{
             id = @{
-                subscriptionId = $ws.subscriptionId
-                resourceGroup  = $ws.resourceGroup
+                subscriptionId = $wsEffSub
+                resourceGroup  = $wsEffRg
                 name           = $ws.name
             }
             location     = $ws.location
@@ -710,7 +760,7 @@ if (-not $wsMatch) {
 } else {
     Write-Log "Workspace '$($ws.name)' exists."
     if ($DemoTagName -and $wsMatch) {
-        $wsArmId = "/subscriptions/$($ws.subscriptionId)/resourceGroups/$($ws.resourceGroup)/providers/Microsoft.DesktopVirtualization/workspaces/$($ws.name)"
+        $wsArmId = "/subscriptions/$wsEffSub/resourceGroups/$wsEffRg/providers/Microsoft.DesktopVirtualization/workspaces/$($ws.name)"
         Confirm-ArmTag -ResourceId $wsArmId -TagName $DemoTagName -TagValue $DemoTagValue
     }
 }
@@ -1075,6 +1125,8 @@ if ($DesiredState.vnets) {
     if (-not $liveNets) { $liveNets = @() }
 
     foreach ($entry in $DesiredState.vnets) {
+        $vnetEffSub = if ($entry.subscriptionId)    { $entry.subscriptionId }    else { $DefaultSubId }
+        $vnetEffRg  = if ($entry.resourceGroupName) { $entry.resourceGroupName } else { $DefaultRg }
         $match = $liveNets | Where-Object {
             $_.name -ieq $entry.networkName -and $_.subnet -ieq $entry.subnetName
         }
@@ -1083,8 +1135,8 @@ if ($DesiredState.vnets) {
             if (-not $WhatIf) {
                 try {
                     $netBody = @{
-                        subscriptionId    = $entry.subscriptionId
-                        resourceGroupName = $entry.resourceGroupName
+                        subscriptionId    = $vnetEffSub
+                        resourceGroupName = $vnetEffRg
                         networkName       = $entry.networkName
                         subnetName        = $entry.subnetName
                     } | ConvertTo-Json
@@ -1140,8 +1192,10 @@ if ($DesiredState.storageAccounts) {
     if (-not $liveStorage) { $liveStorage = @() }
 
     foreach ($entry in $DesiredState.storageAccounts) {
+        $saEffSub = if ($entry.subscriptionId) { $entry.subscriptionId } else { $DefaultSubId }
+        $saEffRg  = if ($entry.resourceGroup)  { $entry.resourceGroup }  else { $DefaultRg }
         # NME storage IDs are ARM resource IDs — construct expected ID for comparison
-        $expectedId = "/subscriptions/$($entry.subscriptionId)/resourceGroups/$($entry.resourceGroup)/providers/Microsoft.Storage/storageAccounts/$($entry.accountName)/fileServices/default/shares/$($entry.shareName)"
+        $expectedId = "/subscriptions/$saEffSub/resourceGroups/$saEffRg/providers/Microsoft.Storage/storageAccounts/$($entry.accountName)/fileServices/default/shares/$($entry.shareName)"
         $match = $liveStorage | Where-Object { $_.id -ieq $expectedId }
 
         if (-not $match) {
@@ -1151,13 +1205,13 @@ if ($DesiredState.storageAccounts) {
             } else {
                 try {
                     # Ensure the Azure Storage account exists — create it if not
-                    $azSa = Get-AzStorageAccount -ResourceGroupName $entry.resourceGroup `
+                    $azSa = Get-AzStorageAccount -ResourceGroupName $saEffRg `
                         -Name $entry.accountName -ErrorAction SilentlyContinue
                     if (-not $azSa) {
-                        Write-Log "Storage account '$($entry.accountName)' not found in Azure. Creating in '$($entry.resourceGroup)'..."
-                        $rgObj = Get-AzResourceGroup -Name $entry.resourceGroup -ErrorAction Stop
+                        Write-Log "Storage account '$($entry.accountName)' not found in Azure. Creating in '$saEffRg'..."
+                        $rgObj = Get-AzResourceGroup -Name $saEffRg -ErrorAction Stop
                         $saCreateParams = @{
-                            ResourceGroupName     = $entry.resourceGroup
+                            ResourceGroupName     = $saEffRg
                             Name                  = $entry.accountName
                             Location              = $rgObj.Location
                             SkuName               = 'Standard_LRS'
@@ -1172,13 +1226,13 @@ if ($DesiredState.storageAccounts) {
                     }
 
                     # Ensure the file share exists — create it if not
-                    $azShare = Get-AzRmStorageShare -ResourceGroupName $entry.resourceGroup `
+                    $azShare = Get-AzRmStorageShare -ResourceGroupName $saEffRg `
                         -StorageAccountName $entry.accountName -Name $entry.shareName `
                         -ErrorAction SilentlyContinue
                     if (-not $azShare) {
                         Write-Log "File share '$($entry.shareName)' not found. Creating..."
                         New-AzRmStorageShare `
-                            -ResourceGroupName  $entry.resourceGroup `
+                            -ResourceGroupName  $saEffRg `
                             -StorageAccountName $entry.accountName `
                             -Name               $entry.shareName `
                             -QuotaGiB           100 `
@@ -1187,7 +1241,7 @@ if ($DesiredState.storageAccounts) {
                     }
 
                     # Link the share to NME
-                    $linkUrl = "$NmeUri/api/v1/storage/azure-files/$($entry.subscriptionId)/$($entry.resourceGroup)/$($entry.accountName)/$($entry.shareName)/link"
+                    $linkUrl = "$NmeUri/api/v1/storage/azure-files/$saEffSub/$saEffRg/$($entry.accountName)/$($entry.shareName)/link"
                     Invoke-NmeApi -Method POST -Uri $linkUrl | Out-Null
                     Write-Log "Storage '$($entry.accountName)/$($entry.shareName)' linked to NME."
                 } catch {
@@ -1197,7 +1251,7 @@ if ($DesiredState.storageAccounts) {
         } else {
             Write-Log "Storage account '$($entry.accountName)/$($entry.shareName)' is linked."
             if ($DemoTagName) {
-                $saArmId = "/subscriptions/$($entry.subscriptionId)/resourceGroups/$($entry.resourceGroup)/providers/Microsoft.Storage/storageAccounts/$($entry.accountName)"
+                $saArmId = "/subscriptions/$saEffSub/resourceGroups/$saEffRg/providers/Microsoft.Storage/storageAccounts/$($entry.accountName)"
                 Confirm-ArmTag -ResourceId $saArmId -TagName $DemoTagName -TagValue $DemoTagValue
             }
         }
@@ -1209,7 +1263,9 @@ if ($DesiredState.storageAccounts) {
     # will return 500 and must be unlinked manually via the NME portal.
     foreach ($live in $liveStorage) {
         $inDs = $DesiredState.storageAccounts | Where-Object {
-            $expectedId = "/subscriptions/$($_.subscriptionId)/resourceGroups/$($_.resourceGroup)/providers/Microsoft.Storage/storageAccounts/$($_.accountName)/fileServices/default/shares/$($_.shareName)"
+            $effS = if ($_.subscriptionId) { $_.subscriptionId } else { $DefaultSubId }
+            $effR = if ($_.resourceGroup)  { $_.resourceGroup }  else { $DefaultRg }
+            $expectedId = "/subscriptions/$effS/resourceGroups/$effR/providers/Microsoft.Storage/storageAccounts/$($_.accountName)/fileServices/default/shares/$($_.shareName)"
             $expectedId -ieq $live.id
         }
         if (-not $inDs) {
@@ -1265,9 +1321,11 @@ if ($DesiredState.images) {
     $imgSubnet = $null
     $imgNetId  = $null
     if ($DesiredState.vnets -and @($DesiredState.vnets).Count -gt 0) {
-        $imgVnet   = @($DesiredState.vnets)[0]
-        $imgSubnet = $imgVnet.subnetName
-        $imgNetId  = "/subscriptions/$($imgVnet.subscriptionId)/resourceGroups/$($imgVnet.resourceGroupName)/providers/Microsoft.Network/virtualNetworks/$($imgVnet.networkName)"
+        $imgVnet      = @($DesiredState.vnets)[0]
+        $imgSubnet    = $imgVnet.subnetName
+        $imgVnetEffSub = if ($imgVnet.subscriptionId)    { $imgVnet.subscriptionId }    else { $DefaultSubId }
+        $imgVnetEffRg  = if ($imgVnet.resourceGroupName) { $imgVnet.resourceGroupName } else { $DefaultRg }
+        $imgNetId  = "/subscriptions/$imgVnetEffSub/resourceGroups/$imgVnetEffRg/providers/Microsoft.Network/virtualNetworks/$($imgVnet.networkName)"
     }
 
     foreach ($entry in $DesiredState.images) {
@@ -1285,8 +1343,8 @@ if ($DesiredState.images) {
         if (-not $match) {
             if ($entry.sourceImageId) {
                 # Required fields present — create the image via create-from-library
-                $imgRg  = if ($entry.resourceGroup) { $entry.resourceGroup } else { $DesiredState.workspace.resourceGroup }
-                $imgSub = $DesiredState.workspace.subscriptionId
+                $imgRg  = if ($entry.resourceGroup)  { $entry.resourceGroup }  else { $DefaultRg }
+                $imgSub = if ($entry.subscriptionId) { $entry.subscriptionId } else { $DefaultSubId }
                 $imgVmSize      = if ($entry.vmSize)      { $entry.vmSize }      else { 'Standard_D2s_v5' }
                 $imgStorageType = if ($entry.storageType) { $entry.storageType } else { 'StandardSSD_LRS' }
 
@@ -1396,8 +1454,8 @@ $liveHostPools = @(Get-AzWvdHostPool -ResourceGroupName $ScopedResourceGroup -Su
 
 foreach ($entry in $DesiredState.hostPools) {
     $hpName = $entry.id.hostpoolName
-    $hpRg   = $entry.id.resourceGroup
-    $hpSub  = $entry.id.subscriptionId
+    $hpRg   = if ($entry.id.resourceGroup)  { $entry.id.resourceGroup }  else { $DefaultRg }
+    $hpSub  = if ($entry.id.subscriptionId) { $entry.id.subscriptionId } else { $DefaultSubId }
     $hpUrl  = "$NmeUri/api/v1/arm/hostpool/$hpSub/$hpRg/$([uri]::EscapeDataString($hpName))"
     # VM name prefix used in the create payload (always has a value — falls back to pool name).
     # $hpVmPrefixEnforce is non-null only when vmNamePrefix is explicitly in desired state,
@@ -1987,8 +2045,8 @@ if (-not $SkipSessionHostCheck) {
 
     foreach ($entry in $DesiredState.hostPools) {
         $hpName = $entry.id.hostpoolName
-        $hpRg   = $entry.id.resourceGroup
-        $hpSub  = $entry.id.subscriptionId
+        $hpRg   = if ($entry.id.resourceGroup)  { $entry.id.resourceGroup }  else { $DefaultRg }
+        $hpSub  = if ($entry.id.subscriptionId) { $entry.id.subscriptionId } else { $DefaultSubId }
         $hpUrl  = "$NmeUri/api/v1/arm/hostpool/$hpSub/$hpRg/$([uri]::EscapeDataString($hpName))"
 
         try {
