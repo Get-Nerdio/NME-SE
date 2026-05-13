@@ -1,6 +1,10 @@
 {
   "schemaVersion": "1.1",
   "lastUpdated": "2026-05-05T00:00:00Z",
+  "tag": {
+    "name": "NmeDemoEnv",
+    "value": "nme-demo-26h1"
+  },
   "workspace": {
     "subscriptionId": "2b9dd21c-8f1d-44aa-a344-4527243840c7",
     "resourceGroup": "nw-salesdemo-resources-rg",

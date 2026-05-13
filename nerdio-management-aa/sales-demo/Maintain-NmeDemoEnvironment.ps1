@@ -310,6 +310,30 @@ function Add-NonFatalError {
     Write-Log $Message 'WARN'
 }
 
+function Confirm-ArmTag {
+    param([string]$ResourceId, [string]$TagName, [string]$TagValue)
+    if (-not $TagName) { return }
+    $shortName = ($ResourceId -split '/')[-1]
+    $resource = Get-AzResource -ResourceId $ResourceId -ErrorAction SilentlyContinue
+    if (-not $resource) { Write-Log "Confirm-ArmTag: resource '$shortName' not found — skipping tag check." 'WARN'; return }
+    if ($resource.Tags -and $resource.Tags[$TagName] -eq $TagValue) {
+        Write-Log "Tag '$TagName=$TagValue' confirmed on '$shortName'."
+        return
+    }
+    $current = if ($resource.Tags -and $resource.Tags[$TagName]) { $resource.Tags[$TagName] } else { '(missing)' }
+    Write-Log "Tag '$TagName' on '$shortName' is '$current', expected '$TagValue'. Applying..."
+    if (-not $WhatIf) {
+        try {
+            Update-AzTag -Tag @{ $TagName = $TagValue } -Operation Merge -ResourceId $ResourceId | Out-Null
+            Write-Log "Tag '$TagName=$TagValue' applied to '$shortName'."
+        } catch {
+            Add-NonFatalError "Failed to apply tag '$TagName=$TagValue' to '$shortName': $($_.Exception.Message)"
+        }
+    } else {
+        Write-Log "[WHATIF] Would apply tag '$TagName=$TagValue' to '$shortName'."
+    }
+}
+
 function Get-NmeSqlConnection {
     <#
     .SYNOPSIS
@@ -475,6 +499,13 @@ $DesiredState = $rawJson | ConvertFrom-Json
 if (-not $DesiredState.workspace -or -not $DesiredState.hostPools) {
     throw "desired-state.json is missing required 'workspace' or 'hostPools' keys."
 }
+
+$DemoTagName  = if ($DesiredState.tag -and $DesiredState.tag.name)  { $DesiredState.tag.name }  else { $null }
+$DemoTagValue = if ($DesiredState.tag -and $DesiredState.tag.value) { $DesiredState.tag.value } else { $null }
+if ($DemoTagName) {
+    Write-Log "Environment tag: '$DemoTagName'='$DemoTagValue' (applied to all NME ARM resources)."
+}
+
 Write-Log "Desired state loaded: $($DesiredState.hostPools.Count) host pool(s), $($DesiredState.profiles.fslogix.Count) FSLogix config(s), $($DesiredState.profiles.autoScale.Count) auto-scale profile(s)."
 
 $ErrorActionPreference = 'Continue'
@@ -609,6 +640,8 @@ $wsMatch = $liveWorkspaces | Where-Object { $_.id.name -eq $ws.name }
 if (-not $wsMatch) {
     Write-Log "Workspace '$($ws.name)' not found. Creating..."
     if (-not $WhatIf) {
+        $wsTags = @{ 'NME-SE-Manage' = 'managed'; Environment = 'SalesDemo' }
+        if ($DemoTagName) { $wsTags[$DemoTagName] = $DemoTagValue }
         $wsBody = @{
             id = @{
                 subscriptionId = $ws.subscriptionId
@@ -618,10 +651,7 @@ if (-not $wsMatch) {
             location     = $ws.location
             friendlyName = $ws.friendlyName
             description  = 'Nerdio SE Sales Demo workspace'
-            tags         = @{
-                'NME-SE-Manage' = 'managed'
-                Environment     = 'SalesDemo'
-            }
+            tags         = $wsTags
         } | ConvertTo-Json -Depth 5
         try {
             $wsResult = Invoke-NmeApi -Method POST -Uri "$NmeUri/api/v1/workspace" -Body $wsBody
@@ -638,6 +668,10 @@ if (-not $wsMatch) {
     }
 } else {
     Write-Log "Workspace '$($ws.name)' exists."
+    if ($DemoTagName -and $wsMatch) {
+        $wsArmId = "/subscriptions/$($ws.subscriptionId)/resourceGroups/$($ws.resourceGroup)/providers/Microsoft.DesktopVirtualization/workspaces/$($ws.name)"
+        Confirm-ArmTag -ResourceId $wsArmId -TagName $DemoTagName -TagValue $DemoTagValue
+    }
 }
 
 #endregion
@@ -1067,15 +1101,18 @@ if ($DesiredState.storageAccounts) {
                     if (-not $azSa) {
                         Write-Log "Storage account '$($entry.accountName)' not found in Azure. Creating in '$($entry.resourceGroup)'..."
                         $rgObj = Get-AzResourceGroup -Name $entry.resourceGroup -ErrorAction Stop
-                        $azSa  = New-AzStorageAccount `
-                            -ResourceGroupName $entry.resourceGroup `
-                            -Name             $entry.accountName `
-                            -Location         $rgObj.Location `
-                            -SkuName          'Standard_LRS' `
-                            -Kind             'StorageV2' `
-                            -AllowBlobPublicAccess $false `
-                            -MinimumTlsVersion 'TLS1_2' `
-                            -ErrorAction Stop
+                        $saCreateParams = @{
+                            ResourceGroupName     = $entry.resourceGroup
+                            Name                  = $entry.accountName
+                            Location              = $rgObj.Location
+                            SkuName               = 'Standard_LRS'
+                            Kind                  = 'StorageV2'
+                            AllowBlobPublicAccess = $false
+                            MinimumTlsVersion     = 'TLS1_2'
+                            ErrorAction           = 'Stop'
+                        }
+                        if ($DemoTagName) { $saCreateParams['Tag'] = @{ $DemoTagName = $DemoTagValue } }
+                        $azSa = New-AzStorageAccount @saCreateParams
                         Write-Log "Storage account '$($entry.accountName)' created (Standard_LRS, $($rgObj.Location))."
                     }
 
@@ -1104,6 +1141,10 @@ if ($DesiredState.storageAccounts) {
             }
         } else {
             Write-Log "Storage account '$($entry.accountName)/$($entry.shareName)' is linked."
+            if ($DemoTagName) {
+                $saArmId = "/subscriptions/$($entry.subscriptionId)/resourceGroups/$($entry.resourceGroup)/providers/Microsoft.Storage/storageAccounts/$($entry.accountName)"
+                Confirm-ArmTag -ResourceId $saArmId -TagName $DemoTagName -TagValue $DemoTagValue
+            }
         }
     }
 
@@ -1215,6 +1256,7 @@ if ($DesiredState.images) {
                             scriptedActionTarget  = 'Clone'
                             description    = if ($entry.description) { $entry.description } else { '' }
                         }
+                        if ($DemoTagName) { $imgPayload['tags'] = @{ $DemoTagName = $DemoTagValue } }
                         $imgBody = @{ jobPayload = $imgPayload } | ConvertTo-Json -Depth 10
                         $imgResult = Invoke-NmeApi -Method POST -Uri "$NmeUri/api/v1/desktop-image/create-from-library" -Body $imgBody
                         # Image builds take 20-45 minutes — don't block the runbook waiting.
@@ -1232,6 +1274,9 @@ if ($DesiredState.images) {
             }
         } else {
             Write-Log "Desktop image '$($entry.name)' exists (vm: $imgVmName, id=$($match.id))."
+            if ($DemoTagName) {
+                Confirm-ArmTag -ResourceId $match.id -TagName $DemoTagName -TagValue $DemoTagValue
+            }
         }
     }
 } else {
@@ -1363,7 +1408,7 @@ foreach ($entry in $DesiredState.hostPools) {
                 }
                 friendlyName = $entry.friendlyName
                 description  = $entry.description
-                tags         = @{ 'NME-SE-Manage' = 'managed'; Environment = 'SalesDemo' }
+                tags         = if ($DemoTagName) { @{ 'NME-SE-Manage' = 'managed'; Environment = 'SalesDemo'; $DemoTagName = $DemoTagValue } } else { @{ 'NME-SE-Manage' = 'managed'; Environment = 'SalesDemo' } }
             }
             # Merge pool type params
             foreach ($k in $poolParams.Keys) { $createBody[$k] = $poolParams[$k] }
@@ -1530,6 +1575,11 @@ foreach ($entry in $DesiredState.hostPools) {
             } catch {
                 Add-NonFatalError "Failed to check/update auto-scale config on '$hpName': $($_.Exception.Message)"
             }
+        }
+
+        # Tag confirmation
+        if ($DemoTagName) {
+            Confirm-ArmTag -ResourceId $liveHp.Id -TagName $DemoTagName -TagValue $DemoTagValue
         }
 
         if ($driftFound) { $hpUpdated++ } else { Write-Log "Host pool '$hpName' is correctly configured." }
