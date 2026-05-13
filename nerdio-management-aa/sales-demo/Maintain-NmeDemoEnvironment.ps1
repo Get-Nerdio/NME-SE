@@ -780,17 +780,17 @@ foreach ($entry in $DesiredState.profiles.fslogix) {
             # Unspecified boolean/array fields default to $false / @() for create
             $fslBody = @{
                 name      = $entry.name
-                isDefault = $entry.isDefault ?? $false
+                isDefault = if ($null -ne $entry.isDefault) { [bool]$entry.isDefault } else { $false }
                 properties = @{
                     installer        = @{ version = ''; forceUpdate = $false }
                     profileContainer = @{
-                        locations = @($entry.properties.profileContainer.locations ?? @())
+                        locations = @(if ($entry.properties.profileContainer.locations) { $entry.properties.profileContainer.locations } else { @() })
                         options   = ''
                     }
                     officeContainer  = @{ locations = @(); options = '' }
-                    cloudCache       = $entry.properties.cloudCache      ?? $false
-                    pageBlobs        = $entry.properties.pageBlobs        ?? $false
-                    entraIdKerberos  = $entry.properties.entraIdKerberos  ?? $false
+                    cloudCache       = if ($null -ne $entry.properties.cloudCache)     { [bool]$entry.properties.cloudCache }     else { $false }
+                    pageBlobs        = if ($null -ne $entry.properties.pageBlobs)      { [bool]$entry.properties.pageBlobs }      else { $false }
+                    entraIdKerberos  = if ($null -ne $entry.properties.entraIdKerberos){ [bool]$entry.properties.entraIdKerberos } else { $false }
                     redirectionsXml  = ''
                     exclusions       = @{ exclusionMode = 'None' }
                     appServiceRegistryOptions = @{ registryOptionsMode = 'None'; registryOptions = '' }
@@ -1016,11 +1016,11 @@ if ($null -ne $DesiredState.profiles.cclConfigs) {
                 $cclBody = @{
                     displayName      = $entry.displayName
                     defaultReportType = $entry.defaultReportType
-                    subscriptionsIds = @($entry.subscriptionsIds ?? @())
-                    workspaceIds     = @($entry.workspaceIds     ?? @())
+                    subscriptionsIds = @(if ($entry.subscriptionsIds) { $entry.subscriptionsIds } else { @() })
+                    workspaceIds     = @(if ($entry.workspaceIds)     { $entry.workspaceIds }     else { @() })
                     tags             = if ($entry.tags) { $entry.tags } else { @{} }
-                    useDefaultTags   = $entry.useDefaultTags   ?? $true
-                    includeAllCosts  = $entry.includeAllCosts  ?? $false
+                    useDefaultTags   = if ($null -ne $entry.useDefaultTags)  { [bool]$entry.useDefaultTags }  else { $true }
+                    includeAllCosts  = if ($null -ne $entry.includeAllCosts) { [bool]$entry.includeAllCosts } else { $false }
                 } | ConvertTo-Json -Depth 5
                 try {
                     $cclResult = Invoke-NmeApi -Method POST -Uri "$NmeUri/api/v1/user-cost-attribution/configuration" -Body $cclBody
