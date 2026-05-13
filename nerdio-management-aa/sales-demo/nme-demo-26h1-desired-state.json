@@ -3,6 +3,10 @@
   "lastUpdated": "2026-05-13T00:00:00Z",
   "subscriptionId": "5d4206f2-8af2-479a-b7f9-5fb434457d5f",
   "resourceGroup": "nme-demo-26h1-avd-resources-rg",
+  "tag": {
+    "name": "NmeDemoEnv",
+    "value": "nme-demo-26h1"
+  },
   "workspace": {
     "name": "sales-demo-workspace",
     "location": "centralus",
@@ -10,17 +14,17 @@
   },
   "vnets": [
     {
-      "networkName": "nme-demo-26h1-vnet",
+      "networkName": "nme-demo-vnet",
       "subnetName": "avd"
     }
   ],
   "storageAccounts": [
     {
-      "accountName": "nme26h1entrasa",
+      "accountName": "nme26entrasa",
       "shareName": "profiles"
     },
     {
-      "accountName": "nme26h1adsa",
+      "accountName": "nme26adsa",
       "shareName": "profiles"
     }
   ],
@@ -51,11 +55,11 @@
     "fslogix": [
       {
         "name": "FSLogix-EntraStorage",
-        "isDefault": false,
+        "isDefault": true,
         "properties": {
           "profileContainer": {
             "locations": [
-              "\\\\nme26h1entrasa.file.core.windows.net\\profiles"
+              "\\\\nme26entrasa.file.core.windows.net\\profiles"
             ]
           },
           "entraIdKerberos": true,
@@ -69,7 +73,7 @@
         "properties": {
           "profileContainer": {
             "locations": [
-              "\\\\nme26h1adsa.file.core.windows.net\\profiles"
+              "\\\\nme26adsa.file.core.windows.net\\profiles"
             ]
           },
           "entraIdKerberos": false,
@@ -125,15 +129,7 @@
     "cclConfigs": [
       {
         "displayName": "NME Demo Environment",
-        "defaultReportType": null,
-        "isDefault": false,
-        "subscriptionsIds": [
-          "5d4206f2-8af2-479a-b7f9-5fb434457d5f"
-        ],
-        "workspaceIds": [],
-        "tags": {},
-        "useDefaultTags": true,
-        "includeAllCosts": false
+        "isDefault": true
       }
     ]
   },
@@ -155,7 +151,7 @@
         "isEnabled": true,
         "vmSize": "Standard_D2s_v5",
         "vmNamePrefix": "mspooled",
-        "hostPoolCapacity": 2,
+        "hostPoolCapacity": 3,
         "minActiveHostsCount": 1
       }
     },
@@ -176,7 +172,7 @@
         "isEnabled": true,
         "vmSize": "Standard_D2s_v5",
         "vmNamePrefix": "remoteapp",
-        "hostPoolCapacity": 2,
+        "hostPoolCapacity": 3,
         "minActiveHostsCount": 1
       }
     },
@@ -197,7 +193,7 @@
         "isEnabled": true,
         "vmSize": "Standard_D2s_v5",
         "vmNamePrefix": "supool",
-        "hostPoolCapacity": 2,
+        "hostPoolCapacity": 3,
         "minActiveHostsCount": 1
       }
     },
@@ -208,6 +204,9 @@
       "friendlyName": "Personal Desktop",
       "description": "Personal desktop host pool with automatic assignment",
       "users": [],
+      "groups": [
+        "SE - Sub Owners"
+      ],
       "poolType": "Personal",
       "personalAssignmentType": "Automatic",
       "isDesktop": true,
@@ -219,8 +218,8 @@
         "isEnabled": true,
         "vmSize": "Standard_D2s_v5",
         "vmNamePrefix": "personal",
-        "hostPoolCapacity": 2,
-        "minActiveHostsCount": 1
+        "hostPoolCapacity": 3,
+        "minActiveHostsCount": 0
       }
     }
   ]
