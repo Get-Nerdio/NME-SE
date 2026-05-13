@@ -1,31 +1,29 @@
 {
   "schemaVersion": "1.1",
   "lastUpdated": "2026-05-05T00:00:00Z",
+  "subscriptionId": "2b9dd21c-8f1d-44aa-a344-4527243840c7",
+  "resourceGroup": "nw-salesdemo-resources-rg",
+  "tag": {
+    "name": "NmeDemoEnv",
+    "value": "nme-demo-dev"
+  },
   "workspace": {
-    "subscriptionId": "2b9dd21c-8f1d-44aa-a344-4527243840c7",
-    "resourceGroup": "nw-salesdemo-resources-rg",
     "name": "sales-demo-workspace",
     "location": "centralus",
     "friendlyName": "NME Sales Demo"
   },
   "vnets": [
     {
-      "subscriptionId": "2b9dd21c-8f1d-44aa-a344-4527243840c7",
-      "resourceGroupName": "nw-salesdemo-resources-rg",
       "networkName": "nw-salesdemo-vnet",
       "subnetName": "avd"
     }
   ],
   "storageAccounts": [
     {
-      "subscriptionId": "2b9dd21c-8f1d-44aa-a344-4527243840c7",
-      "resourceGroup": "nw-salesdemo-resources-rg",
       "accountName": "nwsdfslsa",
       "shareName": "profiles"
     },
     {
-      "subscriptionId": "2b9dd21c-8f1d-44aa-a344-4527243840c7",
-      "resourceGroup": "nw-salesdemo-resources-rg",
       "accountName": "nmedemoadsa",
       "shareName": "profiles"
     }
@@ -33,7 +31,6 @@
   "images": [
     {
       "name": "MultiUserImg",
-      "resourceGroup": "nw-salesdemo-resources-rg",
       "sourceImageId": "MicrosoftWindowsDesktop/windows-11/win11-24h2-avd/latest",
       "vmSize": "Standard_D2s_v5",
       "storageType": "StandardSSD_LRS",
@@ -41,7 +38,6 @@
     },
     {
       "name": "PersonalImg",
-      "resourceGroup": "nw-salesdemo-resources-rg",
       "sourceImageId": "MicrosoftWindowsDesktop/windows-11/win11-24h2-ent/latest",
       "vmSize": "Standard_D2s_v5",
       "storageType": "StandardSSD_LRS",
@@ -49,7 +45,6 @@
     },
     {
       "name": "Img-64gb",
-      "resourceGroup": "nw-salesdemo-resources-rg",
       "sourceImageId": "MicrosoftWindowsDesktop/windows-11/win11-24h2-ent/latest",
       "vmSize": "Standard_D2s_v5",
       "storageType": "StandardSSD_LRS",
@@ -149,8 +144,6 @@
   "hostPools": [
     {
       "id": {
-        "subscriptionId": "2b9dd21c-8f1d-44aa-a344-4527243840c7",
-        "resourceGroup": "nw-salesdemo-resources-rg",
         "hostpoolName": "Multi-session-Pooled"
       },
       "friendlyName": "Multi-session Pooled",
@@ -172,8 +165,6 @@
     },
     {
       "id": {
-        "subscriptionId": "2b9dd21c-8f1d-44aa-a344-4527243840c7",
-        "resourceGroup": "nw-salesdemo-resources-rg",
         "hostpoolName": "RemoteApp-Pooled"
       },
       "friendlyName": "RemoteApp Pooled",
@@ -195,13 +186,14 @@
     },
     {
       "id": {
-        "subscriptionId": "2b9dd21c-8f1d-44aa-a344-4527243840c7",
-        "resourceGroup": "nw-salesdemo-resources-rg",
         "hostpoolName": "Single-User-Pooled"
       },
       "friendlyName": "Single User Pooled",
       "description": "Single User pooled desktop host pool",
       "users": [],
+      "groups": [
+        "NmeSalesEngineers"
+      ],
       "poolType": "Pooled",
       "isDesktop": true,
       "isSingleUser": true,
@@ -218,13 +210,14 @@
     },
     {
       "id": {
-        "subscriptionId": "2b9dd21c-8f1d-44aa-a344-4527243840c7",
-        "resourceGroup": "nw-salesdemo-resources-rg",
         "hostpoolName": "Personal-Desktop"
       },
       "friendlyName": "Personal Desktop",
       "description": "Personal desktop host pool with automatic assignment",
       "users": [],
+      "groups": [
+        "NmeSalesEngineers"
+      ],
       "poolType": "Personal",
       "personalAssignmentType": "Automatic",
       "isDesktop": true,
