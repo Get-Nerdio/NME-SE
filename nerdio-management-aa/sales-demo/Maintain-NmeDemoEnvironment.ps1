@@ -518,9 +518,9 @@ $imagesRemoved          = 0
 $storageUnlinked        = 0
 $vnetsUnlinked          = 0
 
-# PS 5.1 defaults to TLS 1.0 — force TLS 1.2 for all web requests in this session.
-# Note: ServerCertificateValidationCallback is set after Connect-AzAccount (see Region 3).
-[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+# PS 5.1 defaults to TLS 1.0. Use SystemDefault (0) so the OS negotiates the highest
+# supported version — required because the NME App Service enforces a minimum of TLS 1.3.
+[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::SystemDefault
 
 Write-Log "=== Maintain-NmeDemoEnvironment starting (WhatIf=$WhatIf, RemoveUndefinedResources=$RemoveUndefinedResources) ==="
 
@@ -533,22 +533,6 @@ $ErrorActionPreference = 'Stop'
 Disable-AzContextAutosave -Scope Process | Out-Null
 Connect-AzAccount -Identity -SubscriptionId $SubscriptionId -ErrorAction Stop | Out-Null
 Write-Log "Connected to Azure subscription $SubscriptionId."
-
-# Skip certificate validation for Invoke-RestMethod calls (PS5.1 equivalent of -SkipCertificateCheck).
-# Must be set AFTER Connect-AzAccount (setting it before breaks MSAL token acquisition).
-# Script-block delegates fail in Azure Automation runspaces — compiled type required.
-if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
-    Add-Type @'
-using System.Net;
-using System.Security.Cryptography.X509Certificates;
-public class TrustAllCertsPolicy : ICertificatePolicy {
-    public bool CheckValidationResult(ServicePoint sp, X509Certificate cert, WebRequest req, int problem) {
-        return true;
-    }
-}
-'@
-}
-[System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
 
 $NmeHeaders = Get-NmeHeaders
 Write-Log "Connected to NME API at $NmeUri."
