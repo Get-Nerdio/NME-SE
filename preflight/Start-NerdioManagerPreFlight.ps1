@@ -353,7 +353,7 @@ if ($Response -match "^[Yy]$") {
                 AllowSharedKeyAccess            = $true
                 PublicNetworkAccess             = "Enabled"
                 RoutingChoice                   = "MicrosoftRouting"
-                AllowBlobPublicAccess           = $true
+                AllowBlobPublicAccess           = $false
                 MinimumTlsVersion               = "TLS1_2"
                 RequireInfrastructureEncryption = $false
                 Tag                             = $Tags
@@ -538,9 +538,10 @@ if ($Response -match "^[Yy]$") {
                     Tag                        = $Tags
                     ErrorAction                = "Stop"
                 }
-                $AutomationAccount = New-AzAutomationAccount @params *> $null
+                New-AzAutomationAccount @params *> $null
                 Write-Host -ForegroundColor "Cyan" "Waiting for the Automation Account to be created."
                 Start-Sleep -Seconds 10
+                $AutomationAccount = Get-AzAutomationAccount -ResourceGroupName $ResourceGroupName -Name $AutomationAccountName -ErrorAction "SilentlyContinue"
                 if ([System.String]::IsNullOrEmpty($AutomationAccount.AutomationAccountName)) {
                     Write-Host -ForegroundColor "Red" "[x] Failed to create a new Automation Account."
                     $OutputArray.Add($(New-PreflightObject -ExceptionMessage $Error[0].Exception.Message -Target "AutomationAccount")) | Out-Null
@@ -579,6 +580,8 @@ if ($Response -match "^[Yy]$") {
             }
         }
         catch {
+            Write-Host -ForegroundColor "Red" "[x] Failed to create a new Key Vault."
+            $OutputArray.Add($(New-PreflightObject -ExceptionMessage $_.Exception.Message -Target "KeyVault")) | Out-Null
         }
 
         Write-Host ""
@@ -629,7 +632,7 @@ if ($Response -match "^[Yy]$") {
                 Write-Host -ForegroundColor "Cyan" "Removing App Service Plan: '$($AppServicePlan.Name)'."
                 Remove-AzAppServicePlan -ResourceGroupName $ResourceGroupName -Name $AppServicePlan.Name -Force -ErrorAction "Continue"
             }
-            if (-not[System.String]::IsNullOrEmpty($AutomationAccountName.AutomationAccountName)) {
+            if (-not[System.String]::IsNullOrEmpty($AutomationAccount.AutomationAccountName)) {
                 Write-Host -ForegroundColor "Cyan" "Removing Automation Account: '$($AutomationAccount.AutomationAccountName)'."
                 Remove-AzAutomationAccount -ResourceGroupName $ResourceGroupName -Name $AutomationAccount.AutomationAccountName -Force -ErrorAction "Continue"
             }
