@@ -32,21 +32,21 @@
     {
       "name": "MultiUserImg",
       "sourceImageId": "MicrosoftWindowsDesktop/windows-11/win11-24h2-avd/latest",
-      "vmSize": "Standard_D2s_v5",
+      "vmSize": "Standard_D2s_v3",
       "storageType": "StandardSSD_LRS",
       "description": "Windows 11 multi-session for pooled host pools"
     },
     {
       "name": "PersonalImg",
       "sourceImageId": "MicrosoftWindowsDesktop/windows-11/win11-24h2-ent/latest",
-      "vmSize": "Standard_D2s_v5",
+      "vmSize": "Standard_D2s_v3",
       "storageType": "StandardSSD_LRS",
       "description": "Windows 11 single-session for personal desktops"
     },
     {
       "name": "Img-64gb",
       "sourceImageId": "MicrosoftWindowsDesktop/windows-11/win11-24h2-ent/latest",
-      "vmSize": "Standard_D2s_v5",
+      "vmSize": "Standard_D2s_v3",
       "storageType": "StandardSSD_LRS",
       "description": "Windows 11 single-session for personal desktops"
     }
@@ -149,7 +149,7 @@
       "fslogixConfigName": "FSLogix-EntraStorage",
       "autoScale": {
         "isEnabled": true,
-        "vmSize": "Standard_D2s_v5",
+        "vmSize": "Standard_D2s_v3",
         "vmNamePrefix": "mspooled",
         "hostPoolCapacity": 3,
         "minActiveHostsCount": 1
@@ -170,7 +170,7 @@
       "fslogixConfigName": "FSLogix-EntraStorage",
       "autoScale": {
         "isEnabled": true,
-        "vmSize": "Standard_D2s_v5",
+        "vmSize": "Standard_D2s_v3",
         "vmNamePrefix": "remoteapp",
         "hostPoolCapacity": 3,
         "minActiveHostsCount": 1
@@ -191,7 +191,7 @@
       "fslogixConfigName": "FSLogix-EntraStorage",
       "autoScale": {
         "isEnabled": true,
-        "vmSize": "Standard_D2s_v5",
+        "vmSize": "Standard_D2s_v3",
         "vmNamePrefix": "supool",
         "hostPoolCapacity": 3,
         "minActiveHostsCount": 1
@@ -216,7 +216,7 @@
       "fslogixConfigName": "FSLogix-EntraStorage",
       "autoScale": {
         "isEnabled": true,
-        "vmSize": "Standard_D2s_v5",
+        "vmSize": "Standard_D2s_v3",
         "vmNamePrefix": "personal",
         "hostPoolCapacity": 3,
         "minActiveHostsCount": 0
