@@ -1,47 +1,59 @@
-<# Variables:
+#description: Convert VM OS disk between SCSI and NVMe controllers by running Microsoft's Azure-NVMe-Conversion script. Supports single-VM and batch (by VM size) modes.
+#tags: NVMe, SCSI, Disk, VM, Migration, Azure-Boost
+
+<#variables:
 {
     "VMName": {
-        "Description": "Name of the specific VM to convert. Leave empty to process all VMs in RG matching SourceVMSize."
+        "Description": "Name of the specific VM to convert. Leave empty to process all VMs in RG matching SourceVMSize.",
+        "DisplayName": "VM Name"
     },
     "ResourceGroupName": {
         "Description": "Name of the resource group containing the VM(s).",
-        "DefaultValue": ""
+        "DisplayName": "Resource Group Name"
     },
     "SourceVMSize": {
         "Description": "Source VM SKU size to filter VMs for batch processing. NOTE: changing from v6 to v3 will fail.",
-        "DefaultValue": "Standard_D4s_v6"
+        "DefaultValue": "Standard_D4s_v6",
+        "DisplayName": "Source VM Size"
     },
     "DestinationVMSize": {
         "Description": "Target VM SKU size after conversion.",
-        "DefaultValue": "Standard_D4s_v5"
+        "DefaultValue": "Standard_D4s_v5",
+        "DisplayName": "Destination VM Size"
     },
     "NewControllerType": {
         "Description": "Target disk controller type (SCSI or NVMe).",
-        "DefaultValue": "SCSI"
+        "DefaultValue": "SCSI",
+        "DisplayName": "New Controller Type"
     },
     "IgnoreRunningVMs": {
         "Description": "Skip VMs that are currently running/powered on.",
-        "DefaultValue": "true"
+        "DefaultValue": "true",
+        "DisplayName": "Ignore Running VMs"
     },
     "ProcessInGroupsOf": {
         "Description": "Number of VMs to process simultaneously in parallel jobs.",
-        "DefaultValue": 3
+        "DefaultValue": 3,
+        "DisplayName": "Process In Groups Of"
     },
     "WhatIf": {
         "Description": "Preview what changes would be made without executing them.",
-        "DefaultValue": "false"
+        "DefaultValue": "false",
+        "DisplayName": "What-If Mode"
     }
 }
 #>
 
 #Requires -Modules Az.Accounts, Az.Compute, Az.Resources
 
+$ErrorActionPreference = 'Stop'
+
 # -------- Helpers --------
 function Write-Info { param($m) Write-Output ("[INFO]  " + $m) }
 function Write-Warn { param($m) Write-Output ("[WARN]  " + $m) }
 function Write-Err  { param($m) Write-Output ("[ERROR] " + $m) }
 
-function To-Bool {
+function ConvertTo-Bool {
     param($v)
     if ($null -eq $v) { return $false }
     if ($v -is [bool]) { return $v }
@@ -81,8 +93,8 @@ if (-not $ResourceGroupName) {
 }
 
 # Normalize boolean parameters
-$IgnoreRunningVMs = To-Bool $IgnoreRunningVMs
-$WhatIfMode = To-Bool $WhatIf
+$IgnoreRunningVMs = ConvertTo-Bool $IgnoreRunningVMs
+$WhatIfMode = ConvertTo-Bool $WhatIf
 # Normalize and validate NewControllerType
 
 $nt = $NewControllerType.Trim()
@@ -110,11 +122,19 @@ Write-Info ("  - WhatIfMode: {0}" -f $WhatIfMode)
 $downloadStartTime = Get-Date
 Write-Info ("Downloading Microsoft's NVMe conversion script... (started at {0})" -f $downloadStartTime.ToString("HH:mm:ss"))
 
-$scriptUrl = "https://raw.githubusercontent.com/Get-Nerdio/SAP-on-Azure-Scripts-and-Utilities/refs/heads/main/Azure-NVMe-Utils/Azure-NVMe-Conversion.ps1"
+$scriptUrl = "https://raw.githubusercontent.com/Azure/SAP-on-Azure-Scripts-and-Utilities/refs/heads/main/Azure-NVMe-Utils/Azure-NVMe-Conversion.ps1"
 $localScriptPath = Join-Path $env:TEMP "Azure-NVMe-Conversion.ps1"
 
-Invoke-WebRequest -Uri $scriptUrl -OutFile $localScriptPath -ErrorAction Stop
-Write-Info ("Successfully downloaded script to: {0}" -f $localScriptPath)
+try {
+    Invoke-WebRequest -Uri $scriptUrl -OutFile $localScriptPath -ErrorAction Stop
+    Write-Info ("Successfully downloaded script to: {0}" -f $localScriptPath)
+} catch {
+    Write-Err ("Failed to download Microsoft's conversion script: {0}" -f $_.Exception.Message)
+    if (Test-Path $localScriptPath) {
+        Remove-Item $localScriptPath -Force -ErrorAction SilentlyContinue
+    }
+    throw
+}
 
 
 # -------- Identify VMs to process --------
@@ -159,72 +179,115 @@ if ($VMName -and -not [string]::IsNullOrWhiteSpace($VMName)) {
 }
 
 
-# -------- Filter by power state if requested --------
-if ($IgnoreRunningVMs) {
-    $powerStateFilterStartTime = Get-Date
-    Write-Info ("Filtering out running VMs... (started at {0})" -f $powerStateFilterStartTime.ToString("HH:mm:ss"))
-    
-    $filteredVMs = @()
-    $skippedVMs = @()
-    
-    foreach ($vm in $vmsToProcess) {
-        $powerInfo = Test-VMPowerState -VMName $vm.Name -ResourceGroup $ResourceGroupName
-        if ($powerInfo) {
-            if ($powerInfo.IsRunning) {
-                $skippedVMs += $vm
-                Write-Info ("  - SKIPPED: {0} (PowerState: {1})" -f $vm.Name, $powerInfo.PowerState)
-            } else {
-                $filteredVMs += $vm
-                Write-Info ("  - ELIGIBLE: {0} (PowerState: {1})" -f $vm.Name, $powerInfo.PowerState)
-            }
-        } else {
-            Write-Warn ("  - ERROR: Could not determine power state for {0}, skipping" -f $vm.Name)
+# -------- Filter/warn by power state --------
+$powerStateFilterStartTime = Get-Date
+$filterAction = if ($IgnoreRunningVMs) { "Filtering out running VMs" } else { "Checking power states (IgnoreRunningVMs=false — running VMs will be included and may fail conversion)" }
+Write-Info ("{0}... (started at {1})" -f $filterAction, $powerStateFilterStartTime.ToString("HH:mm:ss"))
+
+$filteredVMs = @()
+$skippedVMs = @()
+
+foreach ($vm in $vmsToProcess) {
+    $powerInfo = Test-VMPowerState -VMName $vm.Name -ResourceGroup $ResourceGroupName
+    if ($powerInfo) {
+        if ($powerInfo.IsRunning -and $IgnoreRunningVMs) {
             $skippedVMs += $vm
+            Write-Info ("  - SKIPPED: {0} (PowerState: {1})" -f $vm.Name, $powerInfo.PowerState)
+        } elseif ($powerInfo.IsRunning -and -not $IgnoreRunningVMs) {
+            $filteredVMs += $vm
+            Write-Warn ("  - INCLUDED (RUNNING): {0} — VM is running; conversion will likely fail unless the Microsoft script stops it" -f $vm.Name)
+        } else {
+            $filteredVMs += $vm
+            Write-Info ("  - ELIGIBLE: {0} (PowerState: {1})" -f $vm.Name, $powerInfo.PowerState)
         }
+    } else {
+        Write-Warn ("  - ERROR: Could not determine power state for {0}, skipping" -f $vm.Name)
+        $skippedVMs += $vm
     }
-    
-    $vmsToProcess = $filteredVMs
-    
-    Write-Info ("Power state filtering results:")
-    Write-Info ("  - Eligible VMs: {0}" -f $vmsToProcess.Count)
-    Write-Info ("  - Skipped VMs: {0}" -f $skippedVMs.Count)
-    
-    if ($vmsToProcess.Count -eq 0) {
-        Write-Warn "No VMs are eligible for processing after power state filtering"
-        return
-    }
-    
-    $powerStateFilterDuration = ((Get-Date) - $powerStateFilterStartTime).TotalSeconds
-    Write-Info ("Power state filtering completed in {0:F1}s" -f $powerStateFilterDuration)
 }
+
+$vmsToProcess = $filteredVMs
+
+Write-Info ("Power state check results:")
+Write-Info ("  - Eligible VMs: {0}" -f $vmsToProcess.Count)
+Write-Info ("  - Skipped VMs: {0}" -f $skippedVMs.Count)
+
+if ($vmsToProcess.Count -eq 0) {
+    Write-Warn "No VMs are eligible for processing after power state filtering"
+    return
+}
+
+$powerStateFilterDuration = ((Get-Date) - $powerStateFilterStartTime).TotalSeconds
+Write-Info ("Power state check completed in {0:F1}s" -f $powerStateFilterDuration)
 
 # -------- What-If mode --------
 if ($WhatIfMode) {
     $whatIfStartTime = Get-Date
     Write-Info ("=== WHAT-IF MODE: Changes that would be made === (started at {0})" -f $whatIfStartTime.ToString("HH:mm:ss"))
-    
+
+    $eligibleVMs = @()
+    $ineligibleVMs = @()
+
     foreach ($vm in $vmsToProcess) {
-        Write-Info ("Would convert VM '{0}':" -f $vm.Name)
+        Write-Info ("Checking VM '{0}':" -f $vm.Name)
         Write-Info ("  - Current Size: {0}" -f $vm.HardwareProfile.VmSize)
         Write-Info ("  - Target Size: {0}" -f $DestinationVMSize)
         Write-Info ("  - Controller: Current -> {0}" -f $NewControllerType)
         Write-Info ("  - Resource Group: {0}" -f $ResourceGroupName)
-        Write-Info ("  - Process: Stop VM -> Update OS settings -> Convert controller -> Resize -> Start")
+
+        $reasons = @()
+        try {
+            $vmFull = Get-AzVM -Name $vm.Name -ResourceGroupName $ResourceGroupName -Status -ErrorAction Stop
+
+            # Check SecurityType - Trusted Launch blocks NVMe conversion
+            $securityType = if ($vmFull.SecurityProfile) { $vmFull.SecurityProfile.SecurityType } else { $null }
+            if ($NewControllerType -eq 'NVMe' -and $securityType -eq 'TrustedLaunch') {
+                $reasons += "Trusted Launch VM — NVMe conversion is not supported"
+            }
+
+            if ($reasons.Count -eq 0) {
+                $eligibleVMs += $vm
+                Write-Info ("  - ELIGIBLE for conversion")
+                Write-Info ("  - Process: Stop VM -> Update OS settings -> Convert controller -> Resize -> Start")
+            } else {
+                $ineligibleVMs += $vm
+                foreach ($reason in $reasons) {
+                    Write-Warn ("  - INELIGIBLE: {0}" -f $reason)
+                }
+            }
+        } catch {
+            $ineligibleVMs += $vm
+            Write-Warn ("  - INELIGIBLE: Could not fetch VM details — {0}" -f $_.Exception.Message)
+        }
     }
-    
+
+    Write-Info ("")
+    Write-Info ("What-If eligibility summary:")
+    Write-Info ("  - Eligible: {0}" -f $eligibleVMs.Count)
+    Write-Info ("  - Ineligible: {0}" -f $ineligibleVMs.Count)
+
+    if ($ineligibleVMs.Count -gt 0) {
+        Write-Warn ("The following VMs would be skipped during actual execution:")
+        foreach ($vm in $ineligibleVMs) {
+            Write-Warn ("  - {0}" -f $vm.Name)
+        }
+    }
+
+    Write-Info ("")
     Write-Info ("Batch processing configuration:")
-    Write-Info ("  - Total VMs: {0}" -f $vmsToProcess.Count)
+    Write-Info ("  - Total eligible VMs: {0}" -f $eligibleVMs.Count)
     Write-Info ("  - Process in groups of: {0}" -f $ProcessInGroupsOf)
-    Write-Info ("  - Estimated groups: {0}" -f [Math]::Ceiling($vmsToProcess.Count / $ProcessInGroupsOf))
-    
+    Write-Info ("  - Estimated groups: {0}" -f [Math]::Ceiling($eligibleVMs.Count / $ProcessInGroupsOf))
+
     $whatIfDuration = ((Get-Date) - $whatIfStartTime).TotalSeconds
     Write-Info ("=== END WHAT-IF MODE === (took {0:F1}s)" -f $whatIfDuration)
     return
 }
 
 # -------- Process VMs --------
-$conversionStartTime = Get-Date
-Write-Info ("Starting VM conversions... (started at {0})" -f $conversionStartTime.ToString("HH:mm:ss"))
+try {
+    $conversionStartTime = Get-Date
+    Write-Info ("Starting VM conversions... (started at {0})" -f $conversionStartTime.ToString("HH:mm:ss"))
 
 # Create script block for parallel execution
 $ConversionScriptBlock = {
@@ -253,105 +316,85 @@ $ConversionScriptBlock = {
         Write-JobInfo ("Using Microsoft's script: {0}" -f $LocalScriptPath)
         
         # Get initial VM state for validation
-        $initialVM = Get-AzVM -Name $VM.Name -ResourceGroupName $ResourceGroupName -Status
+        $initialVM = Get-AzVM -Name $VM.Name -ResourceGroupName $ResourceGroupName -Status -ErrorAction Stop
         $initialPowerState = ($initialVM.Statuses | Where-Object { $_.Code -like 'PowerState/*' } | Select-Object -Last 1).Code
-        if ($initialPowerState -match 'deallocated') {
-            $StartVM = $false
-            Write-Output "Starting VM '{0}'..." -f $VM.Name
-            Start-AzVM -Name $VM.Name -ResourceGroupName $ResourceGroupName | Out-Null
-        }
-        else {
-            $StartVM = $true
-        }
-        $initialSize = (Get-AzVM -Name $VM.Name -ResourceGroupName $ResourceGroupName).HardwareProfile.VmSize
+        $initialSize = $initialVM.HardwareProfile.VmSize
+        $initialControllerType = $initialVM.StorageProfile.DiskControllerType
         
         Write-JobInfo ("Initial VM state - Size: {0}, PowerState: {1}" -f $initialSize, $initialPowerState)
         
-        # Run the conversion script and capture all output
+        # Run the conversion script and capture its output
         Write-JobInfo ("Calling Microsoft's NVMe conversion script...")
-        
-        # Execute Microsoft's script with proper parameters
-        # The script expects these exact parameter names
+
         $scriptArgs = @{
-            ResourceGroupName = $ResourceGroupName
-            VMName = $VM.Name
-            NewControllerType = $NewControllerType
-            VMSize = $DestinationVMSize
-            StartVM = $StartVM
-            FixOperatingSystemSettings = $true
+            ResourceGroupName      = $ResourceGroupName
+            VMName                 = $VM.Name
+            NewControllerType      = $NewControllerType
+            VMSize                 = $DestinationVMSize
+            StartVM                = $true
             IgnoreAzureModuleCheck = $true
         }
-        
-        Write-JobInfo ("Script arguments: {0}" -f ($scriptArgs -join ' '))
-        
+
+        Write-JobInfo ("Script arguments: ResourceGroupName={0}, VMName={1}, NewControllerType={2}, VMSize={3}, StartVM={4}, IgnoreAzureModuleCheck={5}" -f $scriptArgs.ResourceGroupName, $scriptArgs.VMName, $scriptArgs.NewControllerType, $scriptArgs.VMSize, $scriptArgs.StartVM, $scriptArgs.IgnoreAzureModuleCheck)
+
         try {
-            # Call the script using PowerShell's call operator with arguments
-            & $LocalScriptPath @scriptArgs
-            
+            # Capture all streams including Write-Host (stream 6) which the Microsoft script uses heavily
+            $conversionOutput = & $LocalScriptPath @scriptArgs *>&1
+
             Write-JobInfo ("Microsoft script execution completed")
-            
-            # Display the conversion script output
-            if ($conversionOutput) {
+
+            # Display the conversion script output (only if we captured something)
+            if ($conversionOutput -and $conversionOutput.Count -gt 0) {
                 Write-JobInfo ("Microsoft script output:")
                 foreach ($line in $conversionOutput) {
                     if ($line -and $line.ToString().Trim()) {
                         Write-JobInfo ("  $($line.ToString())")
                     }
                 }
-            } else {
-                Write-JobWarn ("No output received from Microsoft script")
             }
-            
+
         } catch {
             Write-JobErr ("Error executing Microsoft script: {0}" -f $_.Exception.Message)
+            Write-Error $_.Exception.Message
             throw
         }
         
         # Validate the conversion actually happened
         Write-JobInfo ("Validating conversion results...")
         Start-Sleep -Seconds 15  # Give Azure more time to update after script execution
-        
-        $finalVM = Get-AzVM -Name $VM.Name -ResourceGroupName $ResourceGroupName 
+
+        $finalVM = Get-AzVM -Name $VM.Name -ResourceGroupName $ResourceGroupName -ErrorAction Stop
         $finalSize = $finalVM.HardwareProfile.VmSize
-        
-        Write-JobInfo ("Final VM state - Size: {0}" -f $finalSize)
-        
-        # Check if conversion was successful
-        $conversionSuccessful = ($finalSize -eq $DestinationVMSize)
-        
-        if (-not $conversionSuccessful) {
-            Write-JobWarn ("Size validation failed: VM size is still '{0}', expected '{1}'" -f $finalSize, $DestinationVMSize)
-            
-            # Check for controller type change (this is what really matters for NVMe->SCSI conversion)
-            Write-JobInfo ("Checking storage controller type...")
-            try {
-                $vmDetails = Get-AzVM -Name $VM.Name -ResourceGroupName $ResourceGroupName
-                $controllerType = $vmDetails.StorageProfile.DiskControllerType
-                
-                Write-JobInfo ("Current disk controller type: {0}" -f $controllerType)
-                
-                if ($controllerType -eq "SCSI") {
-                    Write-JobInfo ("Controller successfully converted to SCSI! Size validation secondary.")
-                    $conversionSuccessful = $true
-                } else {
-                    Write-JobWarn ("Controller type is still: {0}" -f $controllerType)
-                }
-                
-                # Additional storage profile information
-                $storageProfile = $vmDetails.StorageProfile
-                if ($storageProfile) {
-                    Write-JobInfo ("Storage profile information:")
-                    Write-JobInfo ("  - OS Disk: {0}" -f $storageProfile.OsDisk.Name)
-                    Write-JobInfo ("  - Controller Type: {0}" -f $storageProfile.DiskControllerType)
-                    if ($storageProfile.DataDisks) {
-                        Write-JobInfo ("  - Data Disks: {0}" -f ($storageProfile.DataDisks.Count))
-                    }
-                }
-                
-            } catch {
-                Write-JobWarn ("Could not retrieve detailed VM information: {0}" -f $_.Exception.Message)
+        $finalControllerType = $finalVM.StorageProfile.DiskControllerType
+
+        Write-JobInfo ("Final VM state - Size: {0}, Controller: {1}" -f $finalSize, $finalControllerType)
+
+        # Primary check: controller type must have changed to the target
+        $controllerChanged = ($finalControllerType -eq $NewControllerType)
+
+        if ($controllerChanged) {
+            Write-JobInfo ("Controller type changed: {0} -> {1} (SUCCESS)" -f $initialControllerType, $NewControllerType)
+        } else {
+            Write-JobWarn ("Controller type did not change: still {0} (expected {1})" -f $finalControllerType, $NewControllerType)
+        }
+
+        # Secondary check: VM size should match destination (informational)
+        if ($finalSize -ne $DestinationVMSize) {
+            Write-JobWarn ("VM size is '{0}', expected '{1}' (may not match if conversion succeeded with same SKU family)" -f $finalSize, $DestinationVMSize)
+        }
+
+        # Additional storage profile information
+        $storageProfile = $finalVM.StorageProfile
+        if ($storageProfile) {
+            Write-JobInfo ("Storage profile:")
+            Write-JobInfo ("  - OS Disk: {0}" -f $storageProfile.OsDisk.Name)
+            Write-JobInfo ("  - Controller: {0}" -f $storageProfile.DiskControllerType)
+            if ($storageProfile.DataDisks) {
+                Write-JobInfo ("  - Data Disks: {0}" -f $storageProfile.DataDisks.Count)
             }
         }
+
+        $conversionSuccessful = $controllerChanged
         
         if ($conversionSuccessful) {
             $jobDuration = ((Get-Date) - $jobStartTime).TotalSeconds
@@ -368,7 +411,7 @@ $ConversionScriptBlock = {
             }
         } else {
             $jobDuration = ((Get-Date) - $jobStartTime).TotalSeconds
-            $errorMessage = "Conversion validation failed: VM size is still '{0}', expected '{1}'" -f $finalSize, $DestinationVMSize
+            $errorMessage = "Conversion validation failed: controller type is '{0}', expected '{1}'" -f $finalControllerType, $NewControllerType
             Write-JobErr ("Conversion failed after {0:F1}s: {1}" -f $jobDuration, $errorMessage)
             
             return @{
@@ -385,9 +428,10 @@ $ConversionScriptBlock = {
     } catch {
         $jobDuration = ((Get-Date) - $jobStartTime).TotalSeconds
         $errorMessage = $_.Exception.Message
-        
+
         Write-JobErr ("Conversion failed after {0:F1}s: {1}" -f $jobDuration, $errorMessage)
-        
+        Write-Error $_.Exception.Message
+
         return @{
             Success = $false
             VMName = $VM.Name
@@ -485,8 +529,8 @@ Write-Info ("=== CONVERSION SUMMARY ===")
 Write-Info ("Total execution time: {0:F1}s" -f $totalDuration)
 Write-Info ("Total VMs processed: {0}" -f $allResults.Count)
 
-$successfulConversions = $allResults | Where-Object { $_.Success -eq $true }
-$failedConversions = $allResults | Where-Object { $_.Success -eq $false }
+$successfulConversions = @($allResults | Where-Object { $_.Success -eq $true })
+$failedConversions = @($allResults | Where-Object { $_.Success -eq $false })
 
 Write-Info ("Successful conversions: {0}" -f $successfulConversions.Count)
 Write-Info ("Failed conversions: {0}" -f $failedConversions.Count)
@@ -506,14 +550,18 @@ if ($failedConversions.Count -gt 0) {
     }
 }
 
-Write-Info ("NVMe to SCSI conversion process completed at {0}" -f (Get-Date).ToString("yyyy-MM-dd HH:mm:ss"))
+Write-Info ("Disk controller conversion process completed at {0}" -f (Get-Date).ToString("yyyy-MM-dd HH:mm:ss"))
 
-# Clean up downloaded script
-try {
-    if (Test-Path $localScriptPath) {
-        Remove-Item $localScriptPath -Force
-        Write-Info ("Cleaned up downloaded script file: {0}" -f $localScriptPath)
-    }
 } catch {
-    Write-Warn ("Failed to clean up script file: {0}" -f $_.Exception.Message)
+    Write-Error $_.Exception.Message
+    throw
+} finally {
+    try {
+        if (Test-Path $localScriptPath) {
+            Remove-Item $localScriptPath -Force
+            Write-Info ("Cleaned up downloaded script file: {0}" -f $localScriptPath)
+        }
+    } catch {
+        Write-Warn ("Failed to clean up script file: {0}" -f $_.Exception.Message)
+    }
 }
