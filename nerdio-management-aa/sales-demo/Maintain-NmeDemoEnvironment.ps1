@@ -41,6 +41,14 @@
   PREREQUISITES
   =============
 
+  NME App Service TLS Requirement:
+    This runbook runs in an Azure Automation PS5.1 sandbox, which uses .NET 4.x and supports
+    TLS 1.2 at most. The NME App Service must have its minimum TLS version set to 1.2 (not 1.3)
+    or all Invoke-RestMethod calls to the NME API will fail with "Could not create SSL/TLS
+    secure channel." To verify or fix:
+      az webapp show --name <nme-app> --resource-group <rg> --query siteConfig.minTlsVersion
+      az webapp update --name <nme-app> --resource-group <rg> --set siteConfig.minTlsVersion=1.2
+
   Automation Account Modules:
     - Az.Accounts
     - Az.Compute              (image reads, tag operations)
@@ -172,18 +180,21 @@ function Wait-NmeJob {
     param([string]$JobId, [string]$Description)
     $timeoutSeconds = 600
     $elapsed = 0
-    $job = Invoke-RestMethod "$NmeUri/api/v1/job/$JobId" -Headers $NmeHeaders    while ($job.jobStatus -in @('Pending', 'InProgress', 'Running')) {
+    $job = Invoke-RestMethod "$NmeUri/api/v1/job/$JobId" -Headers $NmeHeaders
+    while ($job.jobStatus -in @('Pending', 'InProgress', 'Running')) {
         if ($elapsed -ge $timeoutSeconds) {
             throw "Timeout waiting for $Description (job $JobId) after ${timeoutSeconds}s"
         }
         Write-Log "Waiting for $Description to complete (${elapsed}s elapsed)..."
         Start-Sleep -Seconds 10
         $elapsed += 10
-        $job = Invoke-RestMethod "$NmeUri/api/v1/job/$JobId" -Headers $NmeHeaders    }
+        $job = Invoke-RestMethod "$NmeUri/api/v1/job/$JobId" -Headers $NmeHeaders
+    }
     if ($job.jobStatus -eq 'Failed') {
         $taskDetail = ''
         try {
-            $tasks = Invoke-RestMethod "$NmeUri/api/v1/job/$JobId/tasks" -Headers $NmeHeaders            $taskDetail = ($tasks | ForEach-Object { "$($_.name): $($_.status) — $($_.resultPlain)" }) -join '; '
+            $tasks = Invoke-RestMethod "$NmeUri/api/v1/job/$JobId/tasks" -Headers $NmeHeaders
+            $taskDetail = ($tasks | ForEach-Object { "$($_.name): $($_.status) — $($_.resultPlain)" }) -join '; '
         } catch {}
         throw "NME job failed: $Description. Tasks: $taskDetail"
     }
@@ -205,8 +216,17 @@ function Invoke-NmeApi {
     try {
         return Invoke-RestMethod @params
     } catch {
-        # Attach the response body to the exception so callers can log detail
+        # Attach the response body to the exception so callers can log detail.
         $detail = $_.ErrorDetails.Message
+        # PS 5.1 often leaves ErrorDetails empty — read the response stream directly.
+        if (-not $detail -and $_.Exception.Response) {
+            try {
+                $respStream = $_.Exception.Response.GetResponseStream()
+                $reader     = New-Object System.IO.StreamReader($respStream)
+                $detail     = $reader.ReadToEnd()
+                $reader.Close()
+            } catch {}
+        }
         if ($detail) {
             throw [System.Exception]::new("$($_.Exception.Message) — $detail", $_.Exception)
         }
@@ -1546,21 +1566,56 @@ foreach ($entry in $DesiredState.hostPools) {
             }
             Write-Log "WVD props set on '$hpName'."
 
-            # Set auto-scale config directly on HP (local rules, no profile assignment)
+            # Set auto-scale config directly on HP (local rules, no profile assignment).
+            # Sequence mirrors the NME PowerShell module's working flow:
+            #   1. POST /auto-scale to explicitly convert the static pool to dynamic
+            #      (ConvertTo-NmeDynamicHostPool). NME does NOT reliably auto-convert —
+            #      without this POST the config never becomes queryable.
+            #   2. GET the now-existing config.
+            #   3. Overwrite the VM template prefix/size and capacity with auto-scale
+            #      DISABLED, then PUT (Set-NmeHostPoolAutoScaleConfig).
+            #   4. Enable auto-scale only after the correct prefix is locked in.
             if ($entry.autoScale) {
                 try {
-                    # Try GET; if 404 (HP is static) convert to dynamic first
-                    $asConfig = $null
-                    try { $asConfig = Invoke-NmeApi -Method GET -Uri "$hpUrl/auto-scale" } catch {}
-                    if (-not $asConfig) {
-                        Write-Log "Converting '$hpName' from static to dynamic (auto-scale)..."
-                        Invoke-NmeApi -Method POST -Uri "$hpUrl/auto-scale" | Out-Null
-                        $asConfig = Invoke-NmeApi -Method GET -Uri "$hpUrl/auto-scale"
+                    # Step 1 — explicit conversion to dynamic. Wait for the conversion job
+                    # so the auto-scale config exists before we GET it.
+                    Write-Log "Converting '$hpName' to dynamic auto-scale..."
+                    try {
+                        $convertResult = Invoke-NmeApi -Method POST -Uri "$hpUrl/auto-scale"
+                        if ($convertResult.job.id) {
+                            Wait-NmeJob -JobId $convertResult.job.id -Description "convert '$hpName' to dynamic auto-scale"
+                        }
+                    } catch {
+                        # If NME already auto-converted, the POST returns 'already dynamic' — fine.
+                        if ($_.Exception.Message -notmatch 'already dynamic') { throw }
+                        Write-Log "Pool '$hpName' was already dynamic. Continuing."
                     }
 
-                    # Step 1 — PUT all desired settings with auto-scale DISABLED.
-                    # This prevents the default post-conversion config (e.g. capacity=5, random vmName)
-                    # from triggering VM provisioning before our settings are in place.
+                    # Step 2 — GET the config. Conversion is complete, but allow a short
+                    # validated retry in case NME briefly returns an error body
+                    # ({"errorMessage":"..."}) immediately after the job finishes.
+                    $asConfig = $null
+                    for ($asRetry = 0; $asRetry -lt 6 -and -not $asConfig; $asRetry++) {
+                        try { $asConfig = Invoke-NmeApi -Method GET -Uri "$hpUrl/auto-scale" } catch {}
+                        if ($asConfig -and $asConfig.PSObject.Properties.Name -notcontains 'isEnabled') { $asConfig = $null }
+                        if (-not $asConfig) { Start-Sleep -Seconds 10 }
+                    }
+                    if (-not $asConfig) { throw "Auto-scale config unavailable on '$hpName' after conversion." }
+
+                    # NME enables auto-scale with a random VM prefix on conversion. Disable it
+                    # before we overwrite the template so no VMs provision with the wrong name.
+                    if ($asConfig.isEnabled) {
+                        try {
+                            $disableResult = Invoke-NmeApi -Method PATCH -Uri "$hpUrl/auto-scale" -Body (@{ isEnabled = $false } | ConvertTo-Json)
+                            if ($disableResult.job.id) {
+                                Wait-NmeJob -JobId $disableResult.job.id -Description "disable auto-scale on '$hpName' before template fix"
+                            }
+                        } catch {
+                            if ($_.Exception.Message -notmatch 'already disabled') { throw }
+                        }
+                    }
+
+                    # Step 3 — overwrite desired settings (auto-scale DISABLED) and PUT.
                     $asConfig.isEnabled = $false
                     if ($entry.poolType -ne 'Personal') {
                         $asConfig.hostPoolCapacity    = $entry.autoScale.hostPoolCapacity
@@ -1572,7 +1627,21 @@ foreach ($entry in $DesiredState.hostPools) {
                     }
                     if ($entry.autoScale.scalingMode)       { $asConfig.scalingMode       = $entry.autoScale.scalingMode }
                     if ($entry.autoScale.autoScaleCriteria) { $asConfig.autoScaleCriteria = $entry.autoScale.autoScaleCriteria }
-                    $asResult = Invoke-NmeApi -Method PUT -Uri "$hpUrl/auto-scale" -Body ($asConfig | ConvertTo-Json -Depth 20)
+                    $asBody = $asConfig | ConvertTo-Json -Depth 20
+                    # On pooled pools NME briefly rejects a PUT that sets hostPoolCapacity/
+                    # minActiveHostsCount in the first ~30-60s after conversion. Retry with
+                    # 15s backoff (8 attempts = up to 2 min).
+                    $asResult = $null
+                    for ($putRetry = 0; $putRetry -lt 8 -and -not $asResult; $putRetry++) {
+                        try {
+                            $asResult = Invoke-NmeApi -Method PUT -Uri "$hpUrl/auto-scale" -Body $asBody
+                        } catch {
+                            if ($putRetry -lt 7) {
+                                Write-Log "Auto-scale PUT on '$hpName' rejected (attempt $($putRetry+1)/8): $($_.Exception.Message). Retrying in 15s..."
+                                Start-Sleep -Seconds 15
+                            } else { throw }
+                        }
+                    }
                     if ($asResult.job.id) {
                         Wait-NmeJob -JobId $asResult.job.id -Description "configure auto-scale on '$hpName'"
                     }
@@ -1652,11 +1721,36 @@ foreach ($entry in $DesiredState.hostPools) {
             try {
                 $liveAs = $null
                 try { $liveAs = Invoke-NmeApi -Method GET -Uri "$hpUrl/auto-scale" } catch {}
+                if ($liveAs -and $liveAs.PSObject.Properties.Name -notcontains 'isEnabled') { $liveAs = $null }
                 if (-not $liveAs) {
-                    # HP is static — convert to dynamic first
-                    Write-Log "Converting '$hpName' from static to dynamic (auto-scale)..."
-                    Invoke-NmeApi -Method POST -Uri "$hpUrl/auto-scale" | Out-Null
-                    $liveAs = Invoke-NmeApi -Method GET -Uri "$hpUrl/auto-scale"
+                    Write-Log "Auto-scale not yet available on '$hpName'; issuing conversion POST..."
+                    try {
+                        $convertResult = Invoke-NmeApi -Method POST -Uri "$hpUrl/auto-scale"
+                        if ($convertResult.job.id) {
+                            Wait-NmeJob -JobId $convertResult.job.id -Description "convert '$hpName' to dynamic auto-scale"
+                        }
+                    } catch {
+                        if ($_.Exception.Message -notmatch 'already dynamic') { throw }
+                        Write-Log "Pool '$hpName' is already dynamic (NME auto-converted). Continuing."
+                    }
+                    # Immediately disable so the random prefix NME assigns on conversion cannot
+                    # trigger VM provisioning before the corrective PUT below runs.
+                    try {
+                        $disableResult = Invoke-NmeApi -Method PATCH -Uri "$hpUrl/auto-scale" -Body (@{ isEnabled = $false } | ConvertTo-Json)
+                        if ($disableResult.job.id) {
+                            Wait-NmeJob -JobId $disableResult.job.id -Description "disable auto-scale on '$hpName' before template fix"
+                        }
+                    } catch {
+                        if ($_.Exception.Message -notmatch 'already disabled') { throw }
+                    }
+                    # Validated retry — NME can briefly return an error body after conversion.
+                    $liveAs = $null
+                    for ($asRetry = 0; $asRetry -lt 6 -and -not $liveAs; $asRetry++) {
+                        try { $liveAs = Invoke-NmeApi -Method GET -Uri "$hpUrl/auto-scale" } catch {}
+                        if ($liveAs -and $liveAs.PSObject.Properties.Name -notcontains 'isEnabled') { $liveAs = $null }
+                        if (-not $liveAs) { Start-Sleep -Seconds 10 }
+                    }
+                    if (-not $liveAs) { throw "Auto-scale config unavailable on '$hpName' after conversion." }
                 }
                 if (Compare-HpAutoScale -Live $liveAs -Desired $entry.autoScale -DesiredPrefix $hpVmPrefixEnforce -PoolType $entry.poolType) {
                     Write-Log "Auto-scale config drifted on '$hpName' (isEnabled=$($liveAs.isEnabled), vmSize=$($liveAs.vmTemplate.size), prefix='$($liveAs.vmTemplate.prefix)', capacity=$($liveAs.hostPoolCapacity), minActive=$($liveAs.minActiveHostsCount))."
