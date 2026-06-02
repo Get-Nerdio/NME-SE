@@ -151,7 +151,7 @@
         "isEnabled": true,
         "vmSize": "Standard_D2s_v3",
         "vmNamePrefix": "mspooled",
-        "hostPoolCapacity": 3,
+        "hostPoolCapacity": 1,
         "minActiveHostsCount": 1
       }
     },
@@ -172,7 +172,7 @@
         "isEnabled": true,
         "vmSize": "Standard_D2s_v3",
         "vmNamePrefix": "remoteapp",
-        "hostPoolCapacity": 3,
+        "hostPoolCapacity": 1,
         "minActiveHostsCount": 1
       }
     },
@@ -193,7 +193,7 @@
         "isEnabled": true,
         "vmSize": "Standard_D2s_v3",
         "vmNamePrefix": "supool",
-        "hostPoolCapacity": 3,
+        "hostPoolCapacity": 1,
         "minActiveHostsCount": 1
       }
     },
@@ -218,7 +218,7 @@
         "isEnabled": true,
         "vmSize": "Standard_D2s_v3",
         "vmNamePrefix": "personal",
-        "hostPoolCapacity": 3,
+        "hostPoolCapacity": 1,
         "minActiveHostsCount": 0
       }
     }
