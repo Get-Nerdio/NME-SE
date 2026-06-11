@@ -14,14 +14,15 @@
   },
   "vnets": [
     {
-      "networkName": "nme-demo-vnet",
+      "networkName": "nme-demo-vnet-scus",
       "subnetName": "avd"
     }
   ],
   "storageAccounts": [
     {
       "accountName": "nme26entrasa",
-      "shareName": "profiles"
+      "shareName": "profiles",
+      "entraKerberos": true
     },
     {
       "accountName": "nme26adsa",

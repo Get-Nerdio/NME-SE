@@ -436,6 +436,35 @@ function Confirm-ArmTag {
     }
 }
 
+function Confirm-EntraKerberos {
+    <#
+    .SYNOPSIS
+      Ensures Azure AD (Entra ID) Kerberos is enabled on a storage account.
+      Required for FSLogix configs that point at Entra-joined storage — NME rejects
+      host pool creation against such storage if the account is not Entra-joined.
+      Idempotent: skips if already enabled. Self-heals if it was disabled.
+    #>
+    param([string]$ResourceGroup, [string]$AccountName)
+    try {
+        $sa = Get-AzStorageAccount -ResourceGroupName $ResourceGroup -Name $AccountName -ErrorAction Stop
+        $current = $sa.AzureFilesIdentityBasedAuth.DirectoryServiceOptions
+        if ($current -eq 'AADKERB') {
+            Write-Log "Entra ID Kerberos already enabled on '$AccountName'."
+            return
+        }
+        Write-Log "Entra ID Kerberos on '$AccountName' is '$current', expected 'AADKERB'. Enabling..."
+        if (-not $WhatIf) {
+            Set-AzStorageAccount -ResourceGroupName $ResourceGroup -Name $AccountName `
+                -EnableAzureActiveDirectoryKerberosForFile $true -ErrorAction Stop | Out-Null
+            Write-Log "Entra ID Kerberos enabled on '$AccountName'."
+        } else {
+            Write-Log "[WHATIF] Would enable Entra ID Kerberos on '$AccountName'."
+        }
+    } catch {
+        Add-NonFatalError "Failed to enable Entra ID Kerberos on '$AccountName': $($_.Exception.Message)"
+    }
+}
+
 function Get-NmeSqlConnection {
     <#
     .SYNOPSIS
@@ -1259,6 +1288,13 @@ if ($DesiredState.storageAccounts) {
                         Write-Log "File share '$($entry.shareName)' created (100 GiB)."
                     }
 
+                    # Enable Entra ID Kerberos if requested — the account create block above
+                    # does not set it, so a torn-down/rebuilt Entra-joined account would
+                    # otherwise come back without it and break host pool creation.
+                    if ($entry.entraKerberos) {
+                        Confirm-EntraKerberos -ResourceGroup $saEffRg -AccountName $entry.accountName
+                    }
+
                     # Link the share to NME
                     $linkUrl = "$NmeUri/api/v1/storage/azure-files/$saEffSub/$saEffRg/$($entry.accountName)/$($entry.shareName)/link"
                     Invoke-NmeApi -Method POST -Uri $linkUrl | Out-Null
@@ -1272,6 +1308,10 @@ if ($DesiredState.storageAccounts) {
             if ($DemoTagName) {
                 $saArmId = "/subscriptions/$saEffSub/resourceGroups/$saEffRg/providers/Microsoft.Storage/storageAccounts/$($entry.accountName)"
                 Confirm-ArmTag -ResourceId $saArmId -TagName $DemoTagName -TagValue $DemoTagValue
+            }
+            # Confirm Entra ID Kerberos on already-linked accounts too (self-heal if disabled).
+            if ($entry.entraKerberos) {
+                Confirm-EntraKerberos -ResourceGroup $saEffRg -AccountName $entry.accountName
             }
         }
     }
