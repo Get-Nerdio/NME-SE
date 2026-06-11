@@ -1078,6 +1078,23 @@ if ($null -ne $DesiredState.profiles.cclConfigs) {
                     Write-Log "CCL config '$($entry.displayName)' created."
                     $liveCcl = Invoke-NmeApi -Method GET -Uri "$NmeUri/api/v1/user-cost-attribution/configuration"
                     if (-not $liveCcl) { $liveCcl = @() }
+                    # The create API doesn't accept isDefault — apply it via PATCH on the same
+                    # run so the new config is default immediately. NME enforces a single
+                    # default, so this demotes whatever was previously default.
+                    if ($entry.isDefault -eq $true) {
+                        $newCcl = $liveCcl | Where-Object { $_.displayName -ieq $entry.displayName } | Select-Object -First 1
+                        if ($newCcl -and $newCcl.isDefault -ne $true) {
+                            try {
+                                $defResult = Invoke-NmeApi -Method PATCH -Uri "$NmeUri/api/v1/user-cost-attribution/configuration/$($newCcl.id)" -Body (@{ isDefault = $true } | ConvertTo-Json)
+                                if ($defResult.job.id) {
+                                    Wait-NmeJob -JobId $defResult.job.id -Description "set CCL config '$($entry.displayName)' as default"
+                                }
+                                Write-Log "CCL config '$($entry.displayName)' set as default."
+                            } catch {
+                                Add-NonFatalError "Failed to set CCL config '$($entry.displayName)' as default: $($_.Exception.Message)"
+                            }
+                        }
+                    }
                 } catch {
                     Add-NonFatalError "Failed to create CCL config '$($entry.displayName)': $($_.Exception.Message)"
                 }
