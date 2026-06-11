@@ -208,7 +208,7 @@
       "description": "Personal desktop host pool with automatic assignment",
       "users": [],
       "groups": [
-        "SE - Sub Owners"
+        "SE - Sub Owners "
       ],
       "poolType": "Personal",
       "personalAssignmentType": "Automatic",
