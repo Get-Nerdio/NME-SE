@@ -9,7 +9,7 @@
   },
   "workspace": {
     "name": "sales-demo-workspace",
-    "location": "centralus",
+    "location": "southcentralus",
     "friendlyName": "NME Sales Demo"
   },
   "vnets": [
@@ -22,11 +22,13 @@
     {
       "accountName": "nme26entrasa",
       "shareName": "profiles",
-      "entraKerberos": true
+      "entraKerberos": true,
+      "location": "southcentralus"
     },
     {
       "accountName": "nme26adsa",
-      "shareName": "profiles"
+      "shareName": "profiles",
+      "location": "southcentralus"
     }
   ],
   "images": [

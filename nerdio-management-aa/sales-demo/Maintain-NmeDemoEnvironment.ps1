@@ -1256,12 +1256,16 @@ if ($DesiredState.storageAccounts) {
                     $azSa = Get-AzStorageAccount -ResourceGroupName $saEffRg `
                         -Name $entry.accountName -ErrorAction SilentlyContinue
                     if (-not $azSa) {
-                        Write-Log "Storage account '$($entry.accountName)' not found in Azure. Creating in '$saEffRg'..."
                         $rgObj = Get-AzResourceGroup -Name $saEffRg -ErrorAction Stop
+                        # Storage region: explicit entry.location wins, else the RG's region.
+                        # Lets storage co-locate with session hosts even when the RG is elsewhere
+                        # (an RG's location only sets metadata placement, not resource region).
+                        $saLocation = if ($entry.location) { $entry.location } else { $rgObj.Location }
+                        Write-Log "Storage account '$($entry.accountName)' not found in Azure. Creating in '$saEffRg' ($saLocation)..."
                         $saCreateParams = @{
                             ResourceGroupName     = $saEffRg
                             Name                  = $entry.accountName
-                            Location              = $rgObj.Location
+                            Location              = $saLocation
                             SkuName               = 'Standard_LRS'
                             Kind                  = 'StorageV2'
                             AllowBlobPublicAccess = $false
@@ -1270,7 +1274,7 @@ if ($DesiredState.storageAccounts) {
                         }
                         if ($DemoTagName) { $saCreateParams['Tag'] = @{ $DemoTagName = $DemoTagValue } }
                         $azSa = New-AzStorageAccount @saCreateParams
-                        Write-Log "Storage account '$($entry.accountName)' created (Standard_LRS, $($rgObj.Location))."
+                        Write-Log "Storage account '$($entry.accountName)' created (Standard_LRS, $saLocation)."
                     }
 
                     # Ensure the file share exists — create it if not
