@@ -133,6 +133,9 @@
       {
         "displayName": "NME Demo Environment",
         "defaultReportType": "Proportional",
+        "subscriptionsIds": [
+          "5d4206f2-8af2-479a-b7f9-5fb434457d5f"
+        ],
         "isDefault": true
       }
     ]
