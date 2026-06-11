@@ -136,6 +136,9 @@
         "subscriptionsIds": [
           "5d4206f2-8af2-479a-b7f9-5fb434457d5f"
         ],
+        "workspaceIds": [
+          "/subscriptions/5d4206f2-8af2-479a-b7f9-5fb434457d5f/resourceGroups/nme-demo-26h1-app-rg/providers/Microsoft.OperationalInsights/workspaces/nme26h1-law-572vsvtgsfozs"
+        ],
         "isDefault": true
       }
     ]
