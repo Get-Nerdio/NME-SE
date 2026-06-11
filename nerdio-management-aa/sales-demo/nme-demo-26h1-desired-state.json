@@ -132,6 +132,7 @@
     "cclConfigs": [
       {
         "displayName": "NME Demo Environment",
+        "defaultReportType": "Proportional",
         "isDefault": true
       }
     ]
