@@ -242,7 +242,7 @@
         "minActiveHostsCount": 0,
         "autoGrow": {
           "unit": "Count",
-          "unassignedThreshold": 1
+          "unassignedThreshold": 2
         }
       }
     }
