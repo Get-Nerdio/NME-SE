@@ -439,29 +439,62 @@ function Confirm-ArmTag {
 function Confirm-EntraKerberos {
     <#
     .SYNOPSIS
-      Ensures Azure AD (Entra ID) Kerberos is enabled on a storage account.
-      Required for FSLogix configs that point at Entra-joined storage — NME rejects
-      host pool creation against such storage if the account is not Entra-joined.
-      Idempotent: skips if already enabled. Self-heals if it was disabled.
+      Ensures Azure AD (Entra ID) Kerberos is enabled on a storage account and that
+      the NMW_APPLICATION_ID tag is set to the storage account's Entra service principal
+      app ID. Both are required for NME to use Entra-joined Azure Files for FSLogix.
+      Idempotent: skips steps that are already correct. Self-heals drift.
     #>
     param([string]$ResourceGroup, [string]$AccountName)
+
+    # --- Step 1: Ensure AADKERB is enabled ---
     try {
         $sa = Get-AzStorageAccount -ResourceGroupName $ResourceGroup -Name $AccountName -ErrorAction Stop
         $current = $sa.AzureFilesIdentityBasedAuth.DirectoryServiceOptions
         if ($current -eq 'AADKERB') {
             Write-Log "Entra ID Kerberos already enabled on '$AccountName'."
-            return
-        }
-        Write-Log "Entra ID Kerberos on '$AccountName' is '$current', expected 'AADKERB'. Enabling..."
-        if (-not $WhatIf) {
-            Set-AzStorageAccount -ResourceGroupName $ResourceGroup -Name $AccountName `
-                -EnableAzureActiveDirectoryKerberosForFile $true -ErrorAction Stop | Out-Null
-            Write-Log "Entra ID Kerberos enabled on '$AccountName'."
         } else {
-            Write-Log "[WHATIF] Would enable Entra ID Kerberos on '$AccountName'."
+            Write-Log "Entra ID Kerberos on '$AccountName' is '$current', expected 'AADKERB'. Enabling..."
+            if (-not $WhatIf) {
+                Set-AzStorageAccount -ResourceGroupName $ResourceGroup -Name $AccountName `
+                    -EnableAzureActiveDirectoryKerberosForFile $true -ErrorAction Stop | Out-Null
+                Write-Log "Entra ID Kerberos enabled on '$AccountName'."
+                # Re-fetch so the tag step below works on current state.
+                $sa = Get-AzStorageAccount -ResourceGroupName $ResourceGroup -Name $AccountName -ErrorAction Stop
+            } else {
+                Write-Log "[WHATIF] Would enable Entra ID Kerberos on '$AccountName'."
+            }
         }
     } catch {
         Add-NonFatalError "Failed to enable Entra ID Kerberos on '$AccountName': $($_.Exception.Message)"
+        return
+    }
+
+    # --- Step 2: Ensure NMW_APPLICATION_ID tag matches the storage account's Entra service principal ---
+    # When AADKERB is enabled, Azure registers a service principal whose display name matches
+    # the storage account name. NME uses the NMW_APPLICATION_ID tag to locate that principal.
+    if ($WhatIf) {
+        Write-Log "[WHATIF] Would verify NMW_APPLICATION_ID tag on '$AccountName' (from Entra service principal)."
+        return
+    }
+    try {
+        $sp = Get-AzADServicePrincipal -DisplayName $AccountName -ErrorAction SilentlyContinue |
+              Where-Object { $_.DisplayName -eq $AccountName } |
+              Select-Object -First 1
+        if (-not $sp) {
+            Add-NonFatalError "Could not find Entra ID service principal for '$AccountName' — NMW_APPLICATION_ID tag not set. Enable Entra Kerberos first or wait for propagation."
+            return
+        }
+        $appId        = $sp.AppId
+        $currentTagVal = $sa.Tags['NMW_APPLICATION_ID']
+        if ($currentTagVal -eq $appId) {
+            Write-Log "Tag 'NMW_APPLICATION_ID' already correct on '$AccountName' ($appId)."
+        } else {
+            Write-Log "Setting tag 'NMW_APPLICATION_ID'='$appId' on '$AccountName'..."
+            Update-AzTag -ResourceId $sa.Id -Tag @{ NMW_APPLICATION_ID = $appId } -Operation Merge -ErrorAction Stop | Out-Null
+            Write-Log "Tag 'NMW_APPLICATION_ID' set on '$AccountName'."
+        }
+    } catch {
+        Add-NonFatalError "Failed to set NMW_APPLICATION_ID tag on '$AccountName': $($_.Exception.Message)"
     }
 }
 
