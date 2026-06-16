@@ -239,7 +239,11 @@
         "vmSize": "Standard_D2s_v3",
         "vmNamePrefix": "personal",
         "hostPoolCapacity": 3,
-        "minActiveHostsCount": 0
+        "minActiveHostsCount": 0,
+        "autoGrow": {
+          "unit": "Count",
+          "unassignedThreshold": 1
+        }
       }
     }
   ]

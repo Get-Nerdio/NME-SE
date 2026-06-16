@@ -361,6 +361,13 @@ function Compare-HpAutoScale {
     if ($DesiredPrefix               -and $Live.vmTemplate.prefix -ne $DesiredPrefix)     { return $true }
     if ($null -ne $Desired.scalingMode       -and $Live.scalingMode       -ne $Desired.scalingMode)       { return $true }
     if ($null -ne $Desired.autoScaleCriteria -and $Live.autoScaleCriteria -ne $Desired.autoScaleCriteria) { return $true }
+    if ($Desired.autoGrow) {
+        $liveGrow    = $Live.autoScaleTriggers | Where-Object { $_.triggerType -eq 'PersonalAutoGrow' } | Select-Object -First 1
+        $desiredUnit = if ($Desired.autoGrow.unit -eq 'Percent') { 0 } else { 1 }
+        if (-not $liveGrow)                                                                        { return $true }
+        if ($liveGrow.personalAutoGrow.unit               -ne $desiredUnit)                       { return $true }
+        if ($liveGrow.personalAutoGrow.unassignedThreshold -ne $Desired.autoGrow.unassignedThreshold) { return $true }
+    }
     return $false
 }
 
@@ -1886,6 +1893,23 @@ foreach ($entry in $DesiredState.hostPools) {
                         }
                         if ($null -ne $entry.autoScale.scalingMode)       { $liveAs.scalingMode       = $entry.autoScale.scalingMode }
                         if ($null -ne $entry.autoScale.autoScaleCriteria) { $liveAs.autoScaleCriteria = $entry.autoScale.autoScaleCriteria }
+                        if ($entry.autoScale.autoGrow -and $entry.poolType -eq 'Personal') {
+                            $desiredUnit = if ($entry.autoScale.autoGrow.unit -eq 'Percent') { 0 } else { 1 }
+                            if (-not $liveAs.autoScaleTriggers) { $liveAs.autoScaleTriggers = @() }
+                            $growTrigger = $liveAs.autoScaleTriggers | Where-Object { $_.triggerType -eq 'PersonalAutoGrow' } | Select-Object -First 1
+                            if ($growTrigger) {
+                                $growTrigger.personalAutoGrow.unit                = $desiredUnit
+                                $growTrigger.personalAutoGrow.unassignedThreshold = $entry.autoScale.autoGrow.unassignedThreshold
+                            } else {
+                                $liveAs.autoScaleTriggers += [PSCustomObject]@{
+                                    triggerType      = 'PersonalAutoGrow'
+                                    personalAutoGrow = [PSCustomObject]@{
+                                        unit                = $desiredUnit
+                                        unassignedThreshold = $entry.autoScale.autoGrow.unassignedThreshold
+                                    }
+                                }
+                            }
+                        }
                         $asResult = Invoke-NmeApi -Method PUT -Uri "$hpUrl/auto-scale" -Body ($liveAs | ConvertTo-Json -Depth 20)
                         if ($asResult.job.id) {
                             Wait-NmeJob -JobId $asResult.job.id -Description "update auto-scale config on '$hpName'"
