@@ -1910,7 +1910,9 @@ foreach ($entry in $DesiredState.hostPools) {
                                 }
                             }
                         }
-                        $asResult = Invoke-NmeApi -Method PUT -Uri "$hpUrl/auto-scale" -Body ($liveAs | ConvertTo-Json -Depth 20)
+                        $hasPersonalAutoGrow = $liveAs.autoScaleTriggers | Where-Object { $_.triggerType -eq 'PersonalAutoGrow' }
+                        $asPutUri = if ($hasPersonalAutoGrow) { "$hpUrl/auto-scale?multiTriggers=true" } else { "$hpUrl/auto-scale" }
+                        $asResult = Invoke-NmeApi -Method PUT -Uri $asPutUri -Body ($liveAs | ConvertTo-Json -Depth 20)
                         if ($asResult.job.id) {
                             Wait-NmeJob -JobId $asResult.job.id -Description "update auto-scale config on '$hpName'"
                         }
@@ -2305,7 +2307,8 @@ if (-not $SkipSessionHostCheck) {
                         if (-not $liveAs.isEnabled) {
                             Write-Log "Auto-scale is disabled on '$hpName'. Re-enabling..."
                             $liveAs.isEnabled = $true
-                            Invoke-NmeApi -Method PUT -Uri "$hpUrl/auto-scale" -Body ($liveAs | ConvertTo-Json -Depth 20) | Out-Null
+                            $reEnableUri = if ($liveAs.autoScaleTriggers | Where-Object { $_.triggerType -eq 'PersonalAutoGrow' }) { "$hpUrl/auto-scale?multiTriggers=true" } else { "$hpUrl/auto-scale" }
+                            Invoke-NmeApi -Method PUT -Uri $reEnableUri -Body ($liveAs | ConvertTo-Json -Depth 20) | Out-Null
                             Write-Log "Auto-scale re-enabled on '$hpName'."
                         }
                     } catch {
