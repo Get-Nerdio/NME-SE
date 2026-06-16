@@ -93,7 +93,7 @@
       },
       {
         "name": "MultiSessionCPU",
-        "mode": "Shared",
+        "mode": "Default",
         "description": "Multi-session host pool scaling based on CPU usage"
       },
       {
@@ -171,7 +171,7 @@
         "isEnabled": true,
         "vmSize": "Standard_D2s_v3",
         "vmNamePrefix": "mspooled",
-        "hostPoolCapacity": 1,
+        "hostPoolCapacity": 3,
         "minActiveHostsCount": 1
       }
     },
@@ -192,7 +192,7 @@
         "isEnabled": true,
         "vmSize": "Standard_D2s_v3",
         "vmNamePrefix": "remoteapp",
-        "hostPoolCapacity": 1,
+        "hostPoolCapacity": 3,
         "minActiveHostsCount": 1
       }
     },
@@ -213,7 +213,7 @@
         "isEnabled": true,
         "vmSize": "Standard_D2s_v3",
         "vmNamePrefix": "supool",
-        "hostPoolCapacity": 1,
+        "hostPoolCapacity": 3,
         "minActiveHostsCount": 1
       }
     },
@@ -238,7 +238,7 @@
         "isEnabled": true,
         "vmSize": "Standard_D2s_v3",
         "vmNamePrefix": "personal",
-        "hostPoolCapacity": 1,
+        "hostPoolCapacity": 3,
         "minActiveHostsCount": 0
       }
     }
