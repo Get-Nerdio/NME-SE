@@ -93,6 +93,12 @@
     - Group.Read.All                Resolve Entra group display names to Object IDs for
                                     host pool group assignments. Required if any host pool
                                     in desired state has a 'groups' array.
+    - Application.Read.All          Look up the Entra service principal app ID for Entra
+                                    Kerberos storage accounts (NMW_APPLICATION_ID tag).
+                                    Required if any storageAccount has entraKerberos=true.
+                                    NOTE: the 'Cloud Application Administrator' Entra
+                                    directory role is NOT sufficient — Graph application
+                                    permissions must be granted as app roles on the MI.
 
     Azure SQL database roles (on NME database, optional):
     - db_datareader                 Read FSLogix profile records for cleanup reporting.
@@ -477,22 +483,32 @@ function Confirm-EntraKerberos {
         return
     }
     try {
-        # Azure Files AADKERB registers the service principal as "[Storage Account] <name>.file.core.windows.net"
-        $spDisplayName = "[Storage Account] $AccountName.file.core.windows.net"
-        $sp = Get-AzADServicePrincipal -DisplayName $spDisplayName -ErrorAction SilentlyContinue |
-              Where-Object { $_.DisplayName -eq $spDisplayName } |
-              Select-Object -First 1
-        if (-not $sp) {
-            # Fallback: try plain account name (older tenants or future naming changes)
-            $sp = Get-AzADServicePrincipal -DisplayName $AccountName -ErrorAction SilentlyContinue |
-                  Where-Object { $_.DisplayName -eq $AccountName } |
-                  Select-Object -First 1
-        }
-        if (-not $sp) {
-            Add-NonFatalError "Could not find Entra ID service principal for '$AccountName' (tried '$spDisplayName' and '$AccountName') — NMW_APPLICATION_ID tag not set. Enable Entra Kerberos first or wait for propagation."
+        # Azure Files AADKERB registers the service principal as "[Storage Account] <name>.file.core.windows.net".
+        # Look it up via Graph REST directly — Get-AzADServicePrincipal has OData filter quirks with
+        # bracket characters in old Az.Resources versions. Requires Application.Read.All app role on the MI.
+        $graphToken = $null
+        try { $graphToken = (Get-AzAccessToken -ResourceUrl 'https://graph.microsoft.com/').Token } catch {}
+        if (-not $graphToken) {
+            Add-NonFatalError "Could not obtain Microsoft Graph token for '$AccountName' SP lookup — ensure the AA Managed Identity has Application.Read.All Graph app role (directory roles are insufficient)."
             return
         }
-        $appId        = $sp.AppId
+        $graphHeaders   = @{ Authorization = "Bearer $graphToken" }
+        $spDisplayName  = "[Storage Account] $AccountName.file.core.windows.net"
+        $sp = $null
+        foreach ($candidate in @($spDisplayName, $AccountName)) {
+            $filter   = "`$filter=displayName eq '$([uri]::EscapeDataString($candidate))'&`$select=appId,displayName"
+            try {
+                $resp = Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/servicePrincipals?$filter" `
+                            -Headers $graphHeaders -ErrorAction Stop
+                $sp = $resp.value | Where-Object { $_.displayName -eq $candidate } | Select-Object -First 1
+            } catch { Write-Log "Graph SP lookup for '$candidate' failed: $($_.Exception.Message)" 'WARN' }
+            if ($sp) { break }
+        }
+        if (-not $sp) {
+            Add-NonFatalError "Could not find Entra service principal for '$AccountName' (tried '$spDisplayName' and '$AccountName') — NMW_APPLICATION_ID tag not set."
+            return
+        }
+        $appId        = $sp.appId   # Graph JSON uses lowercase appId
         $currentTagVal = $sa.Tags['NMW_APPLICATION_ID']
         if ($currentTagVal -eq $appId) {
             Write-Log "Tag 'NMW_APPLICATION_ID' already correct on '$AccountName' ($appId)."
