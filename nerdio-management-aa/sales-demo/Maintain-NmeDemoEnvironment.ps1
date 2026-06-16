@@ -477,11 +477,19 @@ function Confirm-EntraKerberos {
         return
     }
     try {
-        $sp = Get-AzADServicePrincipal -DisplayName $AccountName -ErrorAction SilentlyContinue |
-              Where-Object { $_.DisplayName -eq $AccountName } |
+        # Azure Files AADKERB registers the service principal as "[Storage Account] <name>.file.core.windows.net"
+        $spDisplayName = "[Storage Account] $AccountName.file.core.windows.net"
+        $sp = Get-AzADServicePrincipal -DisplayName $spDisplayName -ErrorAction SilentlyContinue |
+              Where-Object { $_.DisplayName -eq $spDisplayName } |
               Select-Object -First 1
         if (-not $sp) {
-            Add-NonFatalError "Could not find Entra ID service principal for '$AccountName' — NMW_APPLICATION_ID tag not set. Enable Entra Kerberos first or wait for propagation."
+            # Fallback: try plain account name (older tenants or future naming changes)
+            $sp = Get-AzADServicePrincipal -DisplayName $AccountName -ErrorAction SilentlyContinue |
+                  Where-Object { $_.DisplayName -eq $AccountName } |
+                  Select-Object -First 1
+        }
+        if (-not $sp) {
+            Add-NonFatalError "Could not find Entra ID service principal for '$AccountName' (tried '$spDisplayName' and '$AccountName') — NMW_APPLICATION_ID tag not set. Enable Entra Kerberos first or wait for propagation."
             return
         }
         $appId        = $sp.AppId
