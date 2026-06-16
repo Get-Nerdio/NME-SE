@@ -92,12 +92,22 @@
         "description": "Pooled host pool scaling - business hours"
       },
       {
+        "name": "MultiSessionCPU",
+        "mode": "Shared",
+        "description": "Multi-session host pool scaling based on CPU usage"
+      },
+      {
         "name": "DemoAutoScale-Personal",
         "mode": "UserDriven",
         "description": "Personal desktop scaling - user-driven"
       }
     ],
-    "scriptedActions": [],
+    "scriptedActions": [
+      {
+        "name": "SophosOnEndpoints",
+        "description": "Scripted action to install Sophos on session hosts"
+      }
+    ],
     "rdpConfigs": [
       {
         "name": "StandardRDP"
@@ -116,7 +126,7 @@
     ],
     "vmProfiles": [
       {
-        "name": "TrackedVMProfile"
+        "name": "StandardVMProfile"
       }
     ],
     "capacityProfiles": [
