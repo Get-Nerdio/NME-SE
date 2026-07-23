@@ -355,8 +355,10 @@ try {
     }
 
     # Resource providers.
+    # Providers the installer template deploys, plus the ones NME needs to operate post-install
+    # (Compute = session-host VMs, DesktopVirtualization = AVD host pools, RecoveryServices = backup).
     $ResourceProviders = @("Microsoft.KeyVault", "Microsoft.Automation", "Microsoft.Compute",
-        "Microsoft.DocumentDB", "Microsoft.DesktopVirtualization", "Microsoft.Insights",
+        "Microsoft.DesktopVirtualization", "Microsoft.Insights",
         "Microsoft.Network", "Microsoft.OperationalInsights", "Microsoft.RecoveryServices",
         "Microsoft.Storage", "Microsoft.Sql", "Microsoft.Web")
     foreach ($rp in $ResourceProviders) {
@@ -515,7 +517,7 @@ policyresources
         else {
             $p = Get-PolicyFromError -ExceptionMessage $jr.Error
             $polName = Resolve-PolicyName -PolicyDefinitionId $p.PolicyDefinitionId -PolicyAssignmentId $p.PolicyAssignmentId -DenyCache $DenyCache
-            $detail = if ($polName) { "Blocked by policy: '$polName'." } else { "Failed - see message." }
+            $detail = if ($polName) { "Blocked by policy: '$polName'. $($p.Message)" } else { "Failed: $($p.Message)" }
             Add-Result -Category "Deployability" -Check $jr.Target -Result "Fail" -Detail $detail -PolicyName $polName -Message $p.Message
         }
     }
@@ -532,7 +534,7 @@ policyresources
         catch {
             $p = Get-PolicyFromError -ExceptionMessage $_.Exception.Message
             $polName = Resolve-PolicyName -PolicyDefinitionId $p.PolicyDefinitionId -PolicyAssignmentId $p.PolicyAssignmentId -DenyCache $DenyCache
-            $detail = if ($polName) { "Blocked by policy: '$polName'." } else { "Failed - see message." }
+            $detail = if ($polName) { "Blocked by policy: '$polName'. $($p.Message)" } else { "Failed: $($p.Message)" }
             Add-Result -Category "Deployability" -Check "SQL Database (Standard S1, DTU)" -Result "Fail" -Detail $detail -PolicyName $polName -Message $p.Message
         }
     }
