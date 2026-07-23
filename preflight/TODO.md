@@ -2,7 +2,7 @@
 
 1. ~~**Owner check is too narrow.**~~ **DONE.** The role check now accepts Contributor + User Access Administrator as an Owner-equivalent pass when Owner is not present (Owner is the union of those two, and the Terraform/pipeline install path documents the same acceptance).
 
-2. **Markdown table output is hard to read outside a markdown viewer.** The report is rendered as a markdown table but is usually read in a plain console or pasted into Slack/email. Replace with (or add) a plain-text/columnar or indented list format that's readable without markdown rendering.
+2. ~~**Markdown table output is hard to read outside a markdown viewer.**~~ **DONE.** The copy/paste report now renders as aligned fixed-width columns (RESULT / CATEGORY / CHECK with wrapped `> ` detail lines) and a padded key/value config block — readable raw in any console, Slack, or email. No markdown table syntax remains; the JSON output is unchanged.
 
 3. ~~**Prompts need an inline help option.**~~ **DONE.** `Read-YesNo` now takes an optional `-Help` string and accepts `?` to show it and re-prompt; a new `Read-Choice` helper renders numbered options with an always-present `?`; a `Write-HelpText` helper word-wraps help blocks. Private-endpoint, existing-vs-new-VNet, and new-VNet-DNS-mode prompts carry sourced `?` explanations.
 

@@ -1378,20 +1378,48 @@ finally {
     Write-Host "- Cloud / Region: $($summaryMeta.Cloud) / $($summaryMeta.Region)"
     Write-Host "- Summary: $($counts -join '  ')"
     Write-Host ""
-    Write-Host "### Configuration used (reference for install)"
-    Write-Host "| Setting | Value |"
-    Write-Host "|---|---|"
+    Write-Host "Configuration used (reference for install)"
+    Write-Host ("-" * 60)
+    $cfgKeyCap = 34
+    $cfgKeyWidth = [Math]::Min($cfgKeyCap, (($ConfigSummary.Keys | ForEach-Object { $_.Length } | Measure-Object -Maximum).Maximum))
     foreach ($ck in $ConfigSummary.Keys) {
-        $cv = ($ConfigSummary[$ck] -replace "\|", "/") -replace "[\r\n]+", " "
-        Write-Host "| $ck | $cv |"
+        $cv = ($ConfigSummary[$ck] -replace "[\r\n]+", " ")
+        if ($ck.Length -gt $cfgKeyCap) {
+            Write-Host $ck
+            Write-Host ("   {0}" -f $cv)
+        }
+        else {
+            Write-Host ("{0}{1}" -f $ck.PadRight($cfgKeyWidth), "   $cv")
+        }
     }
     Write-Host ""
-    Write-Host "### Check results"
-    Write-Host "| Category | Check | Result | Detail |"
-    Write-Host "|---|---|---|---|"
+    Write-Host "Check results"
+    Write-Host ("-" * 60)
+    $resultTokens = @{ Pass = "[PASS]"; Fail = "[FAIL]"; Warn = "[WARN]"; Info = "[INFO]" }
+    $catCap = 16
+    $catWidth = [Math]::Min($catCap, (($Results | ForEach-Object { $_.Category.Length } | Measure-Object -Maximum).Maximum))
+    $detailIndent = " " * 8
+    $wrapWidth = 92
     foreach ($r in $Results) {
-        $d = ($r.Detail -replace "\|", "/") -replace "[\r\n]+", " "
-        Write-Host "| $($r.Category) | $(($r.Check -replace '\|','/')) | $($r.Result) | $d |"
+        $token = if ($resultTokens.ContainsKey($r.Result)) { $resultTokens[$r.Result] } else { "[{0}]" -f $r.Result.ToUpper().Substring(0, [Math]::Min(4, $r.Result.Length)) }
+        $catPadded = $r.Category.PadRight($catWidth)
+        Write-Host ("{0}  {1}  {2}" -f $token, $catPadded, $r.Check)
+        $d = ($r.Detail -replace "[\r\n]+", " ").Trim()
+        if ($d) {
+            $words = $d -split "\s+"
+            $line = ""
+            $first = $true
+            foreach ($word in $words) {
+                if ($line.Length -eq 0) { $line = $word }
+                elseif (($line.Length + 1 + $word.Length) -le $wrapWidth) { $line = "$line $word" }
+                else {
+                    Write-Host ("{0}{1} {2}" -f $detailIndent, "$(if ($first) { '>' } else { ' ' })", $line)
+                    $first = $false
+                    $line = $word
+                }
+            }
+            if ($line.Length -gt 0) { Write-Host ("{0}{1} {2}" -f $detailIndent, "$(if ($first) { '>' } else { ' ' })", $line) }
+        }
     }
     Write-Host ""
     Write-Host -ForegroundColor "Green" "====== END - COPY EVERYTHING ABOVE ======"
