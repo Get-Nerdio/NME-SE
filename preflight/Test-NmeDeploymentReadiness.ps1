@@ -343,13 +343,52 @@ function New-RandomString {
     return (-join (1..$Length | ForEach-Object { $chars | Get-Random })).ToLower()
 }
 
+function Write-HelpText {
+    param([string] $Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return }
+    $width = 90
+    $words = $Text -split "\s+"
+    $line = ""
+    foreach ($word in $words) {
+        if ($line.Length -eq 0) { $line = $word }
+        elseif (($line.Length + 1 + $word.Length) -le $width) { $line = "$line $word" }
+        else { Write-Host -ForegroundColor "Cyan" "    $line"; $line = $word }
+    }
+    if ($line.Length -gt 0) { Write-Host -ForegroundColor "Cyan" "    $line" }
+}
+
 function Read-YesNo {
-    param([string] $Prompt, [string] $Default = "y")
+    param([string] $Prompt, [string] $Default = "y", [string] $Help)
+    $displayPrompt = if ($Help) { "$Prompt (or '?' for help)" } else { $Prompt }
     do {
-        $r = Read-Host -Prompt $Prompt
+        $r = Read-Host -Prompt $displayPrompt
         if ([string]::IsNullOrWhiteSpace($r)) { $r = $Default }
+        if ($Help -and $r -eq "?") { Write-HelpText -Text $Help; continue }
     } while ($r -notmatch "^[YyNn]$")
     return ($r -match "^[Yy]$")
+}
+
+function Read-Choice {
+    param(
+        [Parameter(Mandatory = $true)][string] $Prompt,
+        [Parameter(Mandatory = $true)][string[]] $Options,
+        [string] $Help,
+        [int] $Default = 1
+    )
+    $hasHelp = -not [string]::IsNullOrWhiteSpace($Help)
+    $tokens = @(1..$Options.Count | ForEach-Object { "$_" })
+    if ($hasHelp) { $tokens += "?" }
+    $choiceStr = $tokens -join "/"
+    while ($true) {
+        Write-Host $Prompt
+        for ($i = 0; $i -lt $Options.Count; $i++) { Write-Host ("  {0}) {1}" -f ($i + 1), $Options[$i]) }
+        if ($hasHelp) { Write-Host "  ?) More information" }
+        $r = Read-Host -Prompt "Choose [$choiceStr] (default $Default)"
+        if ([string]::IsNullOrWhiteSpace($r)) { return $Default }
+        if ($hasHelp -and $r -eq "?") { Write-HelpText -Text $Help; continue }
+        if ($r -match "^\d+$" -and [int]$r -ge 1 -and [int]$r -le $Options.Count) { return [int]$r }
+        Write-Host -ForegroundColor "Yellow" "  Invalid choice. Try again."
+    }
 }
 #endregion
 
@@ -481,7 +520,7 @@ try {
         # Supplied via -ResourceGroupName; validated (and re-prompted if bad) in the loop below.
         $useExisting = $true
     }
-    elseif (Read-YesNo -Prompt "Use an EXISTING (empty) resource group for the test resources? [y/N]" -Default "n") {
+    elseif (Read-YesNo -Prompt "Use an EXISTING (empty) resource group for the test resources? [y/N]" -Default "n" -Help "Nerdio Manager for Enterprise installs only into a new or completely empty resource group - this test mirrors that requirement so the result reflects what a real install would encounter. Answering No has this script create a temporary resource group of its own, which it deletes (along with everything created inside it) at the end of the run.") {
         $useExisting = $true
         $ResourceGroupName = $null
     }
@@ -545,11 +584,19 @@ try {
     $TestVnetIntegration = $false
     $CreateNewVnet = $false
     $ExistingVnetRg = $null; $ExistingVnetName = $null; $PeSubnetName = $null; $AppSubnetName = $null
-    if (Read-YesNo -Prompt "Do you want to deploy Nerdio Manager with PRIVATE ENDPOINTS? [y/N]" -Default "n") {
+    $privateChoice = Read-Choice -Prompt "Do you want to deploy Nerdio Manager with PRIVATE ENDPOINTS?" -Options @(
+        "Yes - deploy with private endpoints (no public internet exposure)",
+        "No - use public endpoints (default)"
+    ) -Default 2 -Help "Private endpoints give NME's PaaS dependencies (SQL Database, Key Vault, Storage, and the App Service) private IPs on your VNet instead of public endpoints. When enabled at install (`"Secure Deployment`"), the app and ALL dependencies are no longer reachable over the public internet - access is only from your VNet or peered/on-prem networks. Pros: no public exposure of the NME data plane; meets network-isolation requirements. Cons/requirements: you must supply a VNet with two subnets (one for private endpoints, one delegated to Microsoft.Web/serverFarms for App Service VNet integration), and private DNS resolution for the privatelink zones. Choose No to deploy with public endpoints (you can harden to private endpoints later via NME's Enable Private Endpoints runbook)."
+    if ($privateChoice -eq 1) {
         $TestPrivate = $true
         $TestVnetIntegration = $true
 
-        if (Read-YesNo -Prompt "Will you deploy to an EXISTING VNet? (Choosing 'n' creates a new VNet; you'll get the option to provide a custom name.) [y/N]" -Default "n") {
+        $vnetChoice = Read-Choice -Prompt "Will you deploy to an EXISTING VNet?" -Options @(
+            "Use an EXISTING VNet (you provide RG, VNet, and both subnet names)",
+            "Create a NEW VNet for this test (this script creates and later deletes it)"
+        ) -Default 2 -Help "An EXISTING VNet tests against the real network NME will use - its subnets, DNS settings, and any private DNS zone links - so the result reflects your production topology. You must provide the VNet's resource group, its name, a subnet for private endpoints, and a separate subnet delegated to Microsoft.Web/serverFarms for App Service integration. A NEW VNet lets the script prove the resources CAN be created (VNet, subnets, delegation, private endpoint) in a clean 10.60.0.0/16 space it creates and then deletes, but it cannot validate your real DNS/routing/firewall because none exists yet."
+        if ($vnetChoice -eq 1) {
             # Validate the VNet exists up front and re-prompt on a bad value, so the user isn't told the
             # name was wrong only after the deployability phase has already created resources.
             $intakeVnet = $null
@@ -585,7 +632,11 @@ try {
 
             # A brand-new VNet has no real DNS configuration to inspect, so (unlike the existing-VNet
             # path, which detects this from the VNet's actual DhcpOptions) we have to ask directly.
-            if (Read-YesNo -Prompt "  Will this VNet use Azure Private DNS Zones to resolve the private endpoints (vs. custom/on-prem DNS servers)? [Y/n]" -Default "y") {
+            $dnsModeChoice = Read-Choice -Prompt "  Will this VNet use Azure Private DNS Zones to resolve the private endpoints?" -Options @(
+                "Azure Private DNS Zones (Azure resolves the privatelink zones)",
+                "Custom / on-prem DNS servers (your DNS resolves the privatelink names)"
+            ) -Default 1 -Help "NME's private endpoints only work if the privatelink DNS names (e.g. privatelink.database.windows.net) resolve to the private IPs. Azure Private DNS Zones: Azure hosts those zones and, when linked to the VNet, resolves them automatically - simplest option. Custom / on-prem DNS: your own DNS servers (set on the VNet) must host or conditionally forward every required privatelink zone; the script will list the exact zones your DNS must resolve. Choose Azure Private DNS Zones unless your organization mandates centralized custom DNS."
+            if ($dnsModeChoice -eq 1) {
                 $NewVnetDnsMode = "Azure"
                 do { $PrivateDnsZoneSubId = Read-Host -Prompt "    Subscription ID where the Azure Private DNS zones live (or will be created)" } while ([string]::IsNullOrWhiteSpace($PrivateDnsZoneSubId))
                 do { $PrivateDnsZoneRg = Read-Host -Prompt "    Resource group name for the Azure Private DNS zones" } while ([string]::IsNullOrWhiteSpace($PrivateDnsZoneRg))
@@ -688,7 +739,7 @@ try {
     # Tags applied to every resource this script creates (never to a pre-existing resource group).
     # Only user-specified tags are applied - none are added by default.
     $Tags = @{}
-    if (Read-YesNo -Prompt "Add custom tags to all resources this script creates? [y/N]" -Default "n") {
+    if (Read-YesNo -Prompt "Add custom tags to all resources this script creates? [y/N]" -Default "n" -Help "Required-tag and tag-value Deny policies are a common deployment blocker in customer environments. Testing with the same tags your customer's Azure Policy mandates surfaces those policy blocks now, instead of during the real Nerdio Manager install.") {
         do {
             $tagName = Read-Host -Prompt "  Tag name"
             if ([string]::IsNullOrWhiteSpace($tagName)) { break }

@@ -4,9 +4,9 @@
 
 2. **Markdown table output is hard to read outside a markdown viewer.** The report is rendered as a markdown table but is usually read in a plain console or pasted into Slack/email. Replace with (or add) a plain-text/columnar or indented list format that's readable without markdown rendering.
 
-3. **Prompts need an inline help option.** Every prompt should support a `?` response that explains the question in more detail (context, implications, trade-offs) and then re-displays the prompt. Example: "Do you want to deploy Nerdio Manager with PRIVATE ENDPOINTS?" should have a `?` that explains what private endpoints are in the context of Nerdio Manager and the pros/cons of choosing them.
+3. ~~**Prompts need an inline help option.**~~ **DONE.** `Read-YesNo` now takes an optional `-Help` string and accepts `?` to show it and re-prompt; a new `Read-Choice` helper renders numbered options with an always-present `?`; a `Write-HelpText` helper word-wraps help blocks. Private-endpoint, existing-vs-new-VNet, and new-VNet-DNS-mode prompts carry sourced `?` explanations.
 
-   3a. Any prompt with more than a simple yes/no choice should move from y/n to numbered options (1/2/`?`) with a short explanation of what each option means, rather than relying on the user already knowing the terminology. Add a third option where needed.
+   3a. ~~**Complex prompts → numbered options.**~~ **DONE.** The three complex/ambiguous prompts (private endpoints; existing vs new VNet; Azure vs custom DNS) are now 1/2/? numbered `Read-Choice` prompts; simple confirmations stay y/n (the existing-RG and custom-tags prompts gained `-Help` explanations).
 
 4. **Private endpoint path should distinguish new vs. existing Private DNS zones.** Ask up front whether the customer will use existing Private DNS zones or have the script create new ones:
    - If **existing**: prompt for the subscription/resource group containing the zones, then check and report which required private DNS zones are missing from that resource group.
