@@ -585,7 +585,7 @@ policyresources
     #endregion
 
     #region Deployability tests (parallel) -------------------------------------------------------
-    Write-Host -ForegroundColor "Cyan" "Testing resource deployability (in parallel). This is the slow part..."
+    Write-Host -ForegroundColor "Cyan" "Testing resource deployability (in parallel). This will take several minutes..."
 
     # Each job returns @{ Target; Ok; Error }. Az context is shared into the thread via -UseNewRunspace:$false default of ThreadJob.
     $jobs = @()
