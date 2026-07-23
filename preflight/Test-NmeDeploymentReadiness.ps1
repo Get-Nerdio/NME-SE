@@ -117,6 +117,25 @@ function Add-TrackedResource {
         }) | Out-Null
 }
 
+# The installer applies CanNotDelete locks to the SQL Database, Key Vault, and (DPS) storage
+# account - mirror that here. Tracked as its own resource so cleanup removes the lock first.
+function New-PreflightLock {
+    param(
+        [Parameter(Mandatory = $true)][string] $ResourceId,
+        [Parameter(Mandatory = $true)][string] $LockName,
+        [Parameter(Mandatory = $true)][string] $Label
+    )
+    try {
+        New-AzResourceLock -LockName $LockName -LockLevel "CanNotDelete" -Scope $ResourceId -Force -ErrorAction Stop | Out-Null
+        $lockResourceId = "$ResourceId/providers/Microsoft.Authorization/locks/$LockName"
+        Add-TrackedResource -Type "lock" -ResourceGroupName $ResourceGroupName -Name $LockName -Id $lockResourceId -Note $ResourceId
+        Add-Result -Category "Deployability" -Check "$Label lock" -Result "Pass" -Detail "CanNotDelete lock applied (matches installer)."
+    }
+    catch {
+        Add-Result -Category "Deployability" -Check "$Label lock" -Result "Warn" -Detail "Could not apply CanNotDelete lock." -Message $_.Exception.Message
+    }
+}
+
 # Parse an ARM/policy error message for the blocking policy details.
 # Ported from Start-NerdioManagerPreFlight.ps1's New-PreflightObject.
 function Get-PolicyFromError {
@@ -614,6 +633,12 @@ policyresources
         if ($jr.Ok) {
             Add-Result -Category "Deployability" -Check $jr.Target -Result "Pass" -Detail "Created successfully."
             Add-TrackedResource -Type $jr.Kind -ResourceGroupName $ResourceGroupName -Name $jr.Name
+            if ($jr.Kind -eq "kv") {
+                New-PreflightLock -ResourceId "/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.KeyVault/vaults/$($jr.Name)" -LockName "$($jr.Name)-lock" -Label "Key Vault"
+            }
+            elseif ($jr.Kind -eq "storage") {
+                New-PreflightLock -ResourceId "/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.Storage/storageAccounts/$($jr.Name)" -LockName "$($jr.Name)-lock" -Label "Storage account"
+            }
         }
         else {
             $p = Get-PolicyFromError -ExceptionMessage $jr.Error
@@ -631,6 +656,7 @@ policyresources
                 -Edition "Standard" -RequestedServiceObjectiveName "S1" -CollationName "SQL_Latin1_General_CP1_CI_AS" -Tag $Tags -ErrorAction Stop | Out-Null
             Add-Result -Category "Deployability" -Check "SQL Database (Standard S1, DTU)" -Result "Pass" -Detail "Created successfully."
             Add-TrackedResource -Type "sqldatabase" -ResourceGroupName $ResourceGroupName -Name $dbName -Note $sqlName
+            New-PreflightLock -ResourceId "/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.Sql/servers/$sqlName/databases/$dbName" -LockName "$dbName-lock" -Label "SQL Database"
         }
         catch {
             $p = Get-PolicyFromError -ExceptionMessage $_.Exception.Message
@@ -858,6 +884,7 @@ finally {
             $t = $Tracker[$i]
             try {
                 switch ($t.Type) {
+                    "lock" { Remove-AzResourceLock -LockId $t.Id -Force -ErrorAction Continue | Out-Null }
                     "privateendpoint" { Remove-AzPrivateEndpoint -ResourceGroupName $t.ResourceGroupName -Name $t.Name -Force -ErrorAction Continue | Out-Null }
                     "webapp" { Remove-AzWebApp -ResourceGroupName $t.ResourceGroupName -Name $t.Name -Force -ErrorAction Continue | Out-Null }
                     "asp" { Remove-AzAppServicePlan -ResourceGroupName $t.ResourceGroupName -Name $t.Name -Force -ErrorAction Continue | Out-Null }
