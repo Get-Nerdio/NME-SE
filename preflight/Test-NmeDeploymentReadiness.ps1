@@ -715,6 +715,8 @@ try {
             $rgCreateStart = (Get-Date).ToUniversalTime().AddMinutes(-5)
             $rgErrMsg = $_.Exception.Message
             try { if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $rgErrMsg = "$rgErrMsg`n$($_.ErrorDetails.Message)" } } catch {}
+            try { if ($_.Exception.Response -and $_.Exception.Response.Content) { $rgErrMsg = "$rgErrMsg`n$($_.Exception.Response.Content)" } } catch {}
+            try { if ($_.Exception.Body) { $rgErrMsg = "$rgErrMsg`n$($_.Exception.Body | ConvertTo-Json -Depth 10 -Compress)" } } catch {}
             $policyInfo = Get-PolicyFromError -ExceptionMessage $rgErrMsg
             $armDisplayHint = if ($policyInfo.PolicyAssignmentDisplayName) { $policyInfo.PolicyAssignmentDisplayName } elseif ($policyInfo.PolicyDefinitionDisplayName) { $policyInfo.PolicyDefinitionDisplayName } else { $null }
             $policyName = Resolve-PolicyName -PolicyDefinitionId $policyInfo.PolicyDefinitionId -PolicyAssignmentId $policyInfo.PolicyAssignmentId -PolicySetDefinitionId $policyInfo.PolicySetDefinitionId -DisplayNameHint $armDisplayHint
@@ -907,6 +909,11 @@ try {
         catch {
             $errMsg = $_.Exception.Message
             try { if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $errMsg = "$errMsg`n$($_.ErrorDetails.Message)" } } catch {}
+            # Track1 SDK cmdlets (Microsoft.Rest.ClientRuntime, e.g. Az.Storage/Az.Websites/Az.Automation)
+            # throw HttpOperationException with a generic "Operation returned an invalid status code"
+            # Message - the actual JSON body (with the policy details) is only on .Response.Content/.Body.
+            try { if ($_.Exception.Response -and $_.Exception.Response.Content) { $errMsg = "$errMsg`n$($_.Exception.Response.Content)" } } catch {}
+            try { if ($_.Exception.Body) { $errMsg = "$errMsg`n$($_.Exception.Body | ConvertTo-Json -Depth 10 -Compress)" } } catch {}
             @{ Target = "Log Analytics workspace"; Ok = $false; Error = $errMsg; Name = $name; Kind = "law" }
         }
     } -ArgumentList $ResourceGroupName, $lawName, $Location, $Tags
@@ -921,6 +928,11 @@ try {
         catch {
             $errMsg = $_.Exception.Message
             try { if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $errMsg = "$errMsg`n$($_.ErrorDetails.Message)" } } catch {}
+            # Track1 SDK cmdlets (Microsoft.Rest.ClientRuntime, e.g. Az.Storage/Az.Websites/Az.Automation)
+            # throw HttpOperationException with a generic "Operation returned an invalid status code"
+            # Message - the actual JSON body (with the policy details) is only on .Response.Content/.Body.
+            try { if ($_.Exception.Response -and $_.Exception.Response.Content) { $errMsg = "$errMsg`n$($_.Exception.Response.Content)" } } catch {}
+            try { if ($_.Exception.Body) { $errMsg = "$errMsg`n$($_.Exception.Body | ConvertTo-Json -Depth 10 -Compress)" } } catch {}
             @{ Target = "Storage account ($sku)"; Ok = $false; Error = $errMsg; Name = $name; Kind = "storage" }
         }
     } -ArgumentList $ResourceGroupName, $stName, $Location, $StorageSku, $Tags
@@ -935,6 +947,11 @@ try {
         catch {
             $errMsg = $_.Exception.Message
             try { if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $errMsg = "$errMsg`n$($_.ErrorDetails.Message)" } } catch {}
+            # Track1 SDK cmdlets (Microsoft.Rest.ClientRuntime, e.g. Az.Storage/Az.Websites/Az.Automation)
+            # throw HttpOperationException with a generic "Operation returned an invalid status code"
+            # Message - the actual JSON body (with the policy details) is only on .Response.Content/.Body.
+            try { if ($_.Exception.Response -and $_.Exception.Response.Content) { $errMsg = "$errMsg`n$($_.Exception.Response.Content)" } } catch {}
+            try { if ($_.Exception.Body) { $errMsg = "$errMsg`n$($_.Exception.Body | ConvertTo-Json -Depth 10 -Compress)" } } catch {}
             @{ Target = "SQL Server"; Ok = $false; Error = $errMsg; Name = $name; Kind = "sqlserver" }
         }
     } -ArgumentList $ResourceGroupName, $sqlName, $Location, $sqlCred, $Tags
@@ -949,6 +966,11 @@ try {
         catch {
             $errMsg = $_.Exception.Message
             try { if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $errMsg = "$errMsg`n$($_.ErrorDetails.Message)" } } catch {}
+            # Track1 SDK cmdlets (Microsoft.Rest.ClientRuntime, e.g. Az.Storage/Az.Websites/Az.Automation)
+            # throw HttpOperationException with a generic "Operation returned an invalid status code"
+            # Message - the actual JSON body (with the policy details) is only on .Response.Content/.Body.
+            try { if ($_.Exception.Response -and $_.Exception.Response.Content) { $errMsg = "$errMsg`n$($_.Exception.Response.Content)" } } catch {}
+            try { if ($_.Exception.Body) { $errMsg = "$errMsg`n$($_.Exception.Body | ConvertTo-Json -Depth 10 -Compress)" } } catch {}
             @{ Target = "App Service Plan (B3, Windows)"; Ok = $false; Error = $errMsg; Name = $name; Kind = "asp" }
         }
     } -ArgumentList $ResourceGroupName, $aspName, $Location, $Tags
@@ -962,6 +984,11 @@ try {
         catch {
             $errMsg = $_.Exception.Message
             try { if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $errMsg = "$errMsg`n$($_.ErrorDetails.Message)" } } catch {}
+            # Track1 SDK cmdlets (Microsoft.Rest.ClientRuntime, e.g. Az.Storage/Az.Websites/Az.Automation)
+            # throw HttpOperationException with a generic "Operation returned an invalid status code"
+            # Message - the actual JSON body (with the policy details) is only on .Response.Content/.Body.
+            try { if ($_.Exception.Response -and $_.Exception.Response.Content) { $errMsg = "$errMsg`n$($_.Exception.Response.Content)" } } catch {}
+            try { if ($_.Exception.Body) { $errMsg = "$errMsg`n$($_.Exception.Body | ConvertTo-Json -Depth 10 -Compress)" } } catch {}
             @{ Target = "Key Vault"; Ok = $false; Error = $errMsg; Name = $name; Kind = "kv" }
         }
     } -ArgumentList $ResourceGroupName, $kvName, $Location, $Tags
@@ -977,6 +1004,11 @@ try {
         catch {
             $errMsg = $_.Exception.Message
             try { if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $errMsg = "$errMsg`n$($_.ErrorDetails.Message)" } } catch {}
+            # Track1 SDK cmdlets (Microsoft.Rest.ClientRuntime, e.g. Az.Storage/Az.Websites/Az.Automation)
+            # throw HttpOperationException with a generic "Operation returned an invalid status code"
+            # Message - the actual JSON body (with the policy details) is only on .Response.Content/.Body.
+            try { if ($_.Exception.Response -and $_.Exception.Response.Content) { $errMsg = "$errMsg`n$($_.Exception.Response.Content)" } } catch {}
+            try { if ($_.Exception.Body) { $errMsg = "$errMsg`n$($_.Exception.Body | ConvertTo-Json -Depth 10 -Compress)" } } catch {}
             @{ Target = "Automation Account (updater)"; Ok = $false; Error = $errMsg; Name = $name; Kind = "automation" }
         }
     } -ArgumentList $ResourceGroupName, $aaUpdaterName, $Location, $Tags
@@ -990,6 +1022,11 @@ try {
         catch {
             $errMsg = $_.Exception.Message
             try { if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $errMsg = "$errMsg`n$($_.ErrorDetails.Message)" } } catch {}
+            # Track1 SDK cmdlets (Microsoft.Rest.ClientRuntime, e.g. Az.Storage/Az.Websites/Az.Automation)
+            # throw HttpOperationException with a generic "Operation returned an invalid status code"
+            # Message - the actual JSON body (with the policy details) is only on .Response.Content/.Body.
+            try { if ($_.Exception.Response -and $_.Exception.Response.Content) { $errMsg = "$errMsg`n$($_.Exception.Response.Content)" } } catch {}
+            try { if ($_.Exception.Body) { $errMsg = "$errMsg`n$($_.Exception.Body | ConvertTo-Json -Depth 10 -Compress)" } } catch {}
             @{ Target = "Automation Account (scripted actions)"; Ok = $false; Error = $errMsg; Name = $name; Kind = "automation" }
         }
     } -ArgumentList $ResourceGroupName, $aaScriptedActionsName, $Location, $Tags
@@ -1030,6 +1067,8 @@ try {
         catch {
             $sqlErrMsg = $_.Exception.Message
             try { if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $sqlErrMsg = "$sqlErrMsg`n$($_.ErrorDetails.Message)" } } catch {}
+            try { if ($_.Exception.Response -and $_.Exception.Response.Content) { $sqlErrMsg = "$sqlErrMsg`n$($_.Exception.Response.Content)" } } catch {}
+            try { if ($_.Exception.Body) { $sqlErrMsg = "$sqlErrMsg`n$($_.Exception.Body | ConvertTo-Json -Depth 10 -Compress)" } } catch {}
             $p = Get-PolicyFromError -ExceptionMessage $sqlErrMsg
             $pDisplayHint = if ($p.PolicyAssignmentDisplayName) { $p.PolicyAssignmentDisplayName } elseif ($p.PolicyDefinitionDisplayName) { $p.PolicyDefinitionDisplayName } else { $null }
             $polName = Resolve-PolicyName -PolicyDefinitionId $p.PolicyDefinitionId -PolicyAssignmentId $p.PolicyAssignmentId -PolicySetDefinitionId $p.PolicySetDefinitionId -DisplayNameHint $pDisplayHint
