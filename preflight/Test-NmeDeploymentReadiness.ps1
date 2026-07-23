@@ -133,7 +133,7 @@ function New-PreflightLock {
         New-AzResourceLock -LockName $LockName -LockLevel "CanNotDelete" -Scope $ResourceId -Force -ErrorAction Stop | Out-Null
         $lockResourceId = "$ResourceId/providers/Microsoft.Authorization/locks/$LockName"
         Add-TrackedResource -Type "lock" -ResourceGroupName $ResourceGroupName -Name $LockName -Id $lockResourceId -Note $ResourceId
-        Add-Result -Category "Deployability" -Check "$Label lock" -Result "Pass" -Detail "CanNotDelete lock applied (matches installer)."
+        Add-Result -Category "Deployability" -Check "$Label lock" -Result "Pass" -Detail "CanNotDelete lock applied."
     }
     catch {
         Add-Result -Category "Deployability" -Check "$Label lock" -Result "Warn" -Detail "Could not apply CanNotDelete lock." -Message $_.Exception.Message
@@ -309,7 +309,7 @@ try {
         # Supplied via -ResourceGroupName; validated (and re-prompted if bad) in the loop below.
         $useExisting = $true
     }
-    elseif (Read-YesNo -Prompt "Use an EXISTING (empty) resource group for the test resources? (Selecting 'n' will create a new temporary resource group) [y/N]" -Default "n") {
+    elseif (Read-YesNo -Prompt "Use an EXISTING (empty) resource group for the test resources? (Selecting 'N' will create a temporary rg. You will be prompted to confirm the name.) [y/N]" -Default "n") {
         $useExisting = $true
         $ResourceGroupName = $null
     }
@@ -713,7 +713,7 @@ policyresources
         }
     }
     catch {
-        Add-Result -Category "Policy" -Check "Deny-effect policy assignments" -Result "Warn" -Detail "Resource Graph scan failed (Az.ResourceGraph / Resource Policy Reader may be unavailable)." -Message $_.Exception.Message
+        Add-Result -Category "Policy" -Check "Deny-effect policy assignments" -Result "Info" -Detail "Resource Graph scan failed (Az.ResourceGraph / Resource Policy Reader may be unavailable). Deny-effect policies that actually block a resource are still caught and reported by the Deployability tests." -Message $_.Exception.Message
     }
     Write-Host ""
     #endregion
