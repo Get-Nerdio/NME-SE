@@ -14,8 +14,12 @@
                                    the blocking policy by name where possible.
           * Private endpoint/DNS - (optional) deploys a private endpoint into an existing VNet and
                                    reports which required private DNS zones are missing / not linked.
-          * Outbound connectivity- (optional) tests App Service VNet-integration outbound access to
-                                   the endpoints NME requires, from inside an App Service worker.
+          * Outbound connectivity- (optional, tested together with private endpoints - NME requires
+                                   both a private endpoint subnet and an App Service integration
+                                   subnet) tests App Service VNet-integration outbound access to the
+                                   endpoints NME requires, from inside an App Service worker. If the
+                                   named subnet isn't delegated to Microsoft.Web/serverFarms, this is
+                                   reported and the VNet integration attempt is skipped.
 
         Every check captures errors instead of failing, cleans up the resources it creates, and
         emits a copy/paste-ready report to send to your Nerdio SE.
@@ -226,9 +230,9 @@ Write-Host "  2. Check required resource providers and scan for Deny-effect Azur
 Write-Host "  3. Show you the exact resource names (and tags) it will use and let you customize them."
 Write-Host "  4. Create a TEMPORARY resource group (or use one you name) and attempt to deploy"
 Write-Host "     throwaway copies of the resources Nerdio Manager needs, to detect policy blocks."
-Write-Host "  5. Optionally test a private endpoint + private DNS in an EXISTING VNet you name."
-Write-Host "  6. Optionally test App Service VNet-integration outbound connectivity."
-Write-Host "  7. DELETE everything it created, then print a report you can copy/paste to your Nerdio SE."
+Write-Host "  5. Optionally test a private endpoint + private DNS, and App Service VNet integration"
+Write-Host "     outbound connectivity, in an EXISTING VNet you name (both subnets are required together)."
+Write-Host "  6. DELETE everything it created, then print a report you can copy/paste to your Nerdio SE."
 Write-Host ""
 Write-Host -ForegroundColor "Yellow" "It will NOT modify anything outside the test resource group, other than (if you opt in)"
 Write-Host -ForegroundColor "Yellow" "creating and then removing a private endpoint in the existing subnet you specify."
@@ -327,19 +331,19 @@ try {
         }
     }
 
-    # Private-network scenarios.
+    # Private-network scenario. A private NME deployment requires an existing VNet with two subnets:
+    # one for private endpoints, one (delegated to Microsoft.Web/serverFarms) for App Service VNet
+    # integration - so both are always requested together; there is no separate opt-in question.
     $TestPrivate = $false
     $TestVnetIntegration = $false
     $ExistingVnetRg = $null; $ExistingVnetName = $null; $PeSubnetName = $null; $AppSubnetName = $null
     if (Read-YesNo -Prompt "Will you deploy NME into an EXISTING VNet using PRIVATE ENDPOINTS? [y/n]" -Default "n") {
         $TestPrivate = $true
+        $TestVnetIntegration = $true
         do { $ExistingVnetRg = Read-Host -Prompt "  Existing VNet's resource group name" } while ([string]::IsNullOrWhiteSpace($ExistingVnetRg))
         do { $ExistingVnetName = Read-Host -Prompt "  Existing VNet name" } while ([string]::IsNullOrWhiteSpace($ExistingVnetName))
         do { $PeSubnetName = Read-Host -Prompt "  Subnet name for private endpoints" } while ([string]::IsNullOrWhiteSpace($PeSubnetName))
-        if (Read-YesNo -Prompt "Will the Nerdio Manager App Service use regional VNet INTEGRATION into that network? [y/n]" -Default "n") {
-            $TestVnetIntegration = $true
-            do { $AppSubnetName = Read-Host -Prompt "  Subnet name for App Service integration (delegated to Microsoft.Web/serverFarms)" } while ([string]::IsNullOrWhiteSpace($AppSubnetName))
-        }
+        do { $AppSubnetName = Read-Host -Prompt "  Subnet name for App Service VNet integration (should be delegated to Microsoft.Web/serverFarms)" } while ([string]::IsNullOrWhiteSpace($AppSubnetName))
     }
 
     Write-Host ""
