@@ -253,6 +253,7 @@ if (-not (Read-YesNo -Prompt "Proceed? [y/n]" -Default "n")) {
 
 # Everything below runs inside try/finally so cleanup always happens.
 $CreatedResourceGroup = $false
+$ConfigSummary = [ordered]@{}
 try {
     #region Intake -------------------------------------------------------------------------------
     if ([string]::IsNullOrWhiteSpace($SubscriptionId)) {
@@ -432,6 +433,22 @@ try {
         $ResourceGroup = Get-AzResourceGroup -Name $ResourceGroupName -ErrorAction Stop
     }
     Write-Host ""
+
+    # Record every input/response so the SE has a confirmed-working configuration to refer back to
+    # once it's time to actually install NME.
+    $ConfigSummary["Run by (signed-in account)"] = (Get-AzContext).Account.Id
+    $ConfigSummary["Subscription"] = "$($Context.Subscription.Name) ($SubscriptionId)"
+    $ConfigSummary["Cloud"] = $AzEnv.Name
+    $ConfigSummary["Region"] = $Location
+    $ConfigSummary["Resource group"] = "$ResourceGroupName $(if ($PendingRgCreate) { '(created by this script)' } else { '(existing, user-supplied)' })"
+    foreach ($k in $NamePlan.Keys) {
+        if ($k -eq "ResourceGroup") { continue }
+        $ConfigSummary["Resource name - $($NamePlan[$k].Label)"] = $NamePlan[$k].Value
+    }
+    if ($Tags.Count -gt 0) { $ConfigSummary["Tags applied"] = (($Tags.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join "; ") } else { $ConfigSummary["Tags applied"] = "(none specified)" }
+    $ConfigSummary["Private endpoint scenario"] = if ($TestPrivate) { "Yes - existing VNet '$ExistingVnetName' (RG '$ExistingVnetRg'), private endpoint subnet '$PeSubnetName'" } else { "Not tested" }
+    $ConfigSummary["App Service VNet integration scenario"] = if ($TestVnetIntegration) { "Yes - app integration subnet '$AppSubnetName' in VNet '$ExistingVnetName'" } else { "Not tested" }
+    $ConfigSummary["VNet DNS configuration"] = "Not tested"
     #endregion
 
     #region Fast checks --------------------------------------------------------------------------
@@ -678,6 +695,7 @@ policyresources
             $vnet = Get-AzVirtualNetwork -ResourceGroupName $ExistingVnetRg -Name $ExistingVnetName -ErrorAction Stop
             $dnsServers = if ($vnet.DhcpOptions.DnsServers -and $vnet.DhcpOptions.DnsServers.Count -gt 0) { $vnet.DhcpOptions.DnsServers -join ", " } else { "Azure-provided default (168.63.129.16)" }
             Add-Result -Category "PrivateDns" -Check "VNet DNS configuration" -Result "Info" -Detail "VNet '$ExistingVnetName' custom DNS servers: $dnsServers"
+            $ConfigSummary["VNet DNS configuration"] = "VNet '$ExistingVnetName': $dnsServers"
 
             # Required private DNS zones the installer creates/links (suffixes are environment-aware).
             $requiredZones = @(
@@ -847,7 +865,7 @@ finally {
         ResourceGroup   = $ResourceGroupName
     }
     try {
-        [pscustomobject]@{ Metadata = $summaryMeta; Results = $Results; CreatedResources = $Tracker } |
+        [pscustomobject]@{ Metadata = $summaryMeta; Configuration = $ConfigSummary; Results = $Results; CreatedResources = $Tracker } |
             ConvertTo-Json -Depth 8 | Out-File -FilePath $OutFile -Force
         Write-Host -ForegroundColor "Cyan" "Detailed results written to: $OutFile"
     }
@@ -864,6 +882,15 @@ finally {
     Write-Host "- Cloud / Region: $($summaryMeta.Cloud) / $($summaryMeta.Region)"
     Write-Host "- Summary: $($counts -join '  ')"
     Write-Host ""
+    Write-Host "### Configuration used (reference for install)"
+    Write-Host "| Setting | Value |"
+    Write-Host "|---|---|"
+    foreach ($ck in $ConfigSummary.Keys) {
+        $cv = ($ConfigSummary[$ck] -replace "\|", "/") -replace "[\r\n]+", " "
+        Write-Host "| $ck | $cv |"
+    }
+    Write-Host ""
+    Write-Host "### Check results"
     Write-Host "| Category | Check | Result | Detail |"
     Write-Host "|---|---|---|---|"
     foreach ($r in $Results) {

@@ -12,6 +12,7 @@ Listed here are scripts and queries to use a preflight tools to validate the tar
 * **Tests private endpoints and DNS.** Optionally deploys a private endpoint into an **existing VNet/subnet** you specify, reports the VNet's DNS configuration, and reports **which required private DNS zones are missing or not linked** to that VNet (`privatelink.database.windows.net`, `privatelink.azurewebsites.net`, `privatelink.vaultcore.azure.net`, `privatelink.blob.core.windows.net`, `privatelink.file.core.windows.net`, `privatelink.azure-automation.net`; Gov/China variants derived automatically).
 * **Tests App Service outbound connectivity.** If you confirm the App Service will use VNet integration, it deploys a test App Service, integrates it into your subnet, and runs the outbound-endpoint checks from `NmeNetworkTest.ps1` **from inside the worker** (via the Kudu command API) so the results reflect the VNet's real routing and DNS.
 * **Cleans up everything it creates** (constrained to the test resource group, plus the private endpoint in your named subnet) and **prints a copy/paste-ready report** to send to your Nerdio SE, plus a JSON file for detail.
+* **Records the confirmed-working configuration** - who ran the test, subscription, region, resource group, the exact resource names used, tags, and the existing VNet/subnet names and DNS settings tested - so your SE has a reference configuration when it's time to install NME.
 
 ### Usage — Azure Cloud Shell (single command)
 
