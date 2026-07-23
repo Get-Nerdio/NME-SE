@@ -179,6 +179,90 @@ function Resolve-PolicyName {
     return $name
 }
 
+# When an ARM error doesn't embed the blocking policy's identifiers (New-AzResourceGroup's
+# RequestDisallowedByPolicy frequently doesn't), the Activity Log does: the failed control-plane
+# operation is recorded with a PolicyViolation carrying the policy/assignment ids AND display names.
+# Activity Log ingestion lags the operation by a few seconds, so poll for it.
+function Get-PolicyFromActivityLog {
+    param(
+        [Parameter(Mandatory = $true)][string] $ResourceGroupName,
+        [datetime] $StartTime,
+        [int] $MaxAttempts = 6,
+        [int] $DelaySeconds = 10
+    )
+    $out = [pscustomobject]@{
+        PolicyDefinitionId   = $null
+        PolicyAssignmentId   = $null
+        PolicyDefinitionName = $null
+        PolicyAssignmentName = $null
+        Found                = $false
+    }
+    if (-not $StartTime) { $StartTime = (Get-Date).ToUniversalTime().AddMinutes(-15) }
+
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        $events = @()
+        try {
+            $events = @(Get-AzLog -ResourceGroupName $ResourceGroupName -StartTime $StartTime -WarningAction SilentlyContinue -ErrorAction Stop)
+        }
+        catch {
+            # Filtering on a resource group that was never created can fault on some API versions -
+            # fall back to a subscription-scoped query filtered client-side by resource group name.
+            try { $events = @(Get-AzLog -StartTime $StartTime -WarningAction SilentlyContinue -ErrorAction Stop | Where-Object { $_.ResourceGroupName -eq $ResourceGroupName }) }
+            catch { $events = @() }
+        }
+
+        foreach ($ev in $events) {
+            # Flatten the event's Properties bag into one text blob - used both to detect the deny and
+            # to regex-extract policy fields if the structured parse below doesn't land.
+            $content = $null
+            try { if ($ev.Properties -and $ev.Properties.Content) { $content = $ev.Properties.Content } } catch {}
+            $statusMessage = $null
+            $blob = ""
+            if ($content) {
+                try {
+                    foreach ($k in @($content.Keys)) {
+                        $blob += "`n$k=$($content[$k])"
+                        if ($k -eq "statusMessage") { $statusMessage = $content[$k] }
+                    }
+                }
+                catch {}
+            }
+            $subStatus = $null; try { $subStatus = $ev.SubStatus.Value } catch {}
+            $isDeny = ($subStatus -eq "RequestDisallowedByPolicy") -or ($blob -match "RequestDisallowedByPolicy") -or ($blob -match "disallowed by policy")
+            if (-not $isDeny) { continue }
+
+            # Preferred: the statusMessage JSON carries error.additionalInfo[].info with ids AND names.
+            if ($statusMessage) {
+                try {
+                    $j = $statusMessage | ConvertFrom-Json
+                    $info = ($j.error.additionalInfo | Where-Object { $_.type -eq "PolicyViolation" } | Select-Object -First 1).info
+                    if ($info) {
+                        if ($info.policyDefinitionId) { $out.PolicyDefinitionId = $info.policyDefinitionId }
+                        if ($info.policyAssignmentId) { $out.PolicyAssignmentId = $info.policyAssignmentId }
+                        $out.PolicyDefinitionName = $(if ($info.policyDefinitionDisplayName) { $info.policyDefinitionDisplayName } else { $info.policyDefinitionName })
+                        $out.PolicyAssignmentName = $(if ($info.policyAssignmentDisplayName) { $info.policyAssignmentDisplayName } else { $info.policyAssignmentName })
+                    }
+                }
+                catch {}
+            }
+            # Fallback: regex the blob for anything the structured parse didn't fill in.
+            if (-not $out.PolicyDefinitionId -and $blob -match 'policyDefinitionId"?\s*:\s*"?(/[^",\s}]+)') { $out.PolicyDefinitionId = $Matches[1] }
+            if (-not $out.PolicyAssignmentId -and $blob -match 'policyAssignmentId"?\s*:\s*"?(/[^",\s}]+)') { $out.PolicyAssignmentId = $Matches[1] }
+            if (-not $out.PolicyDefinitionName -and $blob -match 'policyDefinition(?:Display)?Name"?\s*:\s*"([^"]+)"') { $out.PolicyDefinitionName = $Matches[1] }
+            if (-not $out.PolicyAssignmentName -and $blob -match 'policyAssignment(?:Display)?Name"?\s*:\s*"([^"]+)"') { $out.PolicyAssignmentName = $Matches[1] }
+
+            if ($out.PolicyDefinitionId -or $out.PolicyAssignmentId -or $out.PolicyDefinitionName -or $out.PolicyAssignmentName) {
+                $out.Found = $true
+                break
+            }
+        }
+
+        if ($out.Found) { break }
+        if ($attempt -lt $MaxAttempts) { Start-Sleep -Seconds $DelaySeconds }
+    }
+    return $out
+}
+
 function New-RandomString {
     param([int] $Length = 8)
     $chars = "abcdefghijklmnopqrstuvwxyz0123456789".ToCharArray()
@@ -534,13 +618,36 @@ try {
             # surface. Parse the blocking policy out of the ARM error and report it, then stop cleanly
             # (nothing was created, so there's nothing to deploy into). The finally block still prints
             # the report so the SE sees the named policy.
+            $rgCreateStart = (Get-Date).ToUniversalTime().AddMinutes(-5)
             $policyInfo = Get-PolicyFromError -ExceptionMessage $_.Exception.Message
             $policyName = Resolve-PolicyName -PolicyDefinitionId $policyInfo.PolicyDefinitionId -PolicyAssignmentId $policyInfo.PolicyAssignmentId
-            $detail = if ($policyName) {
-                "Blocked by Azure Policy '$policyName'. The resource group could not be created$(if ($Tags.Count -gt 0) { ' (check the tags you supplied against required-tag/tag-value policies)' })."
+            $policySource = if ($policyName -and $policyName -ne $policyInfo.PolicyDefinitionId -and $policyName -ne $policyInfo.PolicyAssignmentId) { "the ARM error" } else { $null }
+
+            # New-AzResourceGroup's RequestDisallowedByPolicy error usually omits the policy identifiers,
+            # so fall back to the Activity Log, which records the denied operation with the policy name.
+            if (-not $policySource) {
+                Write-Host -ForegroundColor "Yellow" "  Resource group creation was blocked by policy. Querying the Activity Log for the specific policy (can take up to a minute)..."
+                $al = Get-PolicyFromActivityLog -ResourceGroupName $ResourceGroupName -StartTime $rgCreateStart
+                if ($al.Found) {
+                    $alName = if ($al.PolicyAssignmentName) { $al.PolicyAssignmentName } elseif ($al.PolicyDefinitionName) { $al.PolicyDefinitionName } else { $null }
+                    if (-not $alName) { $alName = Resolve-PolicyName -PolicyDefinitionId $al.PolicyDefinitionId -PolicyAssignmentId $al.PolicyAssignmentId }
+                    if ($alName -and $alName -ne $al.PolicyDefinitionId -and $alName -ne $al.PolicyAssignmentId) {
+                        $policyName = $alName
+                        $policySource = "the Activity Log"
+                    }
+                    if (-not $policyInfo.PolicyDefinitionId) { $policyInfo.PolicyDefinitionId = $al.PolicyDefinitionId }
+                    if (-not $policyInfo.PolicyAssignmentId) { $policyInfo.PolicyAssignmentId = $al.PolicyAssignmentId }
+                }
+            }
+
+            $detail = if ($policySource) {
+                "Blocked by Azure Policy '$policyName' (identified via $policySource). The resource group could not be created$(if ($Tags.Count -gt 0) { ' - review the tags you supplied against required-tag/tag-value policies' })."
+            }
+            elseif ($policyName) {
+                "Blocked by Azure Policy id '$policyName' (display name could not be resolved). The resource group could not be created$(if ($Tags.Count -gt 0) { ' - review the tags you supplied against required-tag/tag-value policies' })."
             }
             else {
-                "The resource group could not be created$(if ($Tags.Count -gt 0) { ' (this often indicates a required-tag/tag-value Deny policy - review the supplied tags)' })."
+                "The resource group could not be created$(if ($Tags.Count -gt 0) { ' (this often indicates a required-tag/tag-value Deny policy - review the supplied tags)' }). Could not identify the specific policy from the ARM error or the Activity Log (it may not have been ingested yet)."
             }
             Add-Result -Category "Deployability" -Check "Resource group creation" -Result "Fail" -Detail $detail -PolicyName $policyName -Message $policyInfo.Message
             # We return before the ConfigSummary is normally populated, so record enough here that the
@@ -552,6 +659,7 @@ try {
             $ConfigSummary["Resource group"] = "$ResourceGroupName (creation blocked)"
             $ConfigSummary["Tags applied"] = if ($Tags.Count -gt 0) { (($Tags.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join "; ") } else { "(none specified)" }
             if ($policyName) { $ConfigSummary["Blocking policy"] = $policyName }
+            if ($policyInfo.PolicyAssignmentId) { $ConfigSummary["Blocking policy assignment id"] = $policyInfo.PolicyAssignmentId }
             # Nothing was actually created, so don't offer to remove a resource group that doesn't exist.
             $CreatedResourceGroup = $false
             Write-Host -ForegroundColor "Red" "Cannot continue without a resource group. Skipping the remaining tests and printing the report."

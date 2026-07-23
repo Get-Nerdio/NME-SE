@@ -36,7 +36,7 @@ Connect-AzAccount -UseDeviceAuthentication
 ### Requirements
 
 * PowerShell 7 (pre-installed in Azure Cloud Shell)
-* Az modules: `Az.Accounts, Az.Resources, Az.OperationalInsights, Az.Storage, Az.Sql, Az.Websites, Az.Automation, Az.KeyVault, Az.Network, Az.PrivateDns` and `ThreadJob` (all present in Cloud Shell)
+* Az modules: `Az.Accounts, Az.Resources, Az.Monitor, Az.OperationalInsights, Az.Storage, Az.Sql, Az.Websites, Az.Automation, Az.KeyVault, Az.Network, Az.PrivateDns` and `ThreadJob` (all present in Cloud Shell)
 * **No** `Microsoft.Graph` module
 * Minimum rights to run a full test: **Owner** on the target subscription (to create/remove the test resources)
 
