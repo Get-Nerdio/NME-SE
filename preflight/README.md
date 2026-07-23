@@ -2,7 +2,46 @@
 
 Listed here are scripts and queries to use a preflight tools to validate the target environment before attempting to deploy Nerdio Manager.
 
-## Script
+## Test-NmeDeploymentReadiness.ps1 (recommended)
+
+`Test-NmeDeploymentReadiness.ps1` is the current pre-flight validator. It expands on the original script below and is designed to be handed to a customer and run in **Azure Cloud Shell with a single command**. It:
+
+* **Checks permissions without the Microsoft.Graph module.** Entra directory roles are read via `Invoke-AzRestMethod` against the Microsoft Graph REST API, reusing the existing `Connect-AzAccount` token. This avoids the `Microsoft.Graph` PowerShell module, which is frequently blocked or broken in locked-down tenants and has been a common source of failure. It confirms the signed-in user has **Global Administrator** (or **Privileged Role Administrator** + **Cloud Application Administrator**) and **Owner** on the target subscription.
+* **Scans for blocking Azure Policy** (Deny-effect assignments) via Azure Resource Graph, and reports the **blocking policy by name** when a resource deployment is denied.
+* **Tests resource deployability in parallel.** Throwaway copies of the resources Nerdio Manager deploys are created as background jobs, using **the exact SKUs/config from the installer template** (e.g. Storage `Standard_GRS`/`Standard_ZRS`, SQL DB `Standard S1` DTU, App Service Plan `B3` Windows, Key Vault without purge protection) so a policy that only permits a different SKU cannot produce a false pass. Errors are captured, never fatal.
+* **Tests private endpoints and DNS.** Optionally deploys a private endpoint into an **existing VNet/subnet** you specify, reports the VNet's DNS configuration, and reports **which required private DNS zones are missing or not linked** to that VNet (`privatelink.database.windows.net`, `privatelink.azurewebsites.net`, `privatelink.vaultcore.azure.net`, `privatelink.blob.core.windows.net`, `privatelink.file.core.windows.net`, `privatelink.azure-automation.net`; Gov/China variants derived automatically).
+* **Tests App Service outbound connectivity.** If you confirm the App Service will use VNet integration, it deploys a test App Service, integrates it into your subnet, and runs the outbound-endpoint checks from `NmeNetworkTest.ps1` **from inside the worker** (via the Kudu command API) so the results reflect the VNet's real routing and DNS.
+* **Cleans up everything it creates** (constrained to the test resource group, plus the private endpoint in your named subnet) and **prints a copy/paste-ready report** to send to your Nerdio SE, plus a JSON file for detail.
+
+### Usage — Azure Cloud Shell (single command)
+
+Authenticate is automatic in Cloud Shell. Run:
+
+```powershell
+$s=New-Object Net.WebClient; & ([scriptblock]::Create($s.DownloadString('https://raw.githubusercontent.com/Get-Nerdio/NME-SE/main/preflight/Test-NmeDeploymentReadiness.ps1')))
+```
+
+The script prompts for everything it needs (subscription id, region, whether to create a temporary resource group, and the private-network details). Nothing is deployed until you confirm the "what this does" summary.
+
+### Usage — local PowerShell
+
+Authenticate first, then run the downloaded script (parameters are optional; you are prompted for anything omitted):
+
+```powershell
+Connect-AzAccount -UseDeviceAuthentication
+.\Test-NmeDeploymentReadiness.ps1 -SubscriptionId "00000000-0000-0000-0000-000000000000"
+```
+
+### Requirements
+
+* PowerShell 7 (pre-installed in Azure Cloud Shell)
+* Az modules: `Az.Accounts, Az.Resources, Az.ResourceGraph, Az.OperationalInsights, Az.Storage, Az.Sql, Az.Websites, Az.Automation, Az.KeyVault, Az.Network, Az.PrivateDns` and `ThreadJob` (all present in Cloud Shell)
+* **No** `Microsoft.Graph` module
+* Minimum rights to run a full test: **Owner** on the target subscription (to create/remove the test resources); read access to policy for the Resource Graph scan
+
+---
+
+## Script (legacy — Start-NerdioManagerPreFlight.ps1)
 
 This script performs a pre-flight check for Nerdio Manager for Enterprise by attempting to create various Azure resources within a specified subscription and resource group. It verifies the ability to create resources that may be blocked by policy including a Log Analytics Workspace, Storage Account, SQL Server, SQL Database, App Service Plan, Automation Account, and Key Vault. Additionally, it will list the state of the required Resource Providers and roles assigned to the target resource group for the user account used to run the script.
 
