@@ -361,6 +361,7 @@ function Read-YesNo {
     param([string] $Prompt, [string] $Default = "y", [string] $Help)
     $displayPrompt = if ($Help) { "$Prompt (or '?' for help)" } else { $Prompt }
     do {
+        Write-Host ""
         $r = Read-Host -Prompt $displayPrompt
         if ([string]::IsNullOrWhiteSpace($r)) { $r = $Default }
         if ($Help -and $r -eq "?") { Write-HelpText -Text $Help; continue }
@@ -380,6 +381,7 @@ function Read-Choice {
     if ($hasHelp) { $tokens += "?" }
     $choiceStr = $tokens -join "/"
     while ($true) {
+        Write-Host ""
         Write-Host $Prompt
         for ($i = 0; $i -lt $Options.Count; $i++) { Write-Host ("  {0}) {1}" -f ($i + 1), $Options[$i]) }
         if ($hasHelp) { Write-Host "  ?) More information" }
@@ -452,6 +454,7 @@ if (-not (Read-YesNo -Prompt "Proceed? [Y/n]" -Default "y")) {
 # Everything below runs inside try/finally so cleanup always happens.
 $CreatedResourceGroup = $false
 $ConfigSummary = [ordered]@{}
+$CustomResourceNames = [ordered]@{}   # Label -> final custom Value, only for entries the user changed
 try {
     #region Intake -------------------------------------------------------------------------------
     if ([string]::IsNullOrWhiteSpace($SubscriptionId)) {
@@ -596,7 +599,7 @@ try {
         $vnetChoice = Read-Choice -Prompt "Will you deploy to an EXISTING VNet?" -Options @(
             "Use an EXISTING VNet (you provide RG, VNet, and both subnet names)",
             "Create a NEW VNet for this test (this script creates and later deletes it)"
-        ) -Default 2 -Help "An EXISTING VNet tests against the real network NME will use - its subnets, DNS settings, and any private DNS zone links - so the result reflects your production topology. You must provide the VNet's resource group, its name, a subnet for private endpoints, and a separate subnet delegated to Microsoft.Web/serverFarms for App Service integration. A NEW VNet lets the script prove the resources CAN be created (VNet, subnets, delegation, private endpoint) in a clean 10.60.0.0/16 space it creates and then deletes, but it cannot validate your real DNS/routing/firewall because none exists yet."
+        ) -Default 2 -Help "NME can be deployed to a brand-new VNet, which simplifies DNS and networking - this is the preferred/default deployment. Deploying into an EXISTING VNet is recommended only when your organization requires routing all traffic through centralized firewalls; note that using an existing VNet makes initial configuration more time-consuming. An EXISTING VNet tests against the real network NME will use - its subnets, DNS settings, and any private DNS zone links - so the result reflects your production topology. You must provide the VNet's resource group, its name, a subnet for private endpoints, and a separate subnet delegated to Microsoft.Web/serverFarms for App Service integration. A NEW VNet lets the script prove the resources CAN be created (VNet, subnets, delegation, private endpoint) in a clean 10.60.0.0/16 space it creates and then deletes, but it cannot validate your real DNS/routing/firewall because none exists yet."
         if ($vnetChoice -eq 1) {
             # Validate the VNet exists up front and re-prompt on a bad value, so the user isn't told the
             # name was wrong only after the deployability phase has already created resources.
@@ -624,24 +627,35 @@ try {
                 elseif ($AppSubnetName -eq $PeSubnetName) { Write-Host -ForegroundColor "Yellow" "  The App Service integration subnet must be different from the private endpoint subnet. Try again."; $AppSubnetName = $null }
             } while ([string]::IsNullOrWhiteSpace($AppSubnetName))
 
-            # Existing-vs-new Private DNS zones question. Asked here even though we don't yet know
-            # whether this VNet actually uses Azure DNS (that's only detectable from its DhcpOptions,
-            # in the verification region below) - an existing VNet is the common case for this, and the
-            # verification step gates on the real detected mode, simply ignoring this answer if the
-            # VNet turns out to use custom/on-prem DNS.
-            $dnsZonesChoice = Read-Choice -Prompt "  Will you use EXISTING Azure Private DNS zones, or have NME/this script create NEW ones?" -Options @(
-                "Use EXISTING Private DNS zones (you provide the subscription + resource group)",
-                "Create NEW Private DNS zones (the installer/runbook creates them at deploy time)"
-            ) -Default 2 -Help "NME's private endpoints need these Azure Private DNS zones, linked to the VNet, to resolve to private IPs: privatelink.database.windows.net (SQL), privatelink.vaultcore.azure.net (Key Vault), privatelink.blob.* and privatelink.file.* (Storage), privatelink.azurewebsites.net (App Service), privatelink.azure-automation.net (Automation). EXISTING: your org already manages these zones centrally (common with hub/spoke + Azure Policy auto-registration) - provide the subscription and resource group that holds them, and this script reports which required zones are MISSING there. NEW: NME's deployment (or the Enable Private Endpoints runbook) creates and links the zones for you - this script tests that the zones CAN be created in the test resource group. (Gov/China clouds use the equivalent .us/.cn zone names, derived automatically.)"
-            if ($dnsZonesChoice -eq 1) {
-                $PrivateDnsZonesMode = "Existing"
-                do { $PrivateDnsZoneSubId = Read-Host -Prompt "    Subscription ID where the Azure Private DNS zones live" } while ([string]::IsNullOrWhiteSpace($PrivateDnsZoneSubId))
-                do { $PrivateDnsZoneRg = Read-Host -Prompt "    Resource group name for the Azure Private DNS zones" } while ([string]::IsNullOrWhiteSpace($PrivateDnsZoneRg))
-                $ConfigSummary["Private DNS zones plan"] = "Existing (subscription '$PrivateDnsZoneSubId', resource group '$PrivateDnsZoneRg')"
+            # If the VNet resolves via custom DNS servers (rather than Azure DNS), Azure Private DNS
+            # zones aren't how resolution works there, so the existing-vs-new zones question is noise -
+            # skip it entirely. Same detection the verification region uses further down.
+            $intakeUsesCustomDns = $intakeVnet.DhcpOptions.DnsServers -and $intakeVnet.DhcpOptions.DnsServers.Count -gt 0
+            if ($intakeUsesCustomDns) {
+                $dnsServersStr = $intakeVnet.DhcpOptions.DnsServers -join ", "
+                Write-Host -ForegroundColor "Cyan" "  VNet '$ExistingVnetName' uses custom DNS servers ($dnsServersStr); Azure Private DNS zone questions are not applicable and will be skipped."
+                $ConfigSummary["Private DNS zones plan"] = "N/A - VNet '$ExistingVnetName' uses custom DNS servers ($dnsServersStr); resolution is handled by the custom DNS provider"
             }
             else {
-                $PrivateDnsZonesMode = "New"
-                $ConfigSummary["Private DNS zones plan"] = "New (created at install)"
+                # Existing-vs-new Private DNS zones question. Asked here even though we don't yet know
+                # whether this VNet actually uses Azure DNS (that's only detectable from its DhcpOptions,
+                # in the verification region below) - an existing VNet is the common case for this, and the
+                # verification step gates on the real detected mode, simply ignoring this answer if the
+                # VNet turns out to use custom/on-prem DNS.
+                $dnsZonesChoice = Read-Choice -Prompt "  Will you use EXISTING Azure Private DNS zones, or have NME/this script create NEW ones?" -Options @(
+                    "Use EXISTING Private DNS zones (you provide the subscription + resource group)",
+                    "Create NEW Private DNS zones (the installer/runbook creates them at deploy time)"
+                ) -Default 2 -Help "NME's private endpoints need these Azure Private DNS zones, linked to the VNet, to resolve to private IPs: privatelink.database.windows.net (SQL), privatelink.vaultcore.azure.net (Key Vault), privatelink.blob.* and privatelink.file.* (Storage), privatelink.azurewebsites.net (App Service), privatelink.azure-automation.net (Automation). EXISTING: your org already manages these zones centrally (common with hub/spoke + Azure Policy auto-registration) - provide the subscription and resource group that holds them, and this script reports which required zones are MISSING there. NEW: NME's deployment (or the Enable Private Endpoints runbook) creates and links the zones for you - this script tests that the zones CAN be created in the test resource group. (Gov/China clouds use the equivalent .us/.cn zone names, derived automatically.)"
+                if ($dnsZonesChoice -eq 1) {
+                    $PrivateDnsZonesMode = "Existing"
+                    do { $PrivateDnsZoneSubId = Read-Host -Prompt "    Subscription ID where the Azure Private DNS zones live" } while ([string]::IsNullOrWhiteSpace($PrivateDnsZoneSubId))
+                    do { $PrivateDnsZoneRg = Read-Host -Prompt "    Resource group name for the Azure Private DNS zones" } while ([string]::IsNullOrWhiteSpace($PrivateDnsZoneRg))
+                    $ConfigSummary["Private DNS zones plan"] = "Existing (subscription '$PrivateDnsZoneSubId', resource group '$PrivateDnsZoneRg')"
+                }
+                else {
+                    $PrivateDnsZonesMode = "New"
+                    $ConfigSummary["Private DNS zones plan"] = "New (created at install)"
+                }
             }
         }
         else {
@@ -739,6 +753,8 @@ try {
     Write-Host ""
 
     if (-not (Read-YesNo -Prompt "Use these names? (Choosing 'n' will prompt for custom resource names) [Y/n]" -Default "y")) {
+        $namePlanDefaults = [ordered]@{}
+        foreach ($k in $NamePlan.Keys) { $namePlanDefaults[$k] = $NamePlan[$k].Value }
         foreach ($k in $NamePlan.Keys) {
             $item = $NamePlan[$k]
             if (-not $item.Editable) { continue }
@@ -749,6 +765,10 @@ try {
                 if ($k -eq "KeyVault") { $custom = ($custom -replace "[^a-zA-Z0-9-]", ""); $custom = $custom.Substring(0, [Math]::Min(24, $custom.Length)) }
                 $item.Value = $custom
             }
+        }
+        foreach ($k in $NamePlan.Keys) {
+            if ($k -eq "ResourceGroup") { continue }
+            if ($NamePlan[$k].Value -ne $namePlanDefaults[$k]) { $CustomResourceNames[$NamePlan[$k].Label] = $NamePlan[$k].Value }
         }
         Write-Host ""
     }
@@ -874,10 +894,6 @@ try {
     $ConfigSummary["Cloud"] = $AzEnv.Name
     $ConfigSummary["Region"] = $Location
     $ConfigSummary["Resource group"] = "$ResourceGroupName $(if ($PendingRgCreate) { '(created by this script)' } else { '(existing, user-supplied)' })"
-    foreach ($k in $NamePlan.Keys) {
-        if ($k -eq "ResourceGroup") { continue }
-        $ConfigSummary["Resource name - $($NamePlan[$k].Label)"] = $NamePlan[$k].Value
-    }
     if ($Tags.Count -gt 0) { $ConfigSummary["Tags applied"] = (($Tags.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join "; ") } else { $ConfigSummary["Tags applied"] = "(none specified)" }
     $ConfigSummary["Private endpoint scenario"] = if ($TestPrivate) { "Yes - $(if ($CreateNewVnet) { 'new' } else { 'existing' }) VNet '$ExistingVnetName' (RG '$ExistingVnetRg'), private endpoint subnet '$PeSubnetName'" } else { "Not tested" }
     $ConfigSummary["App Service VNet integration scenario"] = if ($TestVnetIntegration) { "Yes - app integration subnet '$AppSubnetName' in VNet '$ExistingVnetName'" } else { "Not tested" }
@@ -1167,6 +1183,40 @@ try {
         }
     }
 
+    # Simulate the brief Key Vault public-endpoint enable the standard install performs (to write
+    # secrets) before locking it back down. An Azure Policy that denies enabling KV public network
+    # access would block the install even though the final state is compliant - this surfaces that
+    # up front. Runs whenever the KV was created (not gated on -TestPrivate): every standard install
+    # does this toggle, and the check is cheap (two control-plane updates).
+    $kvOk = ($jobResults | Where-Object { $_.Kind -eq "kv" -and $_.Ok })
+    if ($kvOk) {
+        # Put the KV in its hardened end-state first (best-effort; not the check we care about).
+        try { Update-AzKeyVault -VaultName $kvName -ResourceGroupName $ResourceGroupName -PublicNetworkAccess "Disabled" -ErrorAction Stop | Out-Null } catch {}
+        try {
+            # The actual check: can the install's "briefly enable public access" step succeed.
+            Update-AzKeyVault -VaultName $kvName -ResourceGroupName $ResourceGroupName -PublicNetworkAccess "Enabled" -ErrorAction Stop | Out-Null
+            Add-Result -Category "Deployability" -Check "Key Vault temporary public access (install step)" -Result "Pass" -Detail "Public network access can be toggled on as the installer does during setup."
+        }
+        catch {
+            $kvToggleErrMsg = $_.Exception.Message
+            try { if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $kvToggleErrMsg = "$kvToggleErrMsg`n$($_.ErrorDetails.Message)" } } catch {}
+            try { if ($_.Exception.Response -and $_.Exception.Response.Content) { $kvToggleErrMsg = "$kvToggleErrMsg`n$($_.Exception.Response.Content)" } } catch {}
+            try { if ($_.Exception.Body) { $kvToggleErrMsg = "$kvToggleErrMsg`n$($_.Exception.Body | ConvertTo-Json -Depth 10 -Compress)" } } catch {}
+            if ($_.Exception -is [System.Management.Automation.ParameterBindingException] -or $kvToggleErrMsg -match "A parameter cannot be found") {
+                Add-Result -Category "Deployability" -Check "Key Vault temporary public access (install step)" -Result "Warn" -Detail "Could not simulate - Update-AzKeyVault -PublicNetworkAccess not available in this Az version."
+            }
+            else {
+                $p = Get-PolicyFromError -ExceptionMessage $kvToggleErrMsg
+                $pDisplayHint = if ($p.PolicyAssignmentDisplayName) { $p.PolicyAssignmentDisplayName } elseif ($p.PolicyDefinitionDisplayName) { $p.PolicyDefinitionDisplayName } else { $null }
+                $polName = Resolve-PolicyName -PolicyDefinitionId $p.PolicyDefinitionId -PolicyAssignmentId $p.PolicyAssignmentId -PolicySetDefinitionId $p.PolicySetDefinitionId -DisplayNameHint $pDisplayHint
+                $detail = if ($polName) { "Blocked by Azure Policy: '$polName'." } else { "Failed: $($p.Message)" }
+                Add-Result -Category "Deployability" -Check "Key Vault temporary public access (install step)" -Result "Fail" -Detail $detail -PolicyName $polName -Message $p.Message
+            }
+        }
+        # Revert to the hardened end-state (best-effort/cosmetic; the KV is deleted at cleanup anyway).
+        try { Update-AzKeyVault -VaultName $kvName -ResourceGroupName $ResourceGroupName -PublicNetworkAccess "Disabled" -ErrorAction Stop | Out-Null } catch {}
+    }
+
     # SQL database (depends on SQL server having been created).
     $sqlOk = ($jobResults | Where-Object { $_.Kind -eq "sqlserver" -and $_.Ok })
     if ($sqlOk) {
@@ -1308,17 +1358,41 @@ try {
                 # each required zone in the throwaway TEST resource group; don't link them (linking is not
                 # required to prove creation is allowed, and there's nothing meaningful to link them to on
                 # the new-VNet path). These zones are tracked and removed during cleanup.
+                # Fan the per-zone creates out concurrently (N=6 zones) instead of paying per-zone
+                # create latency serially. Each job does ONLY the create and returns a plain hashtable -
+                # Add-Result/Add-TrackedResource/Get-PolicyFromError/Resolve-PolicyName all touch
+                # shared script state and are called on the main thread below, one result at a time.
+                $zoneJobs = @()
                 foreach ($rz in $RequiredPrivateDnsZones) {
-                    try {
-                        New-AzPrivateDnsZone -ResourceGroupName $ResourceGroupName -Name $rz.Zone -ErrorAction Stop | Out-Null
+                    $zoneJobs += Start-ThreadJob -Name "PrivateDnsZone-$($rz.Zone)" -ScriptBlock {
+                        param($rg, $zoneName, $purpose)
+                        $ErrorActionPreference = "Stop"
+                        try {
+                            New-AzPrivateDnsZone -ResourceGroupName $rg -Name $zoneName -ErrorAction Stop | Out-Null
+                            @{ Zone = $zoneName; Purpose = $purpose; Ok = $true }
+                        }
+                        catch {
+                            $zoneErrMsg = $_.Exception.Message
+                            try { if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $zoneErrMsg = "$zoneErrMsg`n$($_.ErrorDetails.Message)" } } catch {}
+                            try { if ($_.Exception.Response -and $_.Exception.Response.Content) { $zoneErrMsg = "$zoneErrMsg`n$($_.Exception.Response.Content)" } } catch {}
+                            try { if ($_.Exception.Body) { $zoneErrMsg = "$zoneErrMsg`n$($_.Exception.Body | ConvertTo-Json -Depth 10 -Compress)" } } catch {}
+                            @{ Zone = $zoneName; Purpose = $purpose; Ok = $false; Error = $zoneErrMsg }
+                        }
+                    } -ArgumentList $ResourceGroupName, $rz.Zone, $rz.Purpose
+                }
+                $zoneJobResults = $zoneJobs | Wait-Job | Receive-Job
+                $zoneJobs | Remove-Job -Force -ErrorAction SilentlyContinue
+
+                # Process results on the main thread, in the original zone order, so console output
+                # stays stable and the report/cleanup are byte-for-byte equivalent to the sequential form.
+                foreach ($rz in $RequiredPrivateDnsZones) {
+                    $zr = $zoneJobResults | Where-Object { $_.Zone -eq $rz.Zone } | Select-Object -First 1
+                    if ($zr -and $zr.Ok) {
                         Add-TrackedResource -Type "privatednszone" -ResourceGroupName $ResourceGroupName -Name $rz.Zone
-                        Add-Result -Category "PrivateDns" -Check "Private DNS zone: $($rz.Zone)" -Result "Pass" -Detail "Test-created successfully in the throwaway test resource group '$ResourceGroupName' ($($rz.Purpose)); not linked. This is a throwaway zone and will be removed during cleanup."
+                        Add-Result -Category "PrivateDns" -Check "Private DNS zone: $($rz.Zone)" -Result "Pass" -Detail "Test-created successfully in resource group '$ResourceGroupName'."
                     }
-                    catch {
-                        $zoneErrMsg = $_.Exception.Message
-                        try { if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $zoneErrMsg = "$zoneErrMsg`n$($_.ErrorDetails.Message)" } } catch {}
-                        try { if ($_.Exception.Response -and $_.Exception.Response.Content) { $zoneErrMsg = "$zoneErrMsg`n$($_.Exception.Response.Content)" } } catch {}
-                        try { if ($_.Exception.Body) { $zoneErrMsg = "$zoneErrMsg`n$($_.Exception.Body | ConvertTo-Json -Depth 10 -Compress)" } } catch {}
+                    else {
+                        $zoneErrMsg = if ($zr) { $zr.Error } else { "No result returned from the create job." }
                         $p = Get-PolicyFromError -ExceptionMessage $zoneErrMsg
                         $pDisplayHint = if ($p.PolicyAssignmentDisplayName) { $p.PolicyAssignmentDisplayName } elseif ($p.PolicyDefinitionDisplayName) { $p.PolicyDefinitionDisplayName } else { $null }
                         $polName = Resolve-PolicyName -PolicyDefinitionId $p.PolicyDefinitionId -PolicyAssignmentId $p.PolicyAssignmentId -PolicySetDefinitionId $p.PolicySetDefinitionId -DisplayNameHint $pDisplayHint
@@ -1506,6 +1580,23 @@ finally {
         }
         else {
             Write-Host ("{0}{1}" -f $ck.PadRight($cfgKeyWidth), "   $cv")
+        }
+    }
+    if ($CustomResourceNames.Count -gt 0) {
+        Write-Host ""
+        Write-Host "Custom resource names"
+        Write-Host ("-" * 60)
+        $nameKeyCap = 34
+        $nameKeyWidth = [Math]::Min($nameKeyCap, (($CustomResourceNames.Keys | ForEach-Object { $_.Length } | Measure-Object -Maximum).Maximum))
+        foreach ($nk in $CustomResourceNames.Keys) {
+            $nv = $CustomResourceNames[$nk]
+            if ($nk.Length -gt $nameKeyCap) {
+                Write-Host $nk
+                Write-Host ("   {0}" -f $nv)
+            }
+            else {
+                Write-Host ("{0}{1}" -f $nk.PadRight($nameKeyWidth), "   $nv")
+            }
         }
     }
     Write-Host ""
