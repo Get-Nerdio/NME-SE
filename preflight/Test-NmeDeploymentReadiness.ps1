@@ -64,7 +64,7 @@ param (
     [System.String] $Location,
 
     [Parameter(Mandatory = $false)]
-    [System.String] $OutFile = $(if ($Env:AZD_IN_CLOUDSHELL -eq 1) { Join-Path -Path $PWD -ChildPath "NmeReadinessOutput.json" } else { Join-Path -Path $PWD -ChildPath "NmeReadinessOutput.json" })
+    [System.String] $OutFile = (Join-Path -Path $PWD -ChildPath "NmeReadinessOutput.json")
 )
 
 $ErrorActionPreference = "Stop"
@@ -228,10 +228,11 @@ Write-Host "It will:"
 Write-Host "  1. Check your Entra directory roles and Azure subscription role (read-only)."
 Write-Host "  2. Check required resource providers and scan for Deny-effect Azure Policies (read-only)."
 Write-Host "  3. Show you the exact resource names (and tags) it will use and let you customize them."
-Write-Host "  4. Create a TEMPORARY resource group (or use one you name) and attempt to deploy"
+Write-Host "  4. Create a TEMPORARY resource group (or use an existing EMPTY one you name) and attempt to deploy"
 Write-Host "     throwaway copies of the resources Nerdio Manager needs, to detect policy blocks."
 Write-Host "  5. Optionally test a private endpoint + private DNS, and App Service VNet integration"
-Write-Host "     outbound connectivity, in an EXISTING VNet you name (both subnets are required together)."
+Write-Host "     outbound connectivity, in an existing VNet you name or a new one this script creates"
+Write-Host "     (both subnets are required together)."
 Write-Host "  6. DELETE everything it created, then print a report you can copy/paste to your Nerdio SE."
 Write-Host ""
 Write-Host -ForegroundColor "Yellow" "It will NOT modify anything outside the test resource group, other than (if you opt in)"
@@ -262,7 +263,7 @@ try {
     #region Intake -------------------------------------------------------------------------------
     if ([string]::IsNullOrWhiteSpace($SubscriptionId)) {
         do { $SubscriptionId = Read-Host -Prompt "Enter the target Azure subscription id (GUID)" }
-        while ($SubscriptionId -notmatch "^[0-9a-fA-F-]{36}$")
+        while ($SubscriptionId -notmatch "^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$")
     }
     try {
         $Context = Set-AzContext -Subscription $SubscriptionId -ErrorAction Stop
@@ -288,62 +289,142 @@ try {
     if ([string]::IsNullOrEmpty($KeyVaultSuffix)) { $KeyVaultSuffix = "vault.azure.net" }
     $SqlSuffix = $SqlSuffix.TrimStart(".")
 
-    # Resource group: existing, or temporary (actually created after the naming/tag confirmation below).
+    # Private DNS zones the installer creates/links for a private deployment (suffixes are
+    # environment-aware). Computed once here so both the intake questions and the later private
+    # endpoint/DNS test can reference the same list.
+    $RequiredPrivateDnsZones = @(
+        @{ Purpose = "SQL"; Zone = "privatelink.$SqlSuffix" },
+        @{ Purpose = "App Service"; Zone = $(if ($AzEnv.Name -eq "AzureUSGovernment") { "privatelink.azurewebsites.us" } elseif ($AzEnv.Name -eq "AzureChinaCloud") { "privatelink.chinacloudsites.cn" } else { "privatelink.azurewebsites.net" }) },
+        @{ Purpose = "Key Vault"; Zone = $(if ($AzEnv.Name -eq "AzureUSGovernment") { "privatelink.vaultcore.usgovcloudapi.net" } elseif ($AzEnv.Name -eq "AzureChinaCloud") { "privatelink.vaultcore.azure.cn" } else { "privatelink.vaultcore.azure.net" }) },
+        @{ Purpose = "Blob storage"; Zone = "privatelink.blob.$StorageSuffix" },
+        @{ Purpose = "File storage"; Zone = "privatelink.file.$StorageSuffix" },
+        @{ Purpose = "Automation"; Zone = $(if ($AzEnv.Name -eq "AzureUSGovernment") { "privatelink.azure-automation.us" } elseif ($AzEnv.Name -eq "AzureChinaCloud") { "privatelink.azure-automation.cn" } else { "privatelink.azure-automation.net" }) }
+    )
+
+    # Resource group: existing (must be empty - NME installs only into a new or empty RG), or a
+    # temporary one this script creates (after the naming/tag confirmation below).
     $PendingRgCreate = $false
+    $useExisting = $false
     if (-not [string]::IsNullOrWhiteSpace($ResourceGroupName)) {
-        # Supplied via -ResourceGroupName.
-        $ResourceGroup = Get-AzResourceGroup -Name $ResourceGroupName -ErrorAction Stop
-        $Location = $ResourceGroup.Location
-        Write-Host -ForegroundColor "Green" "[$([char]0x2713)] Using existing resource group '$ResourceGroupName' in '$Location'."
+        # Supplied via -ResourceGroupName; validated (and re-prompted if bad) in the loop below.
+        $useExisting = $true
     }
-    elseif (Read-YesNo -Prompt "Use an EXISTING resource group for the test resources? (Selecting 'n' will create a new temporary resource group) [y/n]" -Default "n") {
+    elseif (Read-YesNo -Prompt "Use an EXISTING (empty) resource group for the test resources? (Selecting 'n' will create a new temporary resource group) [y/n]" -Default "n") {
+        $useExisting = $true
+        $ResourceGroupName = $null
+    }
+
+    if ($useExisting) {
+        # NME requires a new or EMPTY resource group, so mirror that here: the RG must exist AND be
+        # empty. Re-prompt on a name we can't find or one that already contains resources.
+        $ResourceGroup = $null
         do {
-            $ResourceGroupName = Read-Host -Prompt "  Existing resource group name"
+            if ([string]::IsNullOrWhiteSpace($ResourceGroupName)) {
+                do { $ResourceGroupName = Read-Host -Prompt "  Existing resource group name (must be EMPTY - NME installs only into a new or empty RG)" } while ([string]::IsNullOrWhiteSpace($ResourceGroupName))
+            }
             try { $ResourceGroup = Get-AzResourceGroup -Name $ResourceGroupName -ErrorAction Stop }
-            catch { Write-Host -ForegroundColor "Yellow" "  Could not find resource group '$ResourceGroupName' in this subscription."; $ResourceGroup = $null }
+            catch {
+                Write-Host -ForegroundColor "Yellow" "  Could not find resource group '$ResourceGroupName' in this subscription. Try again."
+                $ResourceGroup = $null; $ResourceGroupName = $null; continue
+            }
+            try {
+                $existingResources = Get-AzResource -ResourceGroupName $ResourceGroupName -ErrorAction Stop
+                if ($existingResources -and $existingResources.Count -gt 0) {
+                    Write-Host -ForegroundColor "Yellow" "  Resource group '$ResourceGroupName' is not empty ($($existingResources.Count) resource(s)). NME requires a new or EMPTY resource group - choose an empty one, or answer 'n' next time to have this script create a temporary one."
+                    $ResourceGroup = $null; $ResourceGroupName = $null
+                }
+            }
+            catch {
+                # Can't enumerate (e.g. permissions) - warn but don't block; accept the RG as-is.
+                Write-Host -ForegroundColor "Yellow" "  Could not verify whether '$ResourceGroupName' is empty: $($_.Exception.Message)"
+            }
         } while (-not $ResourceGroup)
         $Location = $ResourceGroup.Location
-        Write-Host -ForegroundColor "Green" "[$([char]0x2713)] Using existing resource group '$ResourceGroupName' in '$Location'."
+        Write-Host -ForegroundColor "Green" "[$([char]0x2713)] Using existing empty resource group '$ResourceGroupName' in '$Location'."
     }
     else {
-        if ([string]::IsNullOrWhiteSpace($Location)) {
-            do { $Location = Read-Host -Prompt "Enter the Azure region for the temporary test resources (e.g. eastus)" }
-            while ([string]::IsNullOrWhiteSpace($Location))
+        # Valid regions for this subscription - used to validate the region and re-prompt on a bad value.
+        $validRegions = @()
+        try { $validRegions = @((Get-AzLocation -ErrorAction Stop).Location) } catch {}
+        $Location = ($Location -replace "\s", "").ToLower()
+        if ([string]::IsNullOrWhiteSpace($Location) -or ($validRegions.Count -gt 0 -and $validRegions -notcontains $Location)) {
+            if (-not [string]::IsNullOrWhiteSpace($Location) -and $validRegions.Count -gt 0) {
+                Write-Host -ForegroundColor "Yellow" "  '$Location' is not a valid region for this subscription."
+            }
+            do {
+                $Location = ((Read-Host -Prompt "Enter the Azure region for the temporary test resources (e.g. eastus)") -replace "\s", "").ToLower()
+                if ([string]::IsNullOrWhiteSpace($Location)) { continue }
+                if ($validRegions.Count -gt 0 -and $validRegions -notcontains $Location) {
+                    Write-Host -ForegroundColor "Yellow" "  '$Location' is not a valid region. Examples: $((($validRegions | Sort-Object | Select-Object -First 8) -join ', '))..."
+                    $Location = $null
+                }
+            } while ([string]::IsNullOrWhiteSpace($Location))
         }
         $ResourceGroupName = "rg-nme-preflight-$(New-RandomString -Length 6)"
         $PendingRgCreate = $true
         $CreatedResourceGroup = $true
     }
 
-    if (-not $PendingRgCreate) {
-        try {
-            $existingResources = Get-AzResource -ResourceGroupName $ResourceGroupName -ErrorAction Stop
-            if ($existingResources -and $existingResources.Count -gt 0) {
-                Write-Host -ForegroundColor "Yellow" "[!] Resource group '$ResourceGroupName' is not empty - it already contains $($existingResources.Count) resource(s). Test resources will be created alongside them and cleanup will only remove what this script creates."
-            }
-            else {
-                Write-Host -ForegroundColor "Green" "[$([char]0x2713)] Resource group '$ResourceGroupName' is empty."
-            }
-        }
-        catch {
-            Write-Host -ForegroundColor "Yellow" "  Could not check whether resource group '$ResourceGroupName' is empty." -NoNewline
-            Write-Host " $($_.Exception.Message)"
-        }
-    }
-
-    # Private-network scenario. A private NME deployment requires an existing VNet with two subnets:
-    # one for private endpoints, one (delegated to Microsoft.Web/serverFarms) for App Service VNet
+    # Private-network scenario. A private NME deployment requires a VNet with two subnets: one for
+    # private endpoints, one (delegated to Microsoft.Web/serverFarms) for App Service VNet
     # integration - so both are always requested together; there is no separate opt-in question.
+    # The VNet can be one the user already has, or a new one this script creates and names.
     $TestPrivate = $false
     $TestVnetIntegration = $false
+    $CreateNewVnet = $false
     $ExistingVnetRg = $null; $ExistingVnetName = $null; $PeSubnetName = $null; $AppSubnetName = $null
-    if (Read-YesNo -Prompt "Will you deploy NME into an EXISTING VNet using PRIVATE ENDPOINTS? [y/n]" -Default "n") {
+    if (Read-YesNo -Prompt "Do you want to deploy Nerdio Manager with PRIVATE ENDPOINTS? [y/n]" -Default "n") {
         $TestPrivate = $true
         $TestVnetIntegration = $true
-        do { $ExistingVnetRg = Read-Host -Prompt "  Existing VNet's resource group name" } while ([string]::IsNullOrWhiteSpace($ExistingVnetRg))
-        do { $ExistingVnetName = Read-Host -Prompt "  Existing VNet name" } while ([string]::IsNullOrWhiteSpace($ExistingVnetName))
-        do { $PeSubnetName = Read-Host -Prompt "  Subnet name for private endpoints" } while ([string]::IsNullOrWhiteSpace($PeSubnetName))
-        do { $AppSubnetName = Read-Host -Prompt "  Subnet name for App Service VNet integration (should be delegated to Microsoft.Web/serverFarms)" } while ([string]::IsNullOrWhiteSpace($AppSubnetName))
+
+        if (Read-YesNo -Prompt "Will you deploy to an EXISTING VNet? (Choosing 'n' creates a new VNet; you'll get the option to provide a custom name.) [Y/n]" -Default "y") {
+            # Validate the VNet exists up front and re-prompt on a bad value, so the user isn't told the
+            # name was wrong only after the deployability phase has already created resources.
+            $intakeVnet = $null
+            do {
+                do { $ExistingVnetRg = Read-Host -Prompt "  Existing VNet's resource group name" } while ([string]::IsNullOrWhiteSpace($ExistingVnetRg))
+                do { $ExistingVnetName = Read-Host -Prompt "  Existing VNet name" } while ([string]::IsNullOrWhiteSpace($ExistingVnetName))
+                try { $intakeVnet = Get-AzVirtualNetwork -ResourceGroupName $ExistingVnetRg -Name $ExistingVnetName -ErrorAction Stop }
+                catch { Write-Host -ForegroundColor "Yellow" "  Could not find VNet '$ExistingVnetName' in resource group '$ExistingVnetRg' in this subscription. Try again."; $intakeVnet = $null }
+            } while (-not $intakeVnet)
+
+            # Both subnets are validated against the VNet's actual subnets and must be distinct - a subnet
+            # delegated to Microsoft.Web/serverFarms cannot also host private endpoints.
+            $subnetNames = @($intakeVnet.Subnets.Name)
+            Write-Host -ForegroundColor "Cyan" "  Subnets in '$ExistingVnetName': $($subnetNames -join ', ')"
+            do {
+                $PeSubnetName = Read-Host -Prompt "  Subnet name for private endpoints"
+                if ([string]::IsNullOrWhiteSpace($PeSubnetName)) { continue }
+                if ($subnetNames -notcontains $PeSubnetName) { Write-Host -ForegroundColor "Yellow" "  Subnet '$PeSubnetName' not found in '$ExistingVnetName'. Try again."; $PeSubnetName = $null }
+            } while ([string]::IsNullOrWhiteSpace($PeSubnetName))
+            do {
+                $AppSubnetName = Read-Host -Prompt "  Subnet name for App Service VNet integration (should be delegated to Microsoft.Web/serverFarms)"
+                if ([string]::IsNullOrWhiteSpace($AppSubnetName)) { continue }
+                if ($subnetNames -notcontains $AppSubnetName) { Write-Host -ForegroundColor "Yellow" "  Subnet '$AppSubnetName' not found in '$ExistingVnetName'. Try again."; $AppSubnetName = $null }
+                elseif ($AppSubnetName -eq $PeSubnetName) { Write-Host -ForegroundColor "Yellow" "  The App Service integration subnet must be different from the private endpoint subnet. Try again."; $AppSubnetName = $null }
+            } while ([string]::IsNullOrWhiteSpace($AppSubnetName))
+        }
+        else {
+            # New VNet, created by this script alongside the other test resources below. Its name and
+            # its two subnets' names go through the same NamePlan editable-name flow as everything else.
+            $CreateNewVnet = $true
+            $PeSubnetName = "snet-pe"
+            $AppSubnetName = "snet-appint"
+
+            # A brand-new VNet has no real DNS configuration to inspect, so (unlike the existing-VNet
+            # path, which detects this from the VNet's actual DhcpOptions) we have to ask directly.
+            if (Read-YesNo -Prompt "  Will this VNet use Azure Private DNS Zones to resolve the private endpoints (vs. custom/on-prem DNS servers)? [Y/n]" -Default "y") {
+                $NewVnetDnsMode = "Azure"
+                do { $PrivateDnsZoneSubId = Read-Host -Prompt "    Subscription ID where the Azure Private DNS zones live (or will be created)" } while ([string]::IsNullOrWhiteSpace($PrivateDnsZoneSubId))
+                do { $PrivateDnsZoneRg = Read-Host -Prompt "    Resource group name for the Azure Private DNS zones" } while ([string]::IsNullOrWhiteSpace($PrivateDnsZoneRg))
+                $ConfigSummary["Private DNS resolution plan (new VNet)"] = "Azure Private DNS Zones - subscription '$PrivateDnsZoneSubId', resource group '$PrivateDnsZoneRg' (recorded only; not verified or modified by this script)"
+            }
+            else {
+                $NewVnetDnsMode = "Custom"
+                $zoneList = ($RequiredPrivateDnsZones | ForEach-Object { "$($_.Zone) ($($_.Purpose))" }) -join "; "
+                $ConfigSummary["Private DNS resolution plan (new VNet)"] = "Custom/on-prem DNS - the custom DNS server(s) must resolve: $zoneList"
+            }
+        }
     }
 
     Write-Host ""
@@ -378,6 +459,11 @@ try {
     # NME deploys two Automation Accounts (an updater account and a scripted-actions account) - test both.
     $NamePlan["AutomationUpdater"] = [pscustomobject]@{ Label = "Automation Account (updater)"; Value = "aa-nmepf-updater-$rand"; Editable = $true }
     $NamePlan["AutomationScriptedActions"] = [pscustomobject]@{ Label = "Automation Account (scripted actions)"; Value = "aa-nmepf-actions-$rand"; Editable = $true }
+    if ($CreateNewVnet) {
+        $NamePlan["Vnet"] = [pscustomobject]@{ Label = "Virtual Network"; Value = "vnet-nmepf-$rand"; Editable = $true }
+        $NamePlan["PeSubnet"] = [pscustomobject]@{ Label = "Subnet (private endpoints)"; Value = $PeSubnetName; Editable = $true }
+        $NamePlan["AppSubnet"] = [pscustomobject]@{ Label = "Subnet (App Service VNet integration)"; Value = $AppSubnetName; Editable = $true }
+    }
     if ($TestPrivate) {
         $peStorageDefault = "nmepfpe$(New-RandomString -Length 6)"
         $NamePlan["PeStorage"] = [pscustomobject]@{ Label = "Storage account for private endpoint test"; Value = $peStorageDefault.Substring(0, [Math]::Min(24, $peStorageDefault.Length)).ToLower(); Editable = $true }
@@ -418,6 +504,7 @@ try {
     $aaScriptedActionsName = $NamePlan["AutomationScriptedActions"].Value
     if ($TestPrivate) { $peStorageName = $NamePlan["PeStorage"].Value; $peName = $NamePlan["PrivateEndpoint"].Value }
     if ($TestVnetIntegration) { $connAspName = $NamePlan["ConnAsp"].Value; $connWebName = $NamePlan["ConnWebApp"].Value }
+    if ($CreateNewVnet) { $NewVnetName = $NamePlan["Vnet"].Value; $PeSubnetName = $NamePlan["PeSubnet"].Value; $AppSubnetName = $NamePlan["AppSubnet"].Value }
 
     # NmeNetworkTest.ps1 auto-derives Key Vault/SQL/DPS-storage FQDNs only when the App Service name
     # matches the standard "nmw-app-*" pattern. Our test App Service doesn't, so if it's ever run
@@ -446,6 +533,20 @@ try {
     }
     Write-Host ""
 
+    if ($CreateNewVnet) {
+        Write-Host -ForegroundColor "Cyan" "Creating VNet '$NewVnetName' with a private endpoint subnet and an App Service integration subnet."
+        $peSubnetConfig = New-AzVirtualNetworkSubnetConfig -Name $PeSubnetName -AddressPrefix "10.60.1.0/24"
+        # Only the App Service integration subnet needs the serverFarms delegation - a subnet delegated
+        # to it cannot also host private endpoints, which is why the two subnets are always distinct.
+        $appDelegation = New-AzDelegation -Name "appServiceDelegation" -ServiceName "Microsoft.Web/serverFarms"
+        $appSubnetConfig = New-AzVirtualNetworkSubnetConfig -Name $AppSubnetName -AddressPrefix "10.60.2.0/24" -Delegation $appDelegation
+        $newVnet = New-AzVirtualNetwork -ResourceGroupName $ResourceGroupName -Name $NewVnetName -Location $Location -AddressPrefix "10.60.0.0/16" -Subnet $peSubnetConfig, $appSubnetConfig -Tag $Tags -ErrorAction Stop
+        Add-TrackedResource -Type "vnet" -ResourceGroupName $ResourceGroupName -Name $NewVnetName -Id $newVnet.Id
+        $ExistingVnetRg = $ResourceGroupName
+        $ExistingVnetName = $NewVnetName
+    }
+    Write-Host ""
+
     # Record every input/response so the SE has a confirmed-working configuration to refer back to
     # once it's time to actually install NME.
     $ConfigSummary["Run by (signed-in account)"] = (Get-AzContext).Account.Id
@@ -458,7 +559,7 @@ try {
         $ConfigSummary["Resource name - $($NamePlan[$k].Label)"] = $NamePlan[$k].Value
     }
     if ($Tags.Count -gt 0) { $ConfigSummary["Tags applied"] = (($Tags.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join "; ") } else { $ConfigSummary["Tags applied"] = "(none specified)" }
-    $ConfigSummary["Private endpoint scenario"] = if ($TestPrivate) { "Yes - existing VNet '$ExistingVnetName' (RG '$ExistingVnetRg'), private endpoint subnet '$PeSubnetName'" } else { "Not tested" }
+    $ConfigSummary["Private endpoint scenario"] = if ($TestPrivate) { "Yes - $(if ($CreateNewVnet) { 'new' } else { 'existing' }) VNet '$ExistingVnetName' (RG '$ExistingVnetRg'), private endpoint subnet '$PeSubnetName'" } else { "Not tested" }
     $ConfigSummary["App Service VNet integration scenario"] = if ($TestVnetIntegration) { "Yes - app integration subnet '$AppSubnetName' in VNet '$ExistingVnetName'" } else { "Not tested" }
     $ConfigSummary["VNet DNS configuration"] = "Not tested"
     #endregion
@@ -705,37 +806,53 @@ policyresources
         Write-Host -ForegroundColor "Cyan" "Testing private endpoint and private DNS configuration..."
         try {
             $vnet = Get-AzVirtualNetwork -ResourceGroupName $ExistingVnetRg -Name $ExistingVnetName -ErrorAction Stop
-            $dnsServers = if ($vnet.DhcpOptions.DnsServers -and $vnet.DhcpOptions.DnsServers.Count -gt 0) { $vnet.DhcpOptions.DnsServers -join ", " } else { "Azure-provided default (168.63.129.16)" }
-            Add-Result -Category "PrivateDns" -Check "VNet DNS configuration" -Result "Info" -Detail "VNet '$ExistingVnetName' custom DNS servers: $dnsServers"
+            if ($CreateNewVnet) {
+                # A brand-new VNet has no real DhcpOptions to inspect and (being brand new) is never
+                # linked to any pre-existing private DNS zone - use the DNS mode captured at intake
+                # instead of inferring it, and only record/report, per that intake choice.
+                $usesCustomDns = ($NewVnetDnsMode -eq "Custom")
+                $dnsServers = if ($usesCustomDns) { "Custom/on-prem DNS (per intake answer)" } else { "Azure Private DNS Zones - subscription '$PrivateDnsZoneSubId', RG '$PrivateDnsZoneRg' (per intake answer)" }
+            }
+            else {
+                $usesCustomDns = $vnet.DhcpOptions.DnsServers -and $vnet.DhcpOptions.DnsServers.Count -gt 0
+                $dnsServers = if ($usesCustomDns) { $vnet.DhcpOptions.DnsServers -join ", " } else { "Azure-provided default (168.63.129.16)" }
+            }
+            Add-Result -Category "PrivateDns" -Check "VNet DNS configuration" -Result "Info" -Detail "VNet '$ExistingVnetName' DNS servers: $dnsServers"
             $ConfigSummary["VNet DNS configuration"] = "VNet '$ExistingVnetName': $dnsServers"
 
-            # Required private DNS zones the installer creates/links (suffixes are environment-aware).
-            $requiredZones = @(
-                @{ Purpose = "SQL"; Zone = "privatelink.$SqlSuffix" },
-                @{ Purpose = "App Service"; Zone = $(if ($AzEnv.Name -eq "AzureUSGovernment") { "privatelink.azurewebsites.us" } elseif ($AzEnv.Name -eq "AzureChinaCloud") { "privatelink.chinacloudsites.cn" } else { "privatelink.azurewebsites.net" }) },
-                @{ Purpose = "Key Vault"; Zone = "privatelink.$KeyVaultSuffix" },
-                @{ Purpose = "Blob storage"; Zone = "privatelink.blob.$StorageSuffix" },
-                @{ Purpose = "File storage"; Zone = "privatelink.file.$StorageSuffix" },
-                @{ Purpose = "Automation"; Zone = $(if ($AzEnv.Name -eq "AzureUSGovernment") { "privatelink.azure-automation.us" } elseif ($AzEnv.Name -eq "AzureChinaCloud") { "privatelink.azure-automation.cn" } else { "privatelink.azure-automation.net" }) }
-            )
-            $allZones = @()
-            try { $allZones = Get-AzPrivateDnsZone -ErrorAction Stop } catch {}
-            foreach ($rz in $requiredZones) {
-                $match = $allZones | Where-Object { $_.Name -eq $rz.Zone }
-                if (-not $match) {
-                    Add-Result -Category "PrivateDns" -Check "Private DNS zone: $($rz.Zone)" -Result "Fail" -Detail "MISSING - required for $($rz.Purpose) private endpoints. Create it and link it to '$ExistingVnetName'."
-                    continue
-                }
-                $linked = $false
-                foreach ($z in $match) {
-                    try {
-                        $links = Get-AzPrivateDnsVirtualNetworkLink -ResourceGroupName $z.ResourceGroupName -ZoneName $z.Name -ErrorAction Stop
-                        if ($links | Where-Object { $_.VirtualNetworkId -eq $vnet.Id }) { $linked = $true; break }
+            if ($usesCustomDns) {
+                # VNet resolves names via its own (non-Azure) DNS servers rather than Azure-provided DNS,
+                # so Azure private DNS zones linked to this VNet aren't how resolution works here - skip that check.
+                $zoneList = ($RequiredPrivateDnsZones | ForEach-Object { "$($_.Zone) ($($_.Purpose))" }) -join "; "
+                Add-Result -Category "PrivateDns" -Check "Private DNS zones" -Result "Info" -Detail "VNet uses custom DNS servers ($dnsServers); Azure private DNS zone checks are not applicable. The custom DNS server must resolve: $zoneList"
+            }
+            elseif ($CreateNewVnet) {
+                # Azure Private DNS Zones chosen for a brand-new VNet - those zones/links belong to a
+                # subscription and resource group the user provided at intake. Record and report only;
+                # don't check existence/linkage (a fresh VNet won't be linked yet) or modify anything.
+                $zoneList = ($RequiredPrivateDnsZones | ForEach-Object { "$($_.Zone) ($($_.Purpose))" }) -join "; "
+                Add-Result -Category "PrivateDns" -Check "Private DNS zones" -Result "Info" -Detail "Azure Private DNS Zones selected (subscription '$PrivateDnsZoneSubId', RG '$PrivateDnsZoneRg'). Required zones: $zoneList. Not verified or modified by this script."
+            }
+            else {
+                $allZones = @()
+                try { $allZones = Get-AzPrivateDnsZone -ErrorAction Stop } catch {}
+                foreach ($rz in $RequiredPrivateDnsZones) {
+                    $match = $allZones | Where-Object { $_.Name -eq $rz.Zone }
+                    if (-not $match) {
+                        Add-Result -Category "PrivateDns" -Check "Private DNS zone: $($rz.Zone)" -Result "Fail" -Detail "MISSING - required for $($rz.Purpose) private endpoints. Create it and link it to '$ExistingVnetName'."
+                        continue
                     }
-                    catch {}
+                    $linked = $false
+                    foreach ($z in $match) {
+                        try {
+                            $links = Get-AzPrivateDnsVirtualNetworkLink -ResourceGroupName $z.ResourceGroupName -ZoneName $z.Name -ErrorAction Stop
+                            if ($links | Where-Object { $_.VirtualNetworkId -eq $vnet.Id }) { $linked = $true; break }
+                        }
+                        catch {}
+                    }
+                    if ($linked) { Add-Result -Category "PrivateDns" -Check "Private DNS zone: $($rz.Zone)" -Result "Pass" -Detail "Exists and linked to '$ExistingVnetName' ($($rz.Purpose))." }
+                    else { Add-Result -Category "PrivateDns" -Check "Private DNS zone: $($rz.Zone)" -Result "Warn" -Detail "Exists but NOT linked to '$ExistingVnetName' ($($rz.Purpose)). Add a virtual network link." }
                 }
-                if ($linked) { Add-Result -Category "PrivateDns" -Check "Private DNS zone: $($rz.Zone)" -Result "Pass" -Detail "Exists and linked to '$ExistingVnetName' ($($rz.Purpose))." }
-                else { Add-Result -Category "PrivateDns" -Check "Private DNS zone: $($rz.Zone)" -Result "Warn" -Detail "Exists but NOT linked to '$ExistingVnetName' ($($rz.Purpose)). Add a virtual network link." }
             }
 
             # Deploy a private endpoint to a storage account's blob subresource in the named subnet.
@@ -781,7 +898,7 @@ policyresources
 
     #region App Service VNet integration + outbound connectivity ---------------------------------
     if ($TestVnetIntegration) {
-        Write-Host -ForegroundColor "Cyan" "Testing App Service VNet-integration outbound connectivity..."
+        Write-Host -ForegroundColor "Cyan" "Testing App Service VNet-integration outbound connectivity; this takes some time..."
         try {
             $vnet = Get-AzVirtualNetwork -ResourceGroupName $ExistingVnetRg -Name $ExistingVnetName -ErrorAction Stop
             $appSubnet = $vnet.Subnets | Where-Object { $_.Name -eq $AppSubnetName }
@@ -918,12 +1035,25 @@ finally {
     $removeAll = Read-YesNo -Prompt "Remove all resources created by this test? [Y/n]" -Default "y"
     if ($removeAll) {
         Write-Host -ForegroundColor "Cyan" "Removing created resources (reverse order)..."
+        # Locks first, in their own pass: a lock can be created (during the parallel checks)
+        # before the resource that later depends on it being gone (e.g. the private endpoint,
+        # whose removal deletes a privateEndpointConnectionProxies sub-resource on the storage
+        # account) is even created, so strict reverse-creation order can hit a locked scope.
+        for ($i = $Tracker.Count - 1; $i -ge 0; $i--) {
+            $t = $Tracker[$i]
+            if ($t.Type -ne "lock") { continue }
+            try {
+                Remove-AzResourceLock -LockId $t.Id -Force -ErrorAction Continue | Out-Null
+                Write-Host "  removed $($t.Type): $($t.Name)"
+            }
+            catch { Write-Host -ForegroundColor "Yellow" "  could not remove $($t.Type) '$($t.Name)': $($_.Exception.Message)" }
+        }
         # Reverse the tracker so dependents are removed before dependencies.
         for ($i = $Tracker.Count - 1; $i -ge 0; $i--) {
             $t = $Tracker[$i]
+            if ($t.Type -eq "lock") { continue }
             try {
                 switch ($t.Type) {
-                    "lock" { Remove-AzResourceLock -LockId $t.Id -Force -ErrorAction Continue | Out-Null }
                     "privateendpoint" { Remove-AzPrivateEndpoint -ResourceGroupName $t.ResourceGroupName -Name $t.Name -Force -ErrorAction Continue | Out-Null }
                     "webapp" { Remove-AzWebApp -ResourceGroupName $t.ResourceGroupName -Name $t.Name -Force -ErrorAction Continue | Out-Null }
                     "asp" { Remove-AzAppServicePlan -ResourceGroupName $t.ResourceGroupName -Name $t.Name -Force -ErrorAction Continue | Out-Null }
@@ -936,6 +1066,7 @@ finally {
                     "sqlserver" { Remove-AzSqlServer -ResourceGroupName $t.ResourceGroupName -ServerName $t.Name -Force -ErrorAction Continue | Out-Null }
                     "storage" { Remove-AzStorageAccount -ResourceGroupName $t.ResourceGroupName -Name $t.Name -Force -ErrorAction Continue | Out-Null }
                     "law" { Remove-AzOperationalInsightsWorkspace -ResourceGroupName $t.ResourceGroupName -Name $t.Name -Force -ForceDelete -ErrorAction Continue | Out-Null }
+                    "vnet" { Remove-AzVirtualNetwork -ResourceGroupName $t.ResourceGroupName -Name $t.Name -Force -ErrorAction Continue | Out-Null }
                     default { }
                 }
                 Write-Host "  removed $($t.Type): $($t.Name)"
