@@ -418,6 +418,13 @@ try {
     if ($TestPrivate) { $peStorageName = $NamePlan["PeStorage"].Value; $peName = $NamePlan["PrivateEndpoint"].Value }
     if ($TestVnetIntegration) { $connAspName = $NamePlan["ConnAsp"].Value; $connWebName = $NamePlan["ConnWebApp"].Value }
 
+    # NmeNetworkTest.ps1 auto-derives Key Vault/SQL/DPS-storage FQDNs only when the App Service name
+    # matches the standard "nmw-app-*" pattern. Our test App Service doesn't, so if it's ever run
+    # manually against it, it needs -AdditionalTestUris with this run's own resource names.
+    $AdditionalTestUrisList = @("$kvName.$KeyVaultSuffix", "$sqlName.$SqlSuffix", "$stName.blob.$StorageSuffix")
+    $AdditionalTestUrisArg = ($AdditionalTestUrisList | ForEach-Object { "'$_'" }) -join ","
+    $NmeNetworkTestHint = "Run NmeNetworkTest.ps1 with -AdditionalTestUris $AdditionalTestUrisArg (this test App Service's name doesn't match the standard nmw-app-* pattern NmeNetworkTest.ps1 expects)."
+
     # Tags applied to every resource this script creates (never to a pre-existing resource group).
     # Only user-specified tags are applied - none are added by default.
     $Tags = @{}
@@ -838,16 +845,16 @@ policyresources
                                     Add-Result -Category "Connectivity" -Check "Outbound: $ep" -Result "Pass" -Detail "Reachable from the VNet-integrated worker. Cert: $subject"
                                 }
                                 else {
-                                    Add-Result -Category "Connectivity" -Check "Outbound: $ep" -Result "Warn" -Detail "No confirmation from the worker - may be blocked. Verify with NmeNetworkTest.ps1 after install."
+                                    Add-Result -Category "Connectivity" -Check "Outbound: $ep" -Result "Warn" -Detail "No confirmation from the worker - may be blocked. $NmeNetworkTestHint"
                                 }
                             }
                         }
                         catch {
-                            Add-Result -Category "Connectivity" -Check "Kudu outbound test" -Result "Warn" -Detail "Could not run the in-worker connectivity test via Kudu. After installing NME, run NmeNetworkTest.ps1 from the App Service Kudu console to test these endpoints: $($endpoints -join ', ')." -Message $_.Exception.Message
+                            Add-Result -Category "Connectivity" -Check "Kudu outbound test" -Result "Warn" -Detail "Could not run the in-worker connectivity test via Kudu. From the App Service Kudu console for '$webName': $NmeNetworkTestHint Endpoints to test: $($endpoints -join ', ')." -Message $_.Exception.Message
                         }
                     }
                     else {
-                        Add-Result -Category "Connectivity" -Check "VNet integration" -Result "Warn" -Detail "Could not enable VNet integration (HTTP $($swift.StatusCode)). After install, verify outbound access with NmeNetworkTest.ps1." -Message $swift.Content
+                        Add-Result -Category "Connectivity" -Check "VNet integration" -Result "Warn" -Detail "Could not enable VNet integration (HTTP $($swift.StatusCode)) on the test App Service. After the real NME install has working VNet integration, verify outbound access with NmeNetworkTest.ps1." -Message $swift.Content
                     }
                 }
             }
