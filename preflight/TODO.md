@@ -8,8 +8,6 @@
 
    3a. ~~**Complex prompts → numbered options.**~~ **DONE.** The three complex/ambiguous prompts (private endpoints; existing vs new VNet; Azure vs custom DNS) are now 1/2/? numbered `Read-Choice` prompts; simple confirmations stay y/n (the existing-RG and custom-tags prompts gained `-Help` explanations).
 
-4. **Private endpoint path should distinguish new vs. existing Private DNS zones.** Ask up front whether the customer will use existing Private DNS zones or have the script create new ones:
-   - If **existing**: prompt for the subscription/resource group containing the zones, then check and report which required private DNS zones are missing from that resource group.
-   - If **new**: test creating the required Private DNS zones in the test resource group.
+4. ~~**Private endpoint path should distinguish new vs. existing Private DNS zones.**~~ **DONE.** A new numbered prompt asks existing-vs-new Private DNS zones (Azure-DNS path only). Existing: prompt for the zones' subscription/RG (context-switching to that subscription for the read-only lookup) and report which required zones are missing from that RG; also report linkage on the existing-VNet path. New: test-create the required zones in the throwaway test RG (tracked + cleaned up, blocking policy named on failure).
 
 5. **Existing VNet private endpoint testing should report only what's missing.** When testing private endpoints against an existing VNet, deploy test private endpoints and confirm all required DNS zones are linked to that VNet — report only the zones that are missing or not linked, not the full list.

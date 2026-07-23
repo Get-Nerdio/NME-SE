@@ -584,6 +584,7 @@ try {
     $TestVnetIntegration = $false
     $CreateNewVnet = $false
     $ExistingVnetRg = $null; $ExistingVnetName = $null; $PeSubnetName = $null; $AppSubnetName = $null
+    $PrivateDnsZonesMode = $null; $PrivateDnsZoneSubId = $null; $PrivateDnsZoneRg = $null
     $privateChoice = Read-Choice -Prompt "Do you want to deploy Nerdio Manager with PRIVATE ENDPOINTS?" -Options @(
         "Yes - deploy with private endpoints (no public internet exposure)",
         "No - use public endpoints (default)"
@@ -622,6 +623,26 @@ try {
                 if ($subnetNames -notcontains $AppSubnetName) { Write-Host -ForegroundColor "Yellow" "  Subnet '$AppSubnetName' not found in '$ExistingVnetName'. Try again."; $AppSubnetName = $null }
                 elseif ($AppSubnetName -eq $PeSubnetName) { Write-Host -ForegroundColor "Yellow" "  The App Service integration subnet must be different from the private endpoint subnet. Try again."; $AppSubnetName = $null }
             } while ([string]::IsNullOrWhiteSpace($AppSubnetName))
+
+            # Existing-vs-new Private DNS zones question. Asked here even though we don't yet know
+            # whether this VNet actually uses Azure DNS (that's only detectable from its DhcpOptions,
+            # in the verification region below) - an existing VNet is the common case for this, and the
+            # verification step gates on the real detected mode, simply ignoring this answer if the
+            # VNet turns out to use custom/on-prem DNS.
+            $dnsZonesChoice = Read-Choice -Prompt "  Will you use EXISTING Azure Private DNS zones, or have NME/this script create NEW ones?" -Options @(
+                "Use EXISTING Private DNS zones (you provide the subscription + resource group)",
+                "Create NEW Private DNS zones (the installer/runbook creates them at deploy time)"
+            ) -Default 2 -Help "NME's private endpoints need these Azure Private DNS zones, linked to the VNet, to resolve to private IPs: privatelink.database.windows.net (SQL), privatelink.vaultcore.azure.net (Key Vault), privatelink.blob.* and privatelink.file.* (Storage), privatelink.azurewebsites.net (App Service), privatelink.azure-automation.net (Automation). EXISTING: your org already manages these zones centrally (common with hub/spoke + Azure Policy auto-registration) - provide the subscription and resource group that holds them, and this script reports which required zones are MISSING there. NEW: NME's deployment (or the Enable Private Endpoints runbook) creates and links the zones for you - this script tests that the zones CAN be created in the test resource group. (Gov/China clouds use the equivalent .us/.cn zone names, derived automatically.)"
+            if ($dnsZonesChoice -eq 1) {
+                $PrivateDnsZonesMode = "Existing"
+                do { $PrivateDnsZoneSubId = Read-Host -Prompt "    Subscription ID where the Azure Private DNS zones live" } while ([string]::IsNullOrWhiteSpace($PrivateDnsZoneSubId))
+                do { $PrivateDnsZoneRg = Read-Host -Prompt "    Resource group name for the Azure Private DNS zones" } while ([string]::IsNullOrWhiteSpace($PrivateDnsZoneRg))
+                $ConfigSummary["Private DNS zones plan"] = "Existing (subscription '$PrivateDnsZoneSubId', resource group '$PrivateDnsZoneRg')"
+            }
+            else {
+                $PrivateDnsZonesMode = "New"
+                $ConfigSummary["Private DNS zones plan"] = "New (created at install)"
+            }
         }
         else {
             # New VNet, created by this script alongside the other test resources below. Its name and
@@ -638,9 +659,25 @@ try {
             ) -Default 1 -Help "NME's private endpoints only work if the privatelink DNS names (e.g. privatelink.database.windows.net) resolve to the private IPs. Azure Private DNS Zones: Azure hosts those zones and, when linked to the VNet, resolves them automatically - simplest option. Custom / on-prem DNS: your own DNS servers (set on the VNet) must host or conditionally forward every required privatelink zone; the script will list the exact zones your DNS must resolve. Choose Azure Private DNS Zones unless your organization mandates centralized custom DNS."
             if ($dnsModeChoice -eq 1) {
                 $NewVnetDnsMode = "Azure"
-                do { $PrivateDnsZoneSubId = Read-Host -Prompt "    Subscription ID where the Azure Private DNS zones live (or will be created)" } while ([string]::IsNullOrWhiteSpace($PrivateDnsZoneSubId))
-                do { $PrivateDnsZoneRg = Read-Host -Prompt "    Resource group name for the Azure Private DNS zones" } while ([string]::IsNullOrWhiteSpace($PrivateDnsZoneRg))
-                $ConfigSummary["Private DNS resolution plan (new VNet)"] = "Azure Private DNS Zones - subscription '$PrivateDnsZoneSubId', resource group '$PrivateDnsZoneRg' (recorded only; not verified or modified by this script)"
+
+                # Existing-vs-new Private DNS zones question (same question/help as the existing-VNet
+                # path; here the mode is already known to be Azure, so this always applies).
+                $dnsZonesChoice = Read-Choice -Prompt "  Will you use EXISTING Azure Private DNS zones, or have NME/this script create NEW ones?" -Options @(
+                    "Use EXISTING Private DNS zones (you provide the subscription + resource group)",
+                    "Create NEW Private DNS zones (the installer/runbook creates them at deploy time)"
+                ) -Default 2 -Help "NME's private endpoints need these Azure Private DNS zones, linked to the VNet, to resolve to private IPs: privatelink.database.windows.net (SQL), privatelink.vaultcore.azure.net (Key Vault), privatelink.blob.* and privatelink.file.* (Storage), privatelink.azurewebsites.net (App Service), privatelink.azure-automation.net (Automation). EXISTING: your org already manages these zones centrally (common with hub/spoke + Azure Policy auto-registration) - provide the subscription and resource group that holds them, and this script reports which required zones are MISSING there. NEW: NME's deployment (or the Enable Private Endpoints runbook) creates and links the zones for you - this script tests that the zones CAN be created in the test resource group. (Gov/China clouds use the equivalent .us/.cn zone names, derived automatically.)"
+                if ($dnsZonesChoice -eq 1) {
+                    $PrivateDnsZonesMode = "Existing"
+                    do { $PrivateDnsZoneSubId = Read-Host -Prompt "    Subscription ID where the Azure Private DNS zones live" } while ([string]::IsNullOrWhiteSpace($PrivateDnsZoneSubId))
+                    do { $PrivateDnsZoneRg = Read-Host -Prompt "    Resource group name for the Azure Private DNS zones" } while ([string]::IsNullOrWhiteSpace($PrivateDnsZoneRg))
+                    $ConfigSummary["Private DNS zones plan"] = "Existing (subscription '$PrivateDnsZoneSubId', resource group '$PrivateDnsZoneRg')"
+                    $ConfigSummary["Private DNS resolution plan (new VNet)"] = "Azure Private DNS Zones - subscription '$PrivateDnsZoneSubId', resource group '$PrivateDnsZoneRg' (recorded only; not verified or modified by this script)"
+                }
+                else {
+                    $PrivateDnsZonesMode = "New"
+                    $ConfigSummary["Private DNS zones plan"] = "New (created at install)"
+                    $ConfigSummary["Private DNS resolution plan (new VNet)"] = "Azure Private DNS Zones - created at install (this script test-creates the required zones in the throwaway test resource group)"
+                }
             }
             else {
                 $NewVnetDnsMode = "Custom"
@@ -1168,7 +1205,7 @@ try {
                 # linked to any pre-existing private DNS zone - use the DNS mode captured at intake
                 # instead of inferring it, and only record/report, per that intake choice.
                 $usesCustomDns = ($NewVnetDnsMode -eq "Custom")
-                $dnsServers = if ($usesCustomDns) { "Custom/on-prem DNS (per intake answer)" } else { "Azure Private DNS Zones - subscription '$PrivateDnsZoneSubId', RG '$PrivateDnsZoneRg' (per intake answer)" }
+                $dnsServers = if ($usesCustomDns) { "Custom/on-prem DNS (per intake answer)" } elseif ($PrivateDnsZonesMode -eq "Existing") { "Azure Private DNS Zones - subscription '$PrivateDnsZoneSubId', RG '$PrivateDnsZoneRg' (per intake answer)" } else { "Azure Private DNS Zones - created at install (per intake answer)" }
             }
             else {
                 $usesCustomDns = $vnet.DhcpOptions.DnsServers -and $vnet.DhcpOptions.DnsServers.Count -gt 0
@@ -1183,32 +1220,96 @@ try {
                 $zoneList = ($RequiredPrivateDnsZones | ForEach-Object { "$($_.Zone) ($($_.Purpose))" }) -join "; "
                 Add-Result -Category "PrivateDns" -Check "Private DNS zones" -Result "Info" -Detail "VNet uses custom DNS servers ($dnsServers); Azure private DNS zone checks are not applicable. The custom DNS server must resolve: $zoneList"
             }
-            elseif ($CreateNewVnet) {
-                # Azure Private DNS Zones chosen for a brand-new VNet - those zones/links belong to a
-                # subscription and resource group the user provided at intake. Record and report only;
-                # don't check existence/linkage (a fresh VNet won't be linked yet) or modify anything.
-                $zoneList = ($RequiredPrivateDnsZones | ForEach-Object { "$($_.Zone) ($($_.Purpose))" }) -join "; "
-                Add-Result -Category "PrivateDns" -Check "Private DNS zones" -Result "Info" -Detail "Azure Private DNS Zones selected (subscription '$PrivateDnsZoneSubId', RG '$PrivateDnsZoneRg'). Required zones: $zoneList. Not verified or modified by this script."
+            elseif ($PrivateDnsZonesMode -eq "Existing") {
+                # The customer's private DNS zones may live in a DIFFERENT subscription than the one
+                # under test (common with centralized hub/spoke DNS). Switch context to that
+                # subscription for the read-only zone lookups below, then ALWAYS restore the test
+                # subscription context in the finally so the private endpoint deployment that follows
+                # still targets the correct subscription. $vnet.Id is a full resource id, so the
+                # linkage comparison still works across the context switch.
+                $dnsZoneCtxSwitched = $false
+                if ($PrivateDnsZoneSubId -and $PrivateDnsZoneSubId -ne $SubscriptionId) {
+                    try { Set-AzContext -Subscription $PrivateDnsZoneSubId -ErrorAction Stop | Out-Null; $dnsZoneCtxSwitched = $true }
+                    catch { Add-Result -Category "PrivateDns" -Check "Private DNS zones subscription" -Result "Warn" -Detail "Could not switch to subscription '$PrivateDnsZoneSubId' to read the private DNS zones; results below are from the current subscription and may be inaccurate." -Message $_.Exception.Message }
+                }
+                try {
+                if ($CreateNewVnet) {
+                    # New-VNet + Existing zones: the real zones already exist in a subscription/RG the
+                    # customer manages. Report which required zones are MISSING from that RG. Linkage
+                    # can't be checked here (this VNet is throwaway) - that's handled at install.
+                    $rgZones = @()
+                    try { $rgZones = Get-AzPrivateDnsZone -ResourceGroupName $PrivateDnsZoneRg -ErrorAction Stop } catch {}
+                    $missingZones = @()
+                    foreach ($rz in $RequiredPrivateDnsZones) {
+                        $match = $rgZones | Where-Object { $_.Name -eq $rz.Zone }
+                        if (-not $match) {
+                            $missingZones += $rz.Zone
+                            Add-Result -Category "PrivateDns" -Check "Private DNS zone: $($rz.Zone)" -Result "Fail" -Detail "MISSING from resource group '$PrivateDnsZoneRg' - required for $($rz.Purpose) private endpoints. Linkage to the real VNet is handled at install (this test VNet is throwaway)."
+                        }
+                    }
+                    if ($missingZones.Count -eq 0) {
+                        Add-Result -Category "PrivateDns" -Check "Private DNS zones" -Result "Pass" -Detail "All required zones present in resource group '$PrivateDnsZoneRg'. Linkage to the real VNet is handled at install."
+                    }
+                    $ConfigSummary["Private DNS zones missing"] = if ($missingZones.Count -gt 0) { $missingZones -join "; " } else { "none - all required zones present" }
+                }
+                else {
+                    # Existing-VNet + Existing zones: scope "missing" to the named resource group when
+                    # one was supplied (a zone that exists only elsewhere in the subscription is still
+                    # missing from the RG the customer told us they use), and separately report whether
+                    # it's linked to this actual VNet.
+                    $allZones = @()
+                    try { $allZones = Get-AzPrivateDnsZone -ErrorAction Stop } catch {}
+                    $missingZones = @()
+                    foreach ($rz in $RequiredPrivateDnsZones) {
+                        $match = $allZones | Where-Object { $_.Name -eq $rz.Zone }
+                        if ($PrivateDnsZoneRg) { $match = $match | Where-Object { $_.ResourceGroupName -eq $PrivateDnsZoneRg } }
+                        if (-not $match) {
+                            $missingZones += $rz.Zone
+                            $whereText = if ($PrivateDnsZoneRg) { "resource group '$PrivateDnsZoneRg'" } else { "this subscription" }
+                            Add-Result -Category "PrivateDns" -Check "Private DNS zone: $($rz.Zone)" -Result "Fail" -Detail "MISSING from $whereText - required for $($rz.Purpose) private endpoints. Create it and link it to '$ExistingVnetName'."
+                            continue
+                        }
+                        $linked = $false
+                        foreach ($z in $match) {
+                            try {
+                                $links = Get-AzPrivateDnsVirtualNetworkLink -ResourceGroupName $z.ResourceGroupName -ZoneName $z.Name -ErrorAction Stop
+                                if ($links | Where-Object { $_.VirtualNetworkId -eq $vnet.Id }) { $linked = $true; break }
+                            }
+                            catch {}
+                        }
+                        if ($linked) { Add-Result -Category "PrivateDns" -Check "Private DNS zone: $($rz.Zone)" -Result "Pass" -Detail "Present and linked to '$ExistingVnetName' ($($rz.Purpose))." }
+                        else { Add-Result -Category "PrivateDns" -Check "Private DNS zone: $($rz.Zone)" -Result "Warn" -Detail "Present but NOT linked to '$ExistingVnetName' ($($rz.Purpose)). Add a virtual network link." }
+                    }
+                    $ConfigSummary["Private DNS zones missing"] = if ($missingZones.Count -gt 0) { $missingZones -join "; " } else { "none - all required zones present" }
+                }
+                }
+                finally {
+                    if ($dnsZoneCtxSwitched) { try { Set-AzContext -Subscription $SubscriptionId -ErrorAction Stop | Out-Null } catch {} }
+                }
             }
             else {
-                $allZones = @()
-                try { $allZones = Get-AzPrivateDnsZone -ErrorAction Stop } catch {}
+                # New zones (either VNet path): the installer/runbook is expected to create and link the
+                # zones at deploy time. Prove Azure Policy/permissions allow zone creation by test-creating
+                # each required zone in the throwaway TEST resource group; don't link them (linking is not
+                # required to prove creation is allowed, and there's nothing meaningful to link them to on
+                # the new-VNet path). These zones are tracked and removed during cleanup.
                 foreach ($rz in $RequiredPrivateDnsZones) {
-                    $match = $allZones | Where-Object { $_.Name -eq $rz.Zone }
-                    if (-not $match) {
-                        Add-Result -Category "PrivateDns" -Check "Private DNS zone: $($rz.Zone)" -Result "Fail" -Detail "MISSING - required for $($rz.Purpose) private endpoints. Create it and link it to '$ExistingVnetName'."
-                        continue
+                    try {
+                        New-AzPrivateDnsZone -ResourceGroupName $ResourceGroupName -Name $rz.Zone -ErrorAction Stop | Out-Null
+                        Add-TrackedResource -Type "privatednszone" -ResourceGroupName $ResourceGroupName -Name $rz.Zone
+                        Add-Result -Category "PrivateDns" -Check "Private DNS zone: $($rz.Zone)" -Result "Pass" -Detail "Test-created successfully in the throwaway test resource group '$ResourceGroupName' ($($rz.Purpose)); not linked. This is a throwaway zone and will be removed during cleanup."
                     }
-                    $linked = $false
-                    foreach ($z in $match) {
-                        try {
-                            $links = Get-AzPrivateDnsVirtualNetworkLink -ResourceGroupName $z.ResourceGroupName -ZoneName $z.Name -ErrorAction Stop
-                            if ($links | Where-Object { $_.VirtualNetworkId -eq $vnet.Id }) { $linked = $true; break }
-                        }
-                        catch {}
+                    catch {
+                        $zoneErrMsg = $_.Exception.Message
+                        try { if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $zoneErrMsg = "$zoneErrMsg`n$($_.ErrorDetails.Message)" } } catch {}
+                        try { if ($_.Exception.Response -and $_.Exception.Response.Content) { $zoneErrMsg = "$zoneErrMsg`n$($_.Exception.Response.Content)" } } catch {}
+                        try { if ($_.Exception.Body) { $zoneErrMsg = "$zoneErrMsg`n$($_.Exception.Body | ConvertTo-Json -Depth 10 -Compress)" } } catch {}
+                        $p = Get-PolicyFromError -ExceptionMessage $zoneErrMsg
+                        $pDisplayHint = if ($p.PolicyAssignmentDisplayName) { $p.PolicyAssignmentDisplayName } elseif ($p.PolicyDefinitionDisplayName) { $p.PolicyDefinitionDisplayName } else { $null }
+                        $polName = Resolve-PolicyName -PolicyDefinitionId $p.PolicyDefinitionId -PolicyAssignmentId $p.PolicyAssignmentId -PolicySetDefinitionId $p.PolicySetDefinitionId -DisplayNameHint $pDisplayHint
+                        $detail = if ($polName) { "Blocked by Azure Policy: '$polName'." } else { "Failed to test-create: $($p.Message)" }
+                        Add-Result -Category "PrivateDns" -Check "Private DNS zone: $($rz.Zone)" -Result "Fail" -Detail $detail -PolicyName $polName -Message $p.Message
                     }
-                    if ($linked) { Add-Result -Category "PrivateDns" -Check "Private DNS zone: $($rz.Zone)" -Result "Pass" -Detail "Exists and linked to '$ExistingVnetName' ($($rz.Purpose))." }
-                    else { Add-Result -Category "PrivateDns" -Check "Private DNS zone: $($rz.Zone)" -Result "Warn" -Detail "Exists but NOT linked to '$ExistingVnetName' ($($rz.Purpose)). Add a virtual network link." }
                 }
             }
 
@@ -1462,6 +1563,7 @@ finally {
                     "storage" { Remove-AzStorageAccount -ResourceGroupName $t.ResourceGroupName -Name $t.Name -Force -ErrorAction Continue | Out-Null }
                     "law" { Remove-AzOperationalInsightsWorkspace -ResourceGroupName $t.ResourceGroupName -Name $t.Name -Force -ForceDelete -ErrorAction Continue | Out-Null }
                     "vnet" { Remove-AzVirtualNetwork -ResourceGroupName $t.ResourceGroupName -Name $t.Name -Force -ErrorAction Continue | Out-Null }
+                    "privatednszone" { Remove-AzPrivateDnsZone -ResourceGroupName $t.ResourceGroupName -Name $t.Name -Force -ErrorAction Continue | Out-Null }
                     default { }
                 }
                 Write-Host "  removed $($t.Type): $($t.Name)"
