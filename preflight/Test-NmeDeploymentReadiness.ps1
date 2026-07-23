@@ -296,7 +296,7 @@ try {
         $Location = $ResourceGroup.Location
         Write-Host -ForegroundColor "Green" "[$([char]0x2713)] Using existing resource group '$ResourceGroupName' in '$Location'."
     }
-    elseif (Read-YesNo -Prompt "Use an EXISTING resource group for the test resources? [y/n]" -Default "n") {
+    elseif (Read-YesNo -Prompt "Use an EXISTING resource group for the test resources? (Selecting 'n' will create a new temporary resource group) [y/n]" -Default "n") {
         do {
             $ResourceGroupName = Read-Host -Prompt "  Existing resource group name"
             try { $ResourceGroup = Get-AzResourceGroup -Name $ResourceGroupName -ErrorAction Stop }
@@ -379,7 +379,8 @@ try {
     $NamePlan["AutomationUpdater"] = [pscustomobject]@{ Label = "Automation Account (updater)"; Value = "aa-nmepf-updater-$rand"; Editable = $true }
     $NamePlan["AutomationScriptedActions"] = [pscustomobject]@{ Label = "Automation Account (scripted actions)"; Value = "aa-nmepf-actions-$rand"; Editable = $true }
     if ($TestPrivate) {
-        $NamePlan["PeStorage"] = [pscustomobject]@{ Label = "Storage account for private endpoint test"; Value = ("nmepfpe$(New-RandomString -Length 6)").Substring(0, 24).ToLower(); Editable = $true }
+        $peStorageDefault = "nmepfpe$(New-RandomString -Length 6)"
+        $NamePlan["PeStorage"] = [pscustomobject]@{ Label = "Storage account for private endpoint test"; Value = $peStorageDefault.Substring(0, [Math]::Min(24, $peStorageDefault.Length)).ToLower(); Editable = $true }
         $NamePlan["PrivateEndpoint"] = [pscustomobject]@{ Label = "Private Endpoint"; Value = "pe-nmepf-$rand"; Editable = $true }
     }
     if ($TestVnetIntegration) {
