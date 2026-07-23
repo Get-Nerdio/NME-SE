@@ -296,7 +296,6 @@ try {
         }
     }
 
-    $IncludeAutomation = Read-YesNo -Prompt "Include the Automation Account deployability test? (subscriptions have Automation account limits) [y/n]" -Default "y"
     Write-Host ""
     #endregion
 
@@ -326,9 +325,9 @@ try {
     $NamePlan["AppServicePlan"] = [pscustomobject]@{ Label = "App Service Plan (B3, Windows)"; Value = "asp-nmepf-$rand"; Editable = $true }
     $kvDefault = "kv-nmepf-$rand"; if ($kvDefault.Length -gt 24) { $kvDefault = $kvDefault.Substring(0, 24) }
     $NamePlan["KeyVault"] = [pscustomobject]@{ Label = "Key Vault"; Value = $kvDefault; Editable = $true }
-    if ($IncludeAutomation) {
-        $NamePlan["Automation"] = [pscustomobject]@{ Label = "Automation Account"; Value = "aa-nmepf-$rand"; Editable = $true }
-    }
+    # NME deploys two Automation Accounts (an updater account and a scripted-actions account) - test both.
+    $NamePlan["AutomationUpdater"] = [pscustomobject]@{ Label = "Automation Account (updater)"; Value = "aa-nmepf-updater-$rand"; Editable = $true }
+    $NamePlan["AutomationScriptedActions"] = [pscustomobject]@{ Label = "Automation Account (scripted actions)"; Value = "aa-nmepf-actions-$rand"; Editable = $true }
     if ($TestPrivate) {
         $NamePlan["PeStorage"] = [pscustomobject]@{ Label = "Storage account for private endpoint test"; Value = ("nmepfpe$(New-RandomString -Length 6)").Substring(0, 24).ToLower(); Editable = $true }
         $NamePlan["PrivateEndpoint"] = [pscustomobject]@{ Label = "Private Endpoint"; Value = "pe-nmepf-$rand"; Editable = $true }
@@ -364,7 +363,8 @@ try {
     $dbName = $NamePlan["SqlDatabase"].Value
     $aspName = $NamePlan["AppServicePlan"].Value
     $kvName = $NamePlan["KeyVault"].Value
-    if ($IncludeAutomation) { $aaName = $NamePlan["Automation"].Value }
+    $aaUpdaterName = $NamePlan["AutomationUpdater"].Value
+    $aaScriptedActionsName = $NamePlan["AutomationScriptedActions"].Value
     if ($TestPrivate) { $peStorageName = $NamePlan["PeStorage"].Value; $peName = $NamePlan["PrivateEndpoint"].Value }
     if ($TestVnetIntegration) { $connAspName = $NamePlan["ConnAsp"].Value; $connWebName = $NamePlan["ConnWebApp"].Value }
 
@@ -561,16 +561,25 @@ policyresources
         catch { @{ Target = "Key Vault"; Ok = $false; Error = $_.Exception.Message; Name = $name; Kind = "kv" } }
     } -ArgumentList $ResourceGroupName, $kvName, $Location, $Tags
 
-    if ($IncludeAutomation) {
-        $jobs += Start-ThreadJob -Name "Automation" -ScriptBlock {
-            param($rg, $name, $loc, $tags)
-            try {
-                New-AzAutomationAccount -ResourceGroupName $rg -Name $name -Location $loc -Plan "Basic" -Tag $tags -ErrorAction Stop | Out-Null
-                @{ Target = "Automation Account"; Ok = $true; Name = $name; Kind = "automation" }
-            }
-            catch { @{ Target = "Automation Account"; Ok = $false; Error = $_.Exception.Message; Name = $name; Kind = "automation" } }
-        } -ArgumentList $ResourceGroupName, $aaName, $Location, $Tags
-    }
+    # NME deploys two Automation Accounts (an updater account with a system-assigned identity, and a
+    # scripted-actions account with no identity) - test both, matching the installer template.
+    $jobs += Start-ThreadJob -Name "AutomationUpdater" -ScriptBlock {
+        param($rg, $name, $loc, $tags)
+        try {
+            New-AzAutomationAccount -ResourceGroupName $rg -Name $name -Location $loc -Plan "Basic" -AssignSystemIdentity -Tag $tags -ErrorAction Stop | Out-Null
+            @{ Target = "Automation Account (updater)"; Ok = $true; Name = $name; Kind = "automation" }
+        }
+        catch { @{ Target = "Automation Account (updater)"; Ok = $false; Error = $_.Exception.Message; Name = $name; Kind = "automation" } }
+    } -ArgumentList $ResourceGroupName, $aaUpdaterName, $Location, $Tags
+
+    $jobs += Start-ThreadJob -Name "AutomationScriptedActions" -ScriptBlock {
+        param($rg, $name, $loc, $tags)
+        try {
+            New-AzAutomationAccount -ResourceGroupName $rg -Name $name -Location $loc -Plan "Basic" -Tag $tags -ErrorAction Stop | Out-Null
+            @{ Target = "Automation Account (scripted actions)"; Ok = $true; Name = $name; Kind = "automation" }
+        }
+        catch { @{ Target = "Automation Account (scripted actions)"; Ok = $false; Error = $_.Exception.Message; Name = $name; Kind = "automation" } }
+    } -ArgumentList $ResourceGroupName, $aaScriptedActionsName, $Location, $Tags
 
     $jobResults = $jobs | Wait-Job | Receive-Job
     $jobs | Remove-Job -Force -ErrorAction SilentlyContinue
