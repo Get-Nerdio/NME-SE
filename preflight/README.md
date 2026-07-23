@@ -7,7 +7,7 @@ Listed here are scripts and queries to use a preflight tools to validate the tar
 `Test-NmeDeploymentReadiness.ps1` is the current pre-flight validator. It expands on the original script below and is designed to be handed to a customer and run in **Azure Cloud Shell with a single command**. It:
 
 * **Checks permissions without the Microsoft.Graph module.** Entra directory roles are read via `Invoke-AzRestMethod` against the Microsoft Graph REST API, reusing the existing `Connect-AzAccount` token. This avoids the `Microsoft.Graph` PowerShell module, which is frequently blocked or broken in locked-down tenants and has been a common source of failure. It confirms the signed-in user has **Global Administrator** (or **Privileged Role Administrator** + **Cloud Application Administrator**) and **Owner** on the target subscription.
-* **Scans for blocking Azure Policy** (Deny-effect assignments) via Azure Resource Graph, and reports the **blocking policy by name** when a resource deployment is denied.
+* **Detects blocking Azure Policy by deploying real resources** and reports the **blocking policy by name** when a deployment (including the test resource group's own creation) is denied. There is no separate read-only policy scan - a policy only matters if it actually blocks something NME needs, and the deployability tests catch exactly those.
 * **Tests resource deployability in parallel.** Throwaway copies of the resources Nerdio Manager deploys are created as background jobs, using **the exact SKUs/config from the installer template** (e.g. Storage `Standard_GRS`/`Standard_ZRS`, SQL DB `Standard S1` DTU, App Service Plan `B3` Windows, Key Vault without purge protection) so a policy that only permits a different SKU cannot produce a false pass. Errors are captured, never fatal.
 * **Tests private endpoints, DNS, and App Service VNet integration together.** A private NME deployment requires an existing VNet with two subnets - one for private endpoints, one (delegated to `Microsoft.Web/serverFarms`) for App Service VNet integration - so the script asks for both subnet names together, not as separate optional steps. It deploys a private endpoint into the subnet you specify, reports the VNet's DNS configuration, and reports **which required private DNS zones are missing or not linked** to that VNet (`privatelink.database.windows.net`, `privatelink.azurewebsites.net`, `privatelink.vaultcore.azure.net`, `privatelink.blob.core.windows.net`, `privatelink.file.core.windows.net`, `privatelink.azure-automation.net`; Gov/China variants derived automatically).
 * **Tests App Service outbound connectivity.** It checks whether the named App Service integration subnet is delegated to `Microsoft.Web/serverFarms` - if not, it reports that and does **not** attempt VNet integration. If delegated, it deploys a test App Service, integrates it into your subnet, and runs the outbound-endpoint checks from `NmeNetworkTest.ps1` **from inside the worker** (via the Kudu command API) so the results reflect the VNet's real routing and DNS.
@@ -36,9 +36,9 @@ Connect-AzAccount -UseDeviceAuthentication
 ### Requirements
 
 * PowerShell 7 (pre-installed in Azure Cloud Shell)
-* Az modules: `Az.Accounts, Az.Resources, Az.ResourceGraph, Az.OperationalInsights, Az.Storage, Az.Sql, Az.Websites, Az.Automation, Az.KeyVault, Az.Network, Az.PrivateDns` and `ThreadJob` (all present in Cloud Shell)
+* Az modules: `Az.Accounts, Az.Resources, Az.OperationalInsights, Az.Storage, Az.Sql, Az.Websites, Az.Automation, Az.KeyVault, Az.Network, Az.PrivateDns` and `ThreadJob` (all present in Cloud Shell)
 * **No** `Microsoft.Graph` module
-* Minimum rights to run a full test: **Owner** on the target subscription (to create/remove the test resources); read access to policy for the Resource Graph scan
+* Minimum rights to run a full test: **Owner** on the target subscription (to create/remove the test resources)
 
 ---
 

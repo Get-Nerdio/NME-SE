@@ -8,10 +8,10 @@
           * Permission checks   - Entra directory roles (WITHOUT the Microsoft.Graph module) and
                                    Azure Owner on the subscription.
           * Resource providers  - registration state of the providers NME requires.
-          * Policy scan          - Azure Resource Graph query for Deny-effect policy assignments.
           * Deployability tests  - deploys throwaway copies of the exact resources (matching SKUs)
                                    NME's installer creates, to surface Azure Policy blocks. Reports
-                                   the blocking policy by name where possible.
+                                   the blocking policy by name where possible. This is how blocking
+                                   policies are detected - there is no separate read-only policy scan.
           * Private endpoint/DNS - (optional) deploys a private endpoint into an existing VNet and
                                    reports which required private DNS zones are missing / not linked.
           * Outbound connectivity- (optional, tested together with private endpoints - NME requires
@@ -79,7 +79,7 @@ $Tracker = [System.Collections.Generic.List[object]]::new()
 
 function Add-Result {
     param(
-        [Parameter(Mandatory = $true)][ValidateSet("Permissions", "ResourceProviders", "Policy", "Deployability", "PrivateDns", "PrivateEndpoint", "Connectivity", "Info")][string] $Category,
+        [Parameter(Mandatory = $true)][ValidateSet("Permissions", "ResourceProviders", "Deployability", "PrivateDns", "PrivateEndpoint", "Connectivity", "Info")][string] $Category,
         [Parameter(Mandatory = $true)][string] $Check,
         [Parameter(Mandatory = $true)][ValidateSet("Pass", "Fail", "Warn", "Info")][string] $Result,
         [string] $Detail = "",
@@ -162,22 +162,18 @@ function Get-PolicyFromError {
     return $out
 }
 
-# Resolve a policy definition/assignment id (or the deny-scan cache) to a friendly display name.
+# Resolve a policy definition/assignment id to a friendly display name.
 function Resolve-PolicyName {
     param(
         [string] $PolicyDefinitionId,
-        [string] $PolicyAssignmentId,
-        [hashtable] $DenyCache
+        [string] $PolicyAssignmentId
     )
     $name = $null
     if ($PolicyAssignmentId) {
         try { $name = (Get-AzPolicyAssignment -Id $PolicyAssignmentId -ErrorAction Stop).Properties.DisplayName } catch {}
     }
     if (-not $name -and $PolicyDefinitionId) {
-        if ($DenyCache -and $DenyCache.ContainsKey($PolicyDefinitionId)) { $name = $DenyCache[$PolicyDefinitionId] }
-        if (-not $name) {
-            try { $name = (Get-AzPolicyDefinition -Id $PolicyDefinitionId -ErrorAction Stop).Properties.DisplayName } catch {}
-        }
+        try { $name = (Get-AzPolicyDefinition -Id $PolicyDefinitionId -ErrorAction Stop).Properties.DisplayName } catch {}
     }
     if (-not $name) { $name = $PolicyAssignmentId; if (-not $name) { $name = $PolicyDefinitionId } }
     return $name
@@ -226,7 +222,7 @@ Write-Host ""
 Write-Host "This script checks whether this Azure environment can host a Nerdio Manager deployment."
 Write-Host "It will:"
 Write-Host "  1. Check your Entra directory roles and Azure subscription role (read-only)."
-Write-Host "  2. Check required resource providers and scan for Deny-effect Azure Policies (read-only)."
+Write-Host "  2. Check required resource providers are registered (read-only)."
 Write-Host "  3. Show you the exact resource names (and tags) it will use and let you customize them."
 Write-Host "  4. Create a TEMPORARY resource group (or use an existing EMPTY one you name) and attempt to deploy"
 Write-Host "     throwaway copies of the resources Nerdio Manager needs, to detect policy blocks."
@@ -528,8 +524,39 @@ try {
 
     if ($PendingRgCreate) {
         Write-Host -ForegroundColor "Cyan" "Creating temporary resource group '$ResourceGroupName' in '$Location'."
-        New-AzResourceGroup -Name $ResourceGroupName -Location $Location -Tag $Tags -ErrorAction Stop | Out-Null
-        $ResourceGroup = Get-AzResourceGroup -Name $ResourceGroupName -ErrorAction Stop
+        try {
+            New-AzResourceGroup -Name $ResourceGroupName -Location $Location -Tag $Tags -ErrorAction Stop | Out-Null
+            $ResourceGroup = Get-AzResourceGroup -Name $ResourceGroupName -ErrorAction Stop
+        }
+        catch {
+            # A Deny-effect policy (commonly a required-tag or tag-value policy) can block the resource
+            # group creation itself - which is exactly the kind of block this pre-flight exists to
+            # surface. Parse the blocking policy out of the ARM error and report it, then stop cleanly
+            # (nothing was created, so there's nothing to deploy into). The finally block still prints
+            # the report so the SE sees the named policy.
+            $policyInfo = Get-PolicyFromError -ExceptionMessage $_.Exception.Message
+            $policyName = Resolve-PolicyName -PolicyDefinitionId $policyInfo.PolicyDefinitionId -PolicyAssignmentId $policyInfo.PolicyAssignmentId
+            $detail = if ($policyName) {
+                "Blocked by Azure Policy '$policyName'. The resource group could not be created$(if ($Tags.Count -gt 0) { ' (check the tags you supplied against required-tag/tag-value policies)' })."
+            }
+            else {
+                "The resource group could not be created$(if ($Tags.Count -gt 0) { ' (this often indicates a required-tag/tag-value Deny policy - review the supplied tags)' })."
+            }
+            Add-Result -Category "Deployability" -Check "Resource group creation" -Result "Fail" -Detail $detail -PolicyName $policyName -Message $policyInfo.Message
+            # We return before the ConfigSummary is normally populated, so record enough here that the
+            # report still shows the SE what was attempted.
+            $ConfigSummary["Run by (signed-in account)"] = (Get-AzContext).Account.Id
+            $ConfigSummary["Subscription"] = "$($Context.Subscription.Name) ($SubscriptionId)"
+            $ConfigSummary["Cloud"] = $AzEnv.Name
+            $ConfigSummary["Region"] = $Location
+            $ConfigSummary["Resource group"] = "$ResourceGroupName (creation blocked)"
+            $ConfigSummary["Tags applied"] = if ($Tags.Count -gt 0) { (($Tags.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join "; ") } else { "(none specified)" }
+            if ($policyName) { $ConfigSummary["Blocking policy"] = $policyName }
+            # Nothing was actually created, so don't offer to remove a resource group that doesn't exist.
+            $CreatedResourceGroup = $false
+            Write-Host -ForegroundColor "Red" "Cannot continue without a resource group. Skipping the remaining tests and printing the report."
+            return
+        }
     }
     Write-Host ""
 
@@ -565,7 +592,7 @@ try {
     #endregion
 
     #region Fast checks --------------------------------------------------------------------------
-    Write-Host -ForegroundColor "Cyan" "Running permission and policy checks..."
+    Write-Host -ForegroundColor "Cyan" "Running permission and resource provider checks..."
 
     # Resolve the true signed-in user's Entra object id via Graph. In Azure Cloud Shell,
     # (Get-AzContext).Account.Id reports the internal MSI token-broker reference (e.g. "MSI@50342"),
@@ -669,52 +696,10 @@ try {
         }
     }
 
-    # Deny-effect policy scan via Azure Resource Graph. Cache definition id -> display name.
-    $DenyCache = @{}
-    try {
-        $kqlPath = Join-Path -Path $PSScriptRoot -ChildPath "deny-policyassignments.kql"
-        if ($PSScriptRoot -and (Test-Path -Path $kqlPath)) {
-            $kql = Get-Content -Path $kqlPath -Raw
-        }
-        else {
-            $kql = @"
-policyresources
-| where type == "microsoft.authorization/policyassignments"
-| extend definitionId = tostring(properties.policyDefinitionId),
-         assignmentEffect = tostring(properties.parameters.effect.value)
-| join kind=leftouter (
-    policyresources
-    | where type == "microsoft.authorization/policydefinitions"
-    | extend defaultEffect = tostring(properties.parameters.effect.defaultValue),
-             hardCodedEffect = tostring(properties.policyRule.then.effect),
-             policyDisplayName = tostring(properties.displayName)
-    | project definitionId = id, policyDisplayName, hardCodedEffect, defaultEffect
-) on definitionId
-| extend resolvedEffect = case(
-    isnotempty(assignmentEffect), assignmentEffect,
-    isnotempty(hardCodedEffect) and hardCodedEffect !~ "[parameters('effect')]", hardCodedEffect,
-    isnotempty(defaultEffect), defaultEffect, "unknown")
-| where resolvedEffect == "Deny"
-| project assignmentId = id, assignmentName = name, scope = tostring(properties.scope), policyDisplayName, definitionId, resolvedEffect
-"@
-        }
-        $deny = Search-AzGraph -Query $kql -ErrorAction Stop
-        if ($deny -and $deny.Count -gt 0) {
-            foreach ($d in $deny) {
-                if ($d.definitionId -and -not $DenyCache.ContainsKey($d.definitionId)) { $DenyCache[$d.definitionId] = $d.policyDisplayName }
-            }
-            Add-Result -Category "Policy" -Check "Deny-effect policy assignments" -Result "Warn" -Detail "$($deny.Count) Deny policy assignment(s) in scope. Review the ones that target NME resource types (see JSON output)."
-            foreach ($d in ($deny | Select-Object -First 25)) {
-                Add-Result -Category "Policy" -Check "Deny policy: $($d.policyDisplayName)" -Result "Info" -Detail "Scope: $($d.scope)" -PolicyName $d.policyDisplayName
-            }
-        }
-        else {
-            Add-Result -Category "Policy" -Check "Deny-effect policy assignments" -Result "Pass" -Detail "No Deny-effect policy assignments found in accessible scope."
-        }
-    }
-    catch {
-        Add-Result -Category "Policy" -Check "Deny-effect policy assignments" -Result "Info" -Detail "Resource Graph scan failed (Az.ResourceGraph / Resource Policy Reader may be unavailable). Deny-effect policies that actually block a resource are still caught and reported by the Deployability tests." -Message $_.Exception.Message
-    }
+    # NOTE: a read-only Azure Resource Graph scan for Deny-effect policy assignments used to run here.
+    # It was removed - in practice it surfaced noise (Deny assignments that never targeted NME resource
+    # types) without catching real blocks. Blocking policies are instead detected authoritatively by the
+    # Deployability tests below, which report the actual blocking policy by name when a deploy is denied.
     Write-Host ""
     #endregion
 
@@ -805,7 +790,7 @@ policyresources
         }
         else {
             $p = Get-PolicyFromError -ExceptionMessage $jr.Error
-            $polName = Resolve-PolicyName -PolicyDefinitionId $p.PolicyDefinitionId -PolicyAssignmentId $p.PolicyAssignmentId -DenyCache $DenyCache
+            $polName = Resolve-PolicyName -PolicyDefinitionId $p.PolicyDefinitionId -PolicyAssignmentId $p.PolicyAssignmentId
             $detail = if ($polName) { "Blocked by policy: '$polName'. $($p.Message)" } else { "Failed: $($p.Message)" }
             Add-Result -Category "Deployability" -Check $jr.Target -Result "Fail" -Detail $detail -PolicyName $polName -Message $p.Message
         }
@@ -823,7 +808,7 @@ policyresources
         }
         catch {
             $p = Get-PolicyFromError -ExceptionMessage $_.Exception.Message
-            $polName = Resolve-PolicyName -PolicyDefinitionId $p.PolicyDefinitionId -PolicyAssignmentId $p.PolicyAssignmentId -DenyCache $DenyCache
+            $polName = Resolve-PolicyName -PolicyDefinitionId $p.PolicyDefinitionId -PolicyAssignmentId $p.PolicyAssignmentId
             $detail = if ($polName) { "Blocked by policy: '$polName'. $($p.Message)" } else { "Failed: $($p.Message)" }
             Add-Result -Category "Deployability" -Check "SQL Database (Standard S1, DTU)" -Result "Fail" -Detail $detail -PolicyName $polName -Message $p.Message
         }
