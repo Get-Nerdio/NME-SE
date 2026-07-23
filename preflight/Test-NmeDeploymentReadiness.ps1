@@ -190,6 +190,16 @@ function Get-PolicyFromError {
         if ($out.Message -match "policyAssignmentId'?:?\s*'?(/[^',\s\}]+)") { $out.PolicyAssignmentId = $Matches[1] }
         elseif ($ExceptionMessage -match "policyAssignmentId'?:?\s*'?(/[^',\s\}]+)") { $out.PolicyAssignmentId = $Matches[1] }
     }
+
+    # Many Az module cmdlets (e.g. Az.Sql, Az.Storage) throw an exception whose .Message is just the
+    # inner ARM error text - no outer {"error":{...}} envelope, so the additionalInfo parse above never
+    # runs. That inner text still embeds a "Policy identifiers: '[{"policyAssignment":{"name":"...",
+    # "id":"..."},"policyDefinition":{"name":"...","id":"..."}}]'" block with the display names already
+    # resolved - pull straight from that, regardless of whether the outer envelope survived.
+    if (-not $out.PolicyAssignmentDisplayName -and $ExceptionMessage -match '"policyAssignment"\s*:\s*\{\s*"name"\s*:\s*"([^"]+)"') { $out.PolicyAssignmentDisplayName = $Matches[1] }
+    if (-not $out.PolicyDefinitionDisplayName -and $ExceptionMessage -match '"policyDefinition"\s*:\s*\{\s*"name"\s*:\s*"([^"]+)"') { $out.PolicyDefinitionDisplayName = $Matches[1] }
+    if (-not $out.PolicyAssignmentId -and $ExceptionMessage -match '"policyAssignment"\s*:\s*\{[^\}]*?"id"\s*:\s*"([^"]+)"') { $out.PolicyAssignmentId = $Matches[1] }
+    if (-not $out.PolicyDefinitionId -and $ExceptionMessage -match '"policyDefinition"\s*:\s*\{[^\}]*?"id"\s*:\s*"([^"]+)"') { $out.PolicyDefinitionId = $Matches[1] }
     return $out
 }
 
@@ -703,7 +713,9 @@ try {
             # (nothing was created, so there's nothing to deploy into). The finally block still prints
             # the report so the SE sees the named policy.
             $rgCreateStart = (Get-Date).ToUniversalTime().AddMinutes(-5)
-            $policyInfo = Get-PolicyFromError -ExceptionMessage $_.Exception.Message
+            $rgErrMsg = $_.Exception.Message
+            try { if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $rgErrMsg = "$rgErrMsg`n$($_.ErrorDetails.Message)" } } catch {}
+            $policyInfo = Get-PolicyFromError -ExceptionMessage $rgErrMsg
             $armDisplayHint = if ($policyInfo.PolicyAssignmentDisplayName) { $policyInfo.PolicyAssignmentDisplayName } elseif ($policyInfo.PolicyDefinitionDisplayName) { $policyInfo.PolicyDefinitionDisplayName } else { $null }
             $policyName = Resolve-PolicyName -PolicyDefinitionId $policyInfo.PolicyDefinitionId -PolicyAssignmentId $policyInfo.PolicyAssignmentId -PolicySetDefinitionId $policyInfo.PolicySetDefinitionId -DisplayNameHint $armDisplayHint
             $policySource = if ($policyName -and $policyName -ne $policyInfo.PolicyDefinitionId -and $policyName -ne $policyInfo.PolicyAssignmentId) { "the ARM error" } else { $null }
@@ -892,7 +904,11 @@ try {
     $jobs += Start-ThreadJob -Name "LogAnalytics" -ScriptBlock {
         param($rg, $name, $loc, $tags)
         try { New-AzOperationalInsightsWorkspace -ResourceGroupName $rg -Name $name -Location $loc -Sku "PerGB2018" -RetentionInDays 30 -Tag $tags -ErrorAction Stop | Out-Null; @{ Target = "Log Analytics workspace"; Ok = $true; Name = $name; Kind = "law" } }
-        catch { @{ Target = "Log Analytics workspace"; Ok = $false; Error = $_.Exception.Message; Name = $name; Kind = "law" } }
+        catch {
+            $errMsg = $_.Exception.Message
+            try { if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $errMsg = "$errMsg`n$($_.ErrorDetails.Message)" } } catch {}
+            @{ Target = "Log Analytics workspace"; Ok = $false; Error = $errMsg; Name = $name; Kind = "law" }
+        }
     } -ArgumentList $ResourceGroupName, $lawName, $Location, $Tags
 
     $jobs += Start-ThreadJob -Name "Storage" -ScriptBlock {
@@ -902,7 +918,11 @@ try {
                 -MinimumTlsVersion "TLS1_2" -AllowBlobPublicAccess $false -AllowSharedKeyAccess $true -EnableHttpsTrafficOnly $true -PublicNetworkAccess "Enabled" -Tag $tags -ErrorAction Stop | Out-Null
             @{ Target = "Storage account ($sku)"; Ok = $true; Name = $name; Kind = "storage" }
         }
-        catch { @{ Target = "Storage account ($sku)"; Ok = $false; Error = $_.Exception.Message; Name = $name; Kind = "storage" } }
+        catch {
+            $errMsg = $_.Exception.Message
+            try { if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $errMsg = "$errMsg`n$($_.ErrorDetails.Message)" } } catch {}
+            @{ Target = "Storage account ($sku)"; Ok = $false; Error = $errMsg; Name = $name; Kind = "storage" }
+        }
     } -ArgumentList $ResourceGroupName, $stName, $Location, $StorageSku, $Tags
 
     $jobs += Start-ThreadJob -Name "Sql" -ScriptBlock {
@@ -912,7 +932,11 @@ try {
                 -PublicNetworkAccess "Enabled" -SqlAdministratorCredentials $cred -Tag $tags -ErrorAction Stop | Out-Null
             @{ Target = "SQL Server"; Ok = $true; Name = $name; Kind = "sqlserver" }
         }
-        catch { @{ Target = "SQL Server"; Ok = $false; Error = $_.Exception.Message; Name = $name; Kind = "sqlserver" } }
+        catch {
+            $errMsg = $_.Exception.Message
+            try { if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $errMsg = "$errMsg`n$($_.ErrorDetails.Message)" } } catch {}
+            @{ Target = "SQL Server"; Ok = $false; Error = $errMsg; Name = $name; Kind = "sqlserver" }
+        }
     } -ArgumentList $ResourceGroupName, $sqlName, $Location, $sqlCred, $Tags
 
     $jobs += Start-ThreadJob -Name "AppServicePlan" -ScriptBlock {
@@ -922,7 +946,11 @@ try {
             New-AzAppServicePlan -ResourceGroupName $rg -Name $name -Location $loc -Tier "Basic" -WorkerSize "Large" -NumberOfWorkers 1 -Tag $tags -ErrorAction Stop | Out-Null
             @{ Target = "App Service Plan (B3, Windows)"; Ok = $true; Name = $name; Kind = "asp" }
         }
-        catch { @{ Target = "App Service Plan (B3, Windows)"; Ok = $false; Error = $_.Exception.Message; Name = $name; Kind = "asp" } }
+        catch {
+            $errMsg = $_.Exception.Message
+            try { if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $errMsg = "$errMsg`n$($_.ErrorDetails.Message)" } } catch {}
+            @{ Target = "App Service Plan (B3, Windows)"; Ok = $false; Error = $errMsg; Name = $name; Kind = "asp" }
+        }
     } -ArgumentList $ResourceGroupName, $aspName, $Location, $Tags
 
     $jobs += Start-ThreadJob -Name "KeyVault" -ScriptBlock {
@@ -931,7 +959,11 @@ try {
             New-AzKeyVault -ResourceGroupName $rg -VaultName $name -Location $loc -Sku "Standard" -SoftDeleteRetentionInDays 90 -DisableRbacAuthorization -Tag $tags -ErrorAction Stop | Out-Null
             @{ Target = "Key Vault"; Ok = $true; Name = $name; Kind = "kv" }
         }
-        catch { @{ Target = "Key Vault"; Ok = $false; Error = $_.Exception.Message; Name = $name; Kind = "kv" } }
+        catch {
+            $errMsg = $_.Exception.Message
+            try { if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $errMsg = "$errMsg`n$($_.ErrorDetails.Message)" } } catch {}
+            @{ Target = "Key Vault"; Ok = $false; Error = $errMsg; Name = $name; Kind = "kv" }
+        }
     } -ArgumentList $ResourceGroupName, $kvName, $Location, $Tags
 
     # NME deploys two Automation Accounts (an updater account with a system-assigned identity, and a
@@ -942,7 +974,11 @@ try {
             New-AzAutomationAccount -ResourceGroupName $rg -Name $name -Location $loc -Plan "Basic" -AssignSystemIdentity -Tag $tags -ErrorAction Stop | Out-Null
             @{ Target = "Automation Account (updater)"; Ok = $true; Name = $name; Kind = "automation" }
         }
-        catch { @{ Target = "Automation Account (updater)"; Ok = $false; Error = $_.Exception.Message; Name = $name; Kind = "automation" } }
+        catch {
+            $errMsg = $_.Exception.Message
+            try { if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $errMsg = "$errMsg`n$($_.ErrorDetails.Message)" } } catch {}
+            @{ Target = "Automation Account (updater)"; Ok = $false; Error = $errMsg; Name = $name; Kind = "automation" }
+        }
     } -ArgumentList $ResourceGroupName, $aaUpdaterName, $Location, $Tags
 
     $jobs += Start-ThreadJob -Name "AutomationScriptedActions" -ScriptBlock {
@@ -951,7 +987,11 @@ try {
             New-AzAutomationAccount -ResourceGroupName $rg -Name $name -Location $loc -Plan "Basic" -Tag $tags -ErrorAction Stop | Out-Null
             @{ Target = "Automation Account (scripted actions)"; Ok = $true; Name = $name; Kind = "automation" }
         }
-        catch { @{ Target = "Automation Account (scripted actions)"; Ok = $false; Error = $_.Exception.Message; Name = $name; Kind = "automation" } }
+        catch {
+            $errMsg = $_.Exception.Message
+            try { if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $errMsg = "$errMsg`n$($_.ErrorDetails.Message)" } } catch {}
+            @{ Target = "Automation Account (scripted actions)"; Ok = $false; Error = $errMsg; Name = $name; Kind = "automation" }
+        }
     } -ArgumentList $ResourceGroupName, $aaScriptedActionsName, $Location, $Tags
 
     $jobResults = $jobs | Wait-Job | Receive-Job
@@ -972,7 +1012,7 @@ try {
             $p = Get-PolicyFromError -ExceptionMessage $jr.Error
             $pDisplayHint = if ($p.PolicyAssignmentDisplayName) { $p.PolicyAssignmentDisplayName } elseif ($p.PolicyDefinitionDisplayName) { $p.PolicyDefinitionDisplayName } else { $null }
             $polName = Resolve-PolicyName -PolicyDefinitionId $p.PolicyDefinitionId -PolicyAssignmentId $p.PolicyAssignmentId -PolicySetDefinitionId $p.PolicySetDefinitionId -DisplayNameHint $pDisplayHint
-            $detail = if ($polName) { "Blocked by policy: '$polName'. $($p.Message)" } else { "Failed: $($p.Message)" }
+            $detail = if ($polName) { "Blocked by Azure Policy: '$polName'." } else { "Failed: $($p.Message)" }
             Add-Result -Category "Deployability" -Check $jr.Target -Result "Fail" -Detail $detail -PolicyName $polName -Message $p.Message
         }
     }
@@ -988,10 +1028,12 @@ try {
             New-PreflightLock -ResourceId "/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.Sql/servers/$sqlName/databases/$dbName" -LockName "$dbName-lock" -Label "SQL Database"
         }
         catch {
-            $p = Get-PolicyFromError -ExceptionMessage $_.Exception.Message
+            $sqlErrMsg = $_.Exception.Message
+            try { if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $sqlErrMsg = "$sqlErrMsg`n$($_.ErrorDetails.Message)" } } catch {}
+            $p = Get-PolicyFromError -ExceptionMessage $sqlErrMsg
             $pDisplayHint = if ($p.PolicyAssignmentDisplayName) { $p.PolicyAssignmentDisplayName } elseif ($p.PolicyDefinitionDisplayName) { $p.PolicyDefinitionDisplayName } else { $null }
             $polName = Resolve-PolicyName -PolicyDefinitionId $p.PolicyDefinitionId -PolicyAssignmentId $p.PolicyAssignmentId -PolicySetDefinitionId $p.PolicySetDefinitionId -DisplayNameHint $pDisplayHint
-            $detail = if ($polName) { "Blocked by policy: '$polName'. $($p.Message)" } else { "Failed: $($p.Message)" }
+            $detail = if ($polName) { "Blocked by Azure Policy: '$polName'." } else { "Failed: $($p.Message)" }
             Add-Result -Category "Deployability" -Check "SQL Database (Standard S1, DTU)" -Result "Fail" -Detail $detail -PolicyName $polName -Message $p.Message
         }
     }
