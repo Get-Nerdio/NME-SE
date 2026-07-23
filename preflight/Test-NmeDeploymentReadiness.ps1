@@ -781,7 +781,7 @@ try {
 
     # Record every input/response so the SE has a confirmed-working configuration to refer back to
     # once it's time to actually install NME.
-    $ConfigSummary["Run by (signed-in account)"] = (Get-AzContext).Account.Id
+    $ConfigSummary["Run by (signed-in account)"] = $SignedInAccount
     $ConfigSummary["Subscription"] = "$($Context.Subscription.Name) ($SubscriptionId)"
     $ConfigSummary["Cloud"] = $AzEnv.Name
     $ConfigSummary["Region"] = $Location
