@@ -342,7 +342,7 @@ try {
     foreach ($k in $NamePlan.Keys) { Write-Host ("  {0,-45} {1}" -f $NamePlan[$k].Label, $NamePlan[$k].Value) }
     Write-Host ""
 
-    if (-not (Read-YesNo -Prompt "Use these names? [Y/n]" -Default "y")) {
+    if (-not (Read-YesNo -Prompt "Use these names? (Choosing 'n' will prompt for custom resource names) [Y/n]" -Default "y")) {
         foreach ($k in $NamePlan.Keys) {
             $item = $NamePlan[$k]
             if (-not $item.Editable) { continue }
