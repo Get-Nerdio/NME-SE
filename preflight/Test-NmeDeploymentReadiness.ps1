@@ -266,7 +266,22 @@ try {
 
     # Resource group: existing, or temporary (actually created after the naming/tag confirmation below).
     $PendingRgCreate = $false
-    if ([string]::IsNullOrWhiteSpace($ResourceGroupName)) {
+    if (-not [string]::IsNullOrWhiteSpace($ResourceGroupName)) {
+        # Supplied via -ResourceGroupName.
+        $ResourceGroup = Get-AzResourceGroup -Name $ResourceGroupName -ErrorAction Stop
+        $Location = $ResourceGroup.Location
+        Write-Host -ForegroundColor "Green" "[$([char]0x2713)] Using existing resource group '$ResourceGroupName' in '$Location'."
+    }
+    elseif (Read-YesNo -Prompt "Use an EXISTING resource group for the test resources? [y/n]" -Default "n") {
+        do {
+            $ResourceGroupName = Read-Host -Prompt "  Existing resource group name"
+            try { $ResourceGroup = Get-AzResourceGroup -Name $ResourceGroupName -ErrorAction Stop }
+            catch { Write-Host -ForegroundColor "Yellow" "  Could not find resource group '$ResourceGroupName' in this subscription."; $ResourceGroup = $null }
+        } while (-not $ResourceGroup)
+        $Location = $ResourceGroup.Location
+        Write-Host -ForegroundColor "Green" "[$([char]0x2713)] Using existing resource group '$ResourceGroupName' in '$Location'."
+    }
+    else {
         if ([string]::IsNullOrWhiteSpace($Location)) {
             do { $Location = Read-Host -Prompt "Enter the Azure region for the temporary test resources (e.g. eastus)" }
             while ([string]::IsNullOrWhiteSpace($Location))
@@ -274,11 +289,6 @@ try {
         $ResourceGroupName = "rg-nme-preflight-$(New-RandomString -Length 6)"
         $PendingRgCreate = $true
         $CreatedResourceGroup = $true
-    }
-    else {
-        $ResourceGroup = Get-AzResourceGroup -Name $ResourceGroupName -ErrorAction Stop
-        $Location = $ResourceGroup.Location
-        Write-Host -ForegroundColor "Green" "[$([char]0x2713)] Using existing resource group '$ResourceGroupName' in '$Location'."
     }
 
     # Private-network scenarios.
