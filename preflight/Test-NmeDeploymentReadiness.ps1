@@ -144,21 +144,52 @@ function New-PreflightLock {
 # Ported from Start-NerdioManagerPreFlight.ps1's New-PreflightObject.
 function Get-PolicyFromError {
     param([string] $ExceptionMessage)
-    $out = [pscustomobject]@{ Message = $ExceptionMessage; PolicyDefinitionId = $null; PolicyAssignmentId = $null }
+    $out = [pscustomobject]@{
+        Message                     = $ExceptionMessage
+        PolicyDefinitionId          = $null
+        PolicyAssignmentId          = $null
+        PolicySetDefinitionId       = $null
+        PolicyDefinitionDisplayName = $null
+        PolicyAssignmentDisplayName = $null
+    }
     if ([string]::IsNullOrEmpty($ExceptionMessage)) { return $out }
 
+    $rawJson = $null
     if ($ExceptionMessage -match "({.*}$)") {
+        $rawJson = $Matches[0]
         try {
-            $parsed = $Matches[0] | ConvertFrom-Json
+            $parsed = $rawJson | ConvertFrom-Json -ErrorAction Stop
             if ($parsed.error.message) { $out.Message = $parsed.error.message }
         }
         catch {}
     }
-    # ARM policy denials embed the definition and assignment resource ids in the text.
-    if ($out.Message -match "policyDefinitionId'?:?\s*'?(/[^',\s\}]+)") { $out.PolicyDefinitionId = $Matches[1] }
-    elseif ($ExceptionMessage -match "policyDefinitionId'?:?\s*'?(/[^',\s\}]+)") { $out.PolicyDefinitionId = $Matches[1] }
-    if ($out.Message -match "policyAssignmentId'?:?\s*'?(/[^',\s\}]+)") { $out.PolicyAssignmentId = $Matches[1] }
-    elseif ($ExceptionMessage -match "policyAssignmentId'?:?\s*'?(/[^',\s\}]+)") { $out.PolicyAssignmentId = $Matches[1] }
+
+    # Preferred: the same structured error.additionalInfo[].info shape the Activity Log carries -
+    # it has both ids AND display names, and (for Initiative-assigned policies) the set definition id.
+    if ($rawJson) {
+        try {
+            $j = $rawJson | ConvertFrom-Json -ErrorAction Stop
+            $info = ($j.error.additionalInfo | Where-Object { $_.type -eq "PolicyViolation" } | Select-Object -First 1).info
+            if ($info) {
+                if ($info.policyDefinitionId) { $out.PolicyDefinitionId = $info.policyDefinitionId }
+                if ($info.policyAssignmentId) { $out.PolicyAssignmentId = $info.policyAssignmentId }
+                if ($info.policySetDefinitionId) { $out.PolicySetDefinitionId = $info.policySetDefinitionId }
+                if ($info.policyDefinitionDisplayName) { $out.PolicyDefinitionDisplayName = $info.policyDefinitionDisplayName }
+                if ($info.policyAssignmentDisplayName) { $out.PolicyAssignmentDisplayName = $info.policyAssignmentDisplayName }
+            }
+        }
+        catch {}
+    }
+
+    # Fallback: regex the raw text for anything the structured parse didn't fill in (older/odd shapes).
+    if (-not $out.PolicyDefinitionId) {
+        if ($out.Message -match "policyDefinitionId'?:?\s*'?(/[^',\s\}]+)") { $out.PolicyDefinitionId = $Matches[1] }
+        elseif ($ExceptionMessage -match "policyDefinitionId'?:?\s*'?(/[^',\s\}]+)") { $out.PolicyDefinitionId = $Matches[1] }
+    }
+    if (-not $out.PolicyAssignmentId) {
+        if ($out.Message -match "policyAssignmentId'?:?\s*'?(/[^',\s\}]+)") { $out.PolicyAssignmentId = $Matches[1] }
+        elseif ($ExceptionMessage -match "policyAssignmentId'?:?\s*'?(/[^',\s\}]+)") { $out.PolicyAssignmentId = $Matches[1] }
+    }
     return $out
 }
 
@@ -166,14 +197,46 @@ function Get-PolicyFromError {
 function Resolve-PolicyName {
     param(
         [string] $PolicyDefinitionId,
-        [string] $PolicyAssignmentId
+        [string] $PolicyAssignmentId,
+        [string] $PolicySetDefinitionId,
+        [string] $DisplayNameHint
     )
+    # A display name already handed to us (e.g. straight from the ARM error's/Activity Log's
+    # additionalInfo) is authoritative and avoids extra API calls that can fail under limited rights.
+    if ($DisplayNameHint) { return $DisplayNameHint }
+
     $name = $null
+    $assignment = $null
     if ($PolicyAssignmentId) {
-        try { $name = (Get-AzPolicyAssignment -Id $PolicyAssignmentId -ErrorAction Stop).Properties.DisplayName } catch {}
+        try { $assignment = Get-AzPolicyAssignment -Id $PolicyAssignmentId -ErrorAction Stop } catch {}
+        if ($assignment) { $name = $assignment.Properties.DisplayName }
     }
     if (-not $name -and $PolicyDefinitionId) {
-        try { $name = (Get-AzPolicyDefinition -Id $PolicyDefinitionId -ErrorAction Stop).Properties.DisplayName } catch {}
+        if ($PolicyDefinitionId -like "/*") {
+            # A real ARM resource id - look the definition up directly.
+            try { $name = (Get-AzPolicyDefinition -Id $PolicyDefinitionId -ErrorAction Stop).Properties.DisplayName } catch {}
+        }
+        else {
+            # No leading "/" means this isn't a resource id at all. When the blocking policy is a
+            # member of an Initiative (policy set) assignment, Azure's additionalInfo reports the
+            # member's short policyDefinitionReferenceId in this field instead of a real definition id -
+            # resolve it by looking up the initiative and matching that reference id to its member policy.
+            $setId = $PolicySetDefinitionId
+            if (-not $setId -and $assignment -and $assignment.Properties.PolicyDefinitionId -match "/policySetDefinitions/") {
+                $setId = $assignment.Properties.PolicyDefinitionId
+            }
+            if ($setId) {
+                try {
+                    $setDef = Get-AzPolicySetDefinition -Id $setId -ErrorAction Stop
+                    $member = $setDef.Properties.PolicyDefinitions | Where-Object { $_.policyDefinitionReferenceId -eq $PolicyDefinitionId } | Select-Object -First 1
+                    if ($member -and $member.policyDefinitionId) {
+                        try { $name = (Get-AzPolicyDefinition -Id $member.policyDefinitionId -ErrorAction Stop).Properties.DisplayName } catch {}
+                    }
+                    if (-not $name) { $name = $setDef.Properties.DisplayName }
+                }
+                catch {}
+            }
+        }
     }
     if (-not $name) { $name = $PolicyAssignmentId; if (-not $name) { $name = $PolicyDefinitionId } }
     return $name
@@ -191,11 +254,12 @@ function Get-PolicyFromActivityLog {
         [int] $DelaySeconds = 10
     )
     $out = [pscustomobject]@{
-        PolicyDefinitionId   = $null
-        PolicyAssignmentId   = $null
-        PolicyDefinitionName = $null
-        PolicyAssignmentName = $null
-        Found                = $false
+        PolicyDefinitionId     = $null
+        PolicyAssignmentId     = $null
+        PolicyDefinitionName   = $null
+        PolicyAssignmentName   = $null
+        PolicySetDefinitionId  = $null
+        Found                  = $false
     }
     if (-not $StartTime) { $StartTime = (Get-Date).ToUniversalTime().AddMinutes(-15) }
 
@@ -239,6 +303,7 @@ function Get-PolicyFromActivityLog {
                     if ($info) {
                         if ($info.policyDefinitionId) { $out.PolicyDefinitionId = $info.policyDefinitionId }
                         if ($info.policyAssignmentId) { $out.PolicyAssignmentId = $info.policyAssignmentId }
+                        if ($info.policySetDefinitionId) { $out.PolicySetDefinitionId = $info.policySetDefinitionId }
                         $out.PolicyDefinitionName = $(if ($info.policyDefinitionDisplayName) { $info.policyDefinitionDisplayName } else { $info.policyDefinitionName })
                         $out.PolicyAssignmentName = $(if ($info.policyAssignmentDisplayName) { $info.policyAssignmentDisplayName } else { $info.policyAssignmentName })
                     }
@@ -246,8 +311,9 @@ function Get-PolicyFromActivityLog {
                 catch {}
             }
             # Fallback: regex the blob for anything the structured parse didn't fill in.
-            if (-not $out.PolicyDefinitionId -and $blob -match 'policyDefinitionId"?\s*:\s*"?(/[^",\s}]+)') { $out.PolicyDefinitionId = $Matches[1] }
+            if (-not $out.PolicyDefinitionId -and $blob -match 'policyDefinitionId"?\s*:\s*"?([^",\s}]+)') { $out.PolicyDefinitionId = $Matches[1] }
             if (-not $out.PolicyAssignmentId -and $blob -match 'policyAssignmentId"?\s*:\s*"?(/[^",\s}]+)') { $out.PolicyAssignmentId = $Matches[1] }
+            if (-not $out.PolicySetDefinitionId -and $blob -match 'policySetDefinitionId"?\s*:\s*"?(/[^",\s}]+)') { $out.PolicySetDefinitionId = $Matches[1] }
             if (-not $out.PolicyDefinitionName -and $blob -match 'policyDefinition(?:Display)?Name"?\s*:\s*"([^"]+)"') { $out.PolicyDefinitionName = $Matches[1] }
             if (-not $out.PolicyAssignmentName -and $blob -match 'policyAssignment(?:Display)?Name"?\s*:\s*"([^"]+)"') { $out.PolicyAssignmentName = $Matches[1] }
 
@@ -407,7 +473,7 @@ try {
         # Supplied via -ResourceGroupName; validated (and re-prompted if bad) in the loop below.
         $useExisting = $true
     }
-    elseif (Read-YesNo -Prompt "Use an EXISTING (empty) resource group for the test resources? (Selecting 'N' will create a temporary rg. You will be prompted to confirm the name.) [y/N]" -Default "n") {
+    elseif (Read-YesNo -Prompt "Use an EXISTING (empty) resource group for the test resources? [y/N]" -Default "n") {
         $useExisting = $true
         $ResourceGroupName = $null
     }
@@ -638,7 +704,8 @@ try {
             # the report so the SE sees the named policy.
             $rgCreateStart = (Get-Date).ToUniversalTime().AddMinutes(-5)
             $policyInfo = Get-PolicyFromError -ExceptionMessage $_.Exception.Message
-            $policyName = Resolve-PolicyName -PolicyDefinitionId $policyInfo.PolicyDefinitionId -PolicyAssignmentId $policyInfo.PolicyAssignmentId
+            $armDisplayHint = if ($policyInfo.PolicyAssignmentDisplayName) { $policyInfo.PolicyAssignmentDisplayName } elseif ($policyInfo.PolicyDefinitionDisplayName) { $policyInfo.PolicyDefinitionDisplayName } else { $null }
+            $policyName = Resolve-PolicyName -PolicyDefinitionId $policyInfo.PolicyDefinitionId -PolicyAssignmentId $policyInfo.PolicyAssignmentId -PolicySetDefinitionId $policyInfo.PolicySetDefinitionId -DisplayNameHint $armDisplayHint
             $policySource = if ($policyName -and $policyName -ne $policyInfo.PolicyDefinitionId -and $policyName -ne $policyInfo.PolicyAssignmentId) { "the ARM error" } else { $null }
 
             # New-AzResourceGroup's RequestDisallowedByPolicy error usually omits the policy identifiers,
@@ -647,8 +714,8 @@ try {
                 Write-Host -ForegroundColor "Yellow" "  Resource group creation was blocked by policy. Querying the Activity Log for the specific policy - this can take up to 5 minutes while Azure ingests the event..."
                 $al = Get-PolicyFromActivityLog -ResourceGroupName $ResourceGroupName -StartTime $rgCreateStart
                 if ($al.Found) {
-                    $alName = if ($al.PolicyAssignmentName) { $al.PolicyAssignmentName } elseif ($al.PolicyDefinitionName) { $al.PolicyDefinitionName } else { $null }
-                    if (-not $alName) { $alName = Resolve-PolicyName -PolicyDefinitionId $al.PolicyDefinitionId -PolicyAssignmentId $al.PolicyAssignmentId }
+                    $alDisplayHint = if ($al.PolicyAssignmentName) { $al.PolicyAssignmentName } elseif ($al.PolicyDefinitionName) { $al.PolicyDefinitionName } else { $null }
+                    $alName = Resolve-PolicyName -PolicyDefinitionId $al.PolicyDefinitionId -PolicyAssignmentId $al.PolicyAssignmentId -PolicySetDefinitionId $al.PolicySetDefinitionId -DisplayNameHint $alDisplayHint
                     if ($alName -and $alName -ne $al.PolicyDefinitionId -and $alName -ne $al.PolicyAssignmentId) {
                         $policyName = $alName
                         $policySource = "the Activity Log"
@@ -903,7 +970,8 @@ try {
         }
         else {
             $p = Get-PolicyFromError -ExceptionMessage $jr.Error
-            $polName = Resolve-PolicyName -PolicyDefinitionId $p.PolicyDefinitionId -PolicyAssignmentId $p.PolicyAssignmentId
+            $pDisplayHint = if ($p.PolicyAssignmentDisplayName) { $p.PolicyAssignmentDisplayName } elseif ($p.PolicyDefinitionDisplayName) { $p.PolicyDefinitionDisplayName } else { $null }
+            $polName = Resolve-PolicyName -PolicyDefinitionId $p.PolicyDefinitionId -PolicyAssignmentId $p.PolicyAssignmentId -PolicySetDefinitionId $p.PolicySetDefinitionId -DisplayNameHint $pDisplayHint
             $detail = if ($polName) { "Blocked by policy: '$polName'. $($p.Message)" } else { "Failed: $($p.Message)" }
             Add-Result -Category "Deployability" -Check $jr.Target -Result "Fail" -Detail $detail -PolicyName $polName -Message $p.Message
         }
@@ -921,7 +989,8 @@ try {
         }
         catch {
             $p = Get-PolicyFromError -ExceptionMessage $_.Exception.Message
-            $polName = Resolve-PolicyName -PolicyDefinitionId $p.PolicyDefinitionId -PolicyAssignmentId $p.PolicyAssignmentId
+            $pDisplayHint = if ($p.PolicyAssignmentDisplayName) { $p.PolicyAssignmentDisplayName } elseif ($p.PolicyDefinitionDisplayName) { $p.PolicyDefinitionDisplayName } else { $null }
+            $polName = Resolve-PolicyName -PolicyDefinitionId $p.PolicyDefinitionId -PolicyAssignmentId $p.PolicyAssignmentId -PolicySetDefinitionId $p.PolicySetDefinitionId -DisplayNameHint $pDisplayHint
             $detail = if ($polName) { "Blocked by policy: '$polName'. $($p.Message)" } else { "Failed: $($p.Message)" }
             Add-Result -Category "Deployability" -Check "SQL Database (Standard S1, DTU)" -Result "Fail" -Detail $detail -PolicyName $polName -Message $p.Message
         }
