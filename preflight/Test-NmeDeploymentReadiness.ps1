@@ -1256,10 +1256,14 @@ try {
                     # Existing-VNet + Existing zones: scope "missing" to the named resource group when
                     # one was supplied (a zone that exists only elsewhere in the subscription is still
                     # missing from the RG the customer told us they use), and separately report whether
-                    # it's linked to this actual VNet.
+                    # it's linked to this actual VNet. Per-zone Pass (present+linked) rows are suppressed
+                    # from the console to reduce noise - only Fail/Warn rows are emitted per zone, plus a
+                    # single rollup at the end. The full per-zone state is still accumulated below so it
+                    # reaches the JSON output via the rollup's Message.
                     $allZones = @()
                     try { $allZones = Get-AzPrivateDnsZone -ErrorAction Stop } catch {}
                     $missingZones = @()
+                    $dnsZoneReport = @()
                     foreach ($rz in $RequiredPrivateDnsZones) {
                         $match = $allZones | Where-Object { $_.Name -eq $rz.Zone }
                         if ($PrivateDnsZoneRg) { $match = $match | Where-Object { $_.ResourceGroupName -eq $PrivateDnsZoneRg } }
@@ -1267,6 +1271,7 @@ try {
                             $missingZones += $rz.Zone
                             $whereText = if ($PrivateDnsZoneRg) { "resource group '$PrivateDnsZoneRg'" } else { "this subscription" }
                             Add-Result -Category "PrivateDns" -Check "Private DNS zone: $($rz.Zone)" -Result "Fail" -Detail "MISSING from $whereText - required for $($rz.Purpose) private endpoints. Create it and link it to '$ExistingVnetName'."
+                            $dnsZoneReport += "$($rz.Zone) ($($rz.Purpose)): missing from $whereText"
                             continue
                         }
                         $linked = $false
@@ -1277,8 +1282,18 @@ try {
                             }
                             catch {}
                         }
-                        if ($linked) { Add-Result -Category "PrivateDns" -Check "Private DNS zone: $($rz.Zone)" -Result "Pass" -Detail "Present and linked to '$ExistingVnetName' ($($rz.Purpose))." }
-                        else { Add-Result -Category "PrivateDns" -Check "Private DNS zone: $($rz.Zone)" -Result "Warn" -Detail "Present but NOT linked to '$ExistingVnetName' ($($rz.Purpose)). Add a virtual network link." }
+                        if ($linked) { $dnsZoneReport += "$($rz.Zone) ($($rz.Purpose)): present and linked" }
+                        else {
+                            Add-Result -Category "PrivateDns" -Check "Private DNS zone: $($rz.Zone)" -Result "Warn" -Detail "Present but NOT linked to '$ExistingVnetName' ($($rz.Purpose)). Add a virtual network link."
+                            $dnsZoneReport += "$($rz.Zone) ($($rz.Purpose)): present but NOT linked"
+                        }
+                    }
+                    $linkedCount = @($dnsZoneReport | Where-Object { $_ -like "*: present and linked" }).Count
+                    if ($linkedCount -eq $RequiredPrivateDnsZones.Count) {
+                        Add-Result -Category "PrivateDns" -Check "Private DNS zones" -Result "Pass" -Detail "All required private DNS zones present and linked to '$ExistingVnetName'."
+                    }
+                    else {
+                        Add-Result -Category "PrivateDns" -Check "Private DNS zones summary" -Result "Info" -Detail "$linkedCount of $($RequiredPrivateDnsZones.Count) required private DNS zones present and linked to '$ExistingVnetName'." -Message ($dnsZoneReport -join "; ")
                     }
                     $ConfigSummary["Private DNS zones missing"] = if ($missingZones.Count -gt 0) { $missingZones -join "; " } else { "none - all required zones present" }
                 }
