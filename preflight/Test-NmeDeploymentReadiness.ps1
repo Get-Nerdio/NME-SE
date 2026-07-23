@@ -204,11 +204,12 @@ Write-Host "This script checks whether this Azure environment can host a Nerdio 
 Write-Host "It will:"
 Write-Host "  1. Check your Entra directory roles and Azure subscription role (read-only)."
 Write-Host "  2. Check required resource providers and scan for Deny-effect Azure Policies (read-only)."
-Write-Host "  3. Create a TEMPORARY resource group (or use one you name) and attempt to deploy"
+Write-Host "  3. Show you the exact resource names (and tags) it will use and let you customize them."
+Write-Host "  4. Create a TEMPORARY resource group (or use one you name) and attempt to deploy"
 Write-Host "     throwaway copies of the resources Nerdio Manager needs, to detect policy blocks."
-Write-Host "  4. Optionally test a private endpoint + private DNS in an EXISTING VNet you name."
-Write-Host "  5. Optionally test App Service VNet-integration outbound connectivity."
-Write-Host "  6. DELETE everything it created, then print a report you can copy/paste to your Nerdio SE."
+Write-Host "  5. Optionally test a private endpoint + private DNS in an EXISTING VNet you name."
+Write-Host "  6. Optionally test App Service VNet-integration outbound connectivity."
+Write-Host "  7. DELETE everything it created, then print a report you can copy/paste to your Nerdio SE."
 Write-Host ""
 Write-Host -ForegroundColor "Yellow" "It will NOT modify anything outside the test resource group, other than (if you opt in)"
 Write-Host -ForegroundColor "Yellow" "creating and then removing a private endpoint in the existing subnet you specify."
@@ -263,17 +264,16 @@ try {
     if ([string]::IsNullOrEmpty($KeyVaultSuffix)) { $KeyVaultSuffix = "vault.azure.net" }
     $SqlSuffix = $SqlSuffix.TrimStart(".")
 
-    # Resource group: existing or temporary.
+    # Resource group: existing, or temporary (actually created after the naming/tag confirmation below).
+    $PendingRgCreate = $false
     if ([string]::IsNullOrWhiteSpace($ResourceGroupName)) {
         if ([string]::IsNullOrWhiteSpace($Location)) {
             do { $Location = Read-Host -Prompt "Enter the Azure region for the temporary test resources (e.g. eastus)" }
             while ([string]::IsNullOrWhiteSpace($Location))
         }
         $ResourceGroupName = "rg-nme-preflight-$(New-RandomString -Length 6)"
-        Write-Host -ForegroundColor "Cyan" "Creating temporary resource group '$ResourceGroupName' in '$Location'."
-        New-AzResourceGroup -Name $ResourceGroupName -Location $Location -Tag @{ Application = "Nerdio Manager"; Environment = "Preflight" } -ErrorAction Stop | Out-Null
+        $PendingRgCreate = $true
         $CreatedResourceGroup = $true
-        $ResourceGroup = Get-AzResourceGroup -Name $ResourceGroupName -ErrorAction Stop
     }
     else {
         $ResourceGroup = Get-AzResourceGroup -Name $ResourceGroupName -ErrorAction Stop
@@ -297,6 +297,94 @@ try {
     }
 
     $IncludeAutomation = Read-YesNo -Prompt "Include the Automation Account deployability test? (subscriptions have Automation account limits) [y/n]" -Default "y"
+    Write-Host ""
+    #endregion
+
+    #region Resource naming and tags --------------------------------------------------------------
+    $rand = New-RandomString -Length 8
+    $locSlug = ($Location -replace "[^a-z0-9]", "").ToLower()
+    # ZRS is used by the installer in these unpaired regions; GRS everywhere else.
+    $ZrsRegions = @("austriaeast", "belgiumcentral", "chilecentral", "indonesiacentral", "israelcentral",
+        "italynorth", "malaysiawest", "mexicocentral", "newzealandnorth", "polandcentral", "qatarcentral", "spaincentral")
+    $StorageSku = if ($ZrsRegions -contains $locSlug) { "Standard_ZRS" } else { "Standard_GRS" }
+
+    # SQL admin credential. NOTE: the real installer uses Entra-only SQL auth; for a throwaway test we
+    # use a SQL admin login/password so we don't need to designate an AAD admin object.
+    $sqlChars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789".ToCharArray()
+    $sqlPwd = ((1..48 | ForEach-Object { $sqlChars | Get-Random }) -join "") + "aA1!"
+    $sqlLogin = "nmepf$(New-RandomString -Length 8)"
+    $sqlCred = New-Object System.Management.Automation.PSCredential($sqlLogin, (ConvertTo-SecureString -String $sqlPwd -AsPlainText -Force))
+
+    # Default names for every resource this run will attempt to create. The resource group is only
+    # editable if we're about to create it - an existing, user-supplied RG name is not renameable.
+    $NamePlan = [ordered]@{}
+    $NamePlan["ResourceGroup"] = [pscustomobject]@{ Label = "Resource Group"; Value = $ResourceGroupName; Editable = $PendingRgCreate }
+    $NamePlan["LogAnalytics"] = [pscustomobject]@{ Label = "Log Analytics workspace"; Value = "log-nmepf-$locSlug-$rand"; Editable = $true }
+    $NamePlan["Storage"] = [pscustomobject]@{ Label = "Storage account ($StorageSku)"; Value = ("nmepf$rand").Substring(0, [Math]::Min(24, ("nmepf$rand").Length)).ToLower(); Editable = $true }
+    $NamePlan["SqlServer"] = [pscustomobject]@{ Label = "SQL Server"; Value = "nmepf-sql-$rand"; Editable = $true }
+    $NamePlan["SqlDatabase"] = [pscustomobject]@{ Label = "SQL Database"; Value = "nmepfdb"; Editable = $true }
+    $NamePlan["AppServicePlan"] = [pscustomobject]@{ Label = "App Service Plan (B3, Windows)"; Value = "asp-nmepf-$rand"; Editable = $true }
+    $kvDefault = "kv-nmepf-$rand"; if ($kvDefault.Length -gt 24) { $kvDefault = $kvDefault.Substring(0, 24) }
+    $NamePlan["KeyVault"] = [pscustomobject]@{ Label = "Key Vault"; Value = $kvDefault; Editable = $true }
+    if ($IncludeAutomation) {
+        $NamePlan["Automation"] = [pscustomobject]@{ Label = "Automation Account"; Value = "aa-nmepf-$rand"; Editable = $true }
+    }
+    if ($TestPrivate) {
+        $NamePlan["PeStorage"] = [pscustomobject]@{ Label = "Storage account for private endpoint test"; Value = ("nmepfpe$(New-RandomString -Length 6)").Substring(0, 24).ToLower(); Editable = $true }
+        $NamePlan["PrivateEndpoint"] = [pscustomobject]@{ Label = "Private Endpoint"; Value = "pe-nmepf-$rand"; Editable = $true }
+    }
+    if ($TestVnetIntegration) {
+        $NamePlan["ConnAsp"] = [pscustomobject]@{ Label = "App Service Plan for connectivity test"; Value = "asp-nmepfconn-$rand"; Editable = $true }
+        $NamePlan["ConnWebApp"] = [pscustomobject]@{ Label = "Web App for connectivity test"; Value = "app-nmepfconn-$rand"; Editable = $true }
+    }
+
+    Write-Host -ForegroundColor "Cyan" "The following resource names will be used for this test run:"
+    foreach ($k in $NamePlan.Keys) { Write-Host ("  {0,-45} {1}" -f $NamePlan[$k].Label, $NamePlan[$k].Value) }
+    Write-Host ""
+
+    if (-not (Read-YesNo -Prompt "Use these names? [Y/n]" -Default "y")) {
+        foreach ($k in $NamePlan.Keys) {
+            $item = $NamePlan[$k]
+            if (-not $item.Editable) { continue }
+            $custom = Read-Host -Prompt "  New name for $($item.Label) [default: $($item.Value)]"
+            if (-not [string]::IsNullOrWhiteSpace($custom)) {
+                # Storage accounts and Key Vaults have restricted, length-limited naming rules.
+                if ($k -in @("Storage", "PeStorage")) { $custom = ($custom -replace "[^a-zA-Z0-9]", "").ToLower(); $custom = $custom.Substring(0, [Math]::Min(24, $custom.Length)) }
+                if ($k -eq "KeyVault") { $custom = ($custom -replace "[^a-zA-Z0-9-]", ""); $custom = $custom.Substring(0, [Math]::Min(24, $custom.Length)) }
+                $item.Value = $custom
+            }
+        }
+        Write-Host ""
+    }
+
+    $ResourceGroupName = $NamePlan["ResourceGroup"].Value
+    $lawName = $NamePlan["LogAnalytics"].Value
+    $stName = $NamePlan["Storage"].Value
+    $sqlName = $NamePlan["SqlServer"].Value
+    $dbName = $NamePlan["SqlDatabase"].Value
+    $aspName = $NamePlan["AppServicePlan"].Value
+    $kvName = $NamePlan["KeyVault"].Value
+    if ($IncludeAutomation) { $aaName = $NamePlan["Automation"].Value }
+    if ($TestPrivate) { $peStorageName = $NamePlan["PeStorage"].Value; $peName = $NamePlan["PrivateEndpoint"].Value }
+    if ($TestVnetIntegration) { $connAspName = $NamePlan["ConnAsp"].Value; $connWebName = $NamePlan["ConnWebApp"].Value }
+
+    # Tags applied to every resource this script creates (never to a pre-existing resource group).
+    $Tags = @{ Application = "Nerdio Manager"; Environment = "Preflight"; CreatedDate = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss") }
+    if (Read-YesNo -Prompt "Add custom tags to all resources this script creates? [y/n]" -Default "n") {
+        do {
+            $tagName = Read-Host -Prompt "  Tag name"
+            if ([string]::IsNullOrWhiteSpace($tagName)) { break }
+            $tagValue = Read-Host -Prompt "  Tag value"
+            $Tags[$tagName] = $tagValue
+        } while (Read-YesNo -Prompt "  Add another tag? [y/n]" -Default "n")
+    }
+    Write-Host ""
+
+    if ($PendingRgCreate) {
+        Write-Host -ForegroundColor "Cyan" "Creating temporary resource group '$ResourceGroupName' in '$Location'."
+        New-AzResourceGroup -Name $ResourceGroupName -Location $Location -Tag $Tags -ErrorAction Stop | Out-Null
+        $ResourceGroup = Get-AzResourceGroup -Name $ResourceGroupName -ErrorAction Stop
+    }
     Write-Host ""
     #endregion
 
@@ -424,86 +512,63 @@ policyresources
     #region Deployability tests (parallel) -------------------------------------------------------
     Write-Host -ForegroundColor "Cyan" "Testing resource deployability (in parallel). This is the slow part..."
 
-    $rand = New-RandomString -Length 8
-    $locSlug = ($Location -replace "[^a-z0-9]", "").ToLower()
-    # ZRS is used by the installer in these unpaired regions; GRS everywhere else.
-    $ZrsRegions = @("austriaeast", "belgiumcentral", "chilecentral", "indonesiacentral", "israelcentral",
-        "italynorth", "malaysiawest", "mexicocentral", "newzealandnorth", "polandcentral", "qatarcentral", "spaincentral")
-    $StorageSku = if ($ZrsRegions -contains $locSlug) { "Standard_ZRS" } else { "Standard_GRS" }
-
-    # SQL admin credential. NOTE: the real installer uses Entra-only SQL auth; for a throwaway test we
-    # use a SQL admin login/password so we don't need to designate an AAD admin object.
-    $sqlChars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789".ToCharArray()
-    $sqlPwd = ((1..48 | ForEach-Object { $sqlChars | Get-Random }) -join "") + "aA1!"
-    $sqlLogin = "nmepf$(New-RandomString -Length 8)"
-    $sqlCred = New-Object System.Management.Automation.PSCredential($sqlLogin, (ConvertTo-SecureString -String $sqlPwd -AsPlainText -Force))
-
-    # Names
-    $lawName = "log-nmepf-$locSlug-$rand"
-    $stName = ("nmepf$rand").Substring(0, [Math]::Min(24, ("nmepf$rand").Length)).ToLower()
-    $sqlName = "nmepf-sql-$rand"
-    $dbName = "nmepfdb"
-    $aspName = "asp-nmepf-$rand"
-    $kvName = ("kv-nmepf-$rand"); if ($kvName.Length -gt 24) { $kvName = $kvName.Substring(0, 24) }
-    $aaName = "aa-nmepf-$rand"
-
     # Each job returns @{ Target; Ok; Error }. Az context is shared into the thread via -UseNewRunspace:$false default of ThreadJob.
     $jobs = @()
 
     $jobs += Start-ThreadJob -Name "LogAnalytics" -ScriptBlock {
-        param($rg, $name, $loc)
-        try { New-AzOperationalInsightsWorkspace -ResourceGroupName $rg -Name $name -Location $loc -Sku "PerGB2018" -RetentionInDays 30 -ErrorAction Stop | Out-Null; @{ Target = "Log Analytics workspace"; Ok = $true; Name = $name; Kind = "law" } }
+        param($rg, $name, $loc, $tags)
+        try { New-AzOperationalInsightsWorkspace -ResourceGroupName $rg -Name $name -Location $loc -Sku "PerGB2018" -RetentionInDays 30 -Tag $tags -ErrorAction Stop | Out-Null; @{ Target = "Log Analytics workspace"; Ok = $true; Name = $name; Kind = "law" } }
         catch { @{ Target = "Log Analytics workspace"; Ok = $false; Error = $_.Exception.Message; Name = $name; Kind = "law" } }
-    } -ArgumentList $ResourceGroupName, $lawName, $Location
+    } -ArgumentList $ResourceGroupName, $lawName, $Location, $Tags
 
     $jobs += Start-ThreadJob -Name "Storage" -ScriptBlock {
-        param($rg, $name, $loc, $sku)
+        param($rg, $name, $loc, $sku, $tags)
         try {
             New-AzStorageAccount -ResourceGroupName $rg -Name $name -Location $loc -SkuName $sku -Kind "StorageV2" -AccessTier "Hot" `
-                -MinimumTlsVersion "TLS1_2" -AllowBlobPublicAccess $false -AllowSharedKeyAccess $true -EnableHttpsTrafficOnly $true -PublicNetworkAccess "Enabled" -ErrorAction Stop | Out-Null
+                -MinimumTlsVersion "TLS1_2" -AllowBlobPublicAccess $false -AllowSharedKeyAccess $true -EnableHttpsTrafficOnly $true -PublicNetworkAccess "Enabled" -Tag $tags -ErrorAction Stop | Out-Null
             @{ Target = "Storage account ($sku)"; Ok = $true; Name = $name; Kind = "storage" }
         }
         catch { @{ Target = "Storage account ($sku)"; Ok = $false; Error = $_.Exception.Message; Name = $name; Kind = "storage" } }
-    } -ArgumentList $ResourceGroupName, $stName, $Location, $StorageSku
+    } -ArgumentList $ResourceGroupName, $stName, $Location, $StorageSku, $Tags
 
     $jobs += Start-ThreadJob -Name "Sql" -ScriptBlock {
-        param($rg, $name, $loc, $cred)
+        param($rg, $name, $loc, $cred, $tags)
         try {
             New-AzSqlServer -ResourceGroupName $rg -ServerName $name -Location $loc -ServerVersion "12.0" -MinimalTlsVersion "1.2" `
-                -PublicNetworkAccess "Enabled" -SqlAdministratorCredentials $cred -ErrorAction Stop | Out-Null
+                -PublicNetworkAccess "Enabled" -SqlAdministratorCredentials $cred -Tag $tags -ErrorAction Stop | Out-Null
             @{ Target = "SQL Server"; Ok = $true; Name = $name; Kind = "sqlserver" }
         }
         catch { @{ Target = "SQL Server"; Ok = $false; Error = $_.Exception.Message; Name = $name; Kind = "sqlserver" } }
-    } -ArgumentList $ResourceGroupName, $sqlName, $Location, $sqlCred
+    } -ArgumentList $ResourceGroupName, $sqlName, $Location, $sqlCred, $Tags
 
     $jobs += Start-ThreadJob -Name "AppServicePlan" -ScriptBlock {
-        param($rg, $name, $loc)
+        param($rg, $name, $loc, $tags)
         try {
             # B3 == Basic tier, Large worker, Windows (reserved = false). Match the installer's App Service Plan.
-            New-AzAppServicePlan -ResourceGroupName $rg -Name $name -Location $loc -Tier "Basic" -WorkerSize "Large" -NumberOfWorkers 1 -ErrorAction Stop | Out-Null
+            New-AzAppServicePlan -ResourceGroupName $rg -Name $name -Location $loc -Tier "Basic" -WorkerSize "Large" -NumberOfWorkers 1 -Tag $tags -ErrorAction Stop | Out-Null
             @{ Target = "App Service Plan (B3, Windows)"; Ok = $true; Name = $name; Kind = "asp" }
         }
         catch { @{ Target = "App Service Plan (B3, Windows)"; Ok = $false; Error = $_.Exception.Message; Name = $name; Kind = "asp" } }
-    } -ArgumentList $ResourceGroupName, $aspName, $Location
+    } -ArgumentList $ResourceGroupName, $aspName, $Location, $Tags
 
     $jobs += Start-ThreadJob -Name "KeyVault" -ScriptBlock {
-        param($rg, $name, $loc)
+        param($rg, $name, $loc, $tags)
         try {
-            New-AzKeyVault -ResourceGroupName $rg -VaultName $name -Location $loc -Sku "Standard" -SoftDeleteRetentionInDays 90 -DisableRbacAuthorization -ErrorAction Stop | Out-Null
+            New-AzKeyVault -ResourceGroupName $rg -VaultName $name -Location $loc -Sku "Standard" -SoftDeleteRetentionInDays 90 -DisableRbacAuthorization -Tag $tags -ErrorAction Stop | Out-Null
             @{ Target = "Key Vault"; Ok = $true; Name = $name; Kind = "kv" }
         }
         catch { @{ Target = "Key Vault"; Ok = $false; Error = $_.Exception.Message; Name = $name; Kind = "kv" } }
-    } -ArgumentList $ResourceGroupName, $kvName, $Location
+    } -ArgumentList $ResourceGroupName, $kvName, $Location, $Tags
 
     if ($IncludeAutomation) {
         $jobs += Start-ThreadJob -Name "Automation" -ScriptBlock {
-            param($rg, $name, $loc)
+            param($rg, $name, $loc, $tags)
             try {
-                New-AzAutomationAccount -ResourceGroupName $rg -Name $name -Location $loc -Plan "Basic" -ErrorAction Stop | Out-Null
+                New-AzAutomationAccount -ResourceGroupName $rg -Name $name -Location $loc -Plan "Basic" -Tag $tags -ErrorAction Stop | Out-Null
                 @{ Target = "Automation Account"; Ok = $true; Name = $name; Kind = "automation" }
             }
             catch { @{ Target = "Automation Account"; Ok = $false; Error = $_.Exception.Message; Name = $name; Kind = "automation" } }
-        } -ArgumentList $ResourceGroupName, $aaName, $Location
+        } -ArgumentList $ResourceGroupName, $aaName, $Location, $Tags
     }
 
     $jobResults = $jobs | Wait-Job | Receive-Job
@@ -527,7 +592,7 @@ policyresources
     if ($sqlOk) {
         try {
             New-AzSqlDatabase -ResourceGroupName $ResourceGroupName -ServerName $sqlName -DatabaseName $dbName `
-                -Edition "Standard" -RequestedServiceObjectiveName "S1" -CollationName "SQL_Latin1_General_CP1_CI_AS" -ErrorAction Stop | Out-Null
+                -Edition "Standard" -RequestedServiceObjectiveName "S1" -CollationName "SQL_Latin1_General_CP1_CI_AS" -Tag $Tags -ErrorAction Stop | Out-Null
             Add-Result -Category "Deployability" -Check "SQL Database (Standard S1, DTU)" -Result "Pass" -Detail "Created successfully."
             Add-TrackedResource -Type "sqldatabase" -ResourceGroupName $ResourceGroupName -Name $dbName -Note $sqlName
         }
@@ -585,8 +650,8 @@ policyresources
             $peStorage = $stName
             $stAcct = Get-AzStorageAccount -ResourceGroupName $ResourceGroupName -Name $peStorage -ErrorAction SilentlyContinue
             if (-not $stAcct) {
-                $peStorage = ("nmepfpe$(New-RandomString -Length 6)").Substring(0, 24).ToLower()
-                $stAcct = New-AzStorageAccount -ResourceGroupName $ResourceGroupName -Name $peStorage -Location $Location -SkuName $StorageSku -Kind "StorageV2" -AccessTier "Hot" -MinimumTlsVersion "TLS1_2" -AllowBlobPublicAccess $false -PublicNetworkAccess "Enabled" -ErrorAction Stop
+                $peStorage = $peStorageName
+                $stAcct = New-AzStorageAccount -ResourceGroupName $ResourceGroupName -Name $peStorage -Location $Location -SkuName $StorageSku -Kind "StorageV2" -AccessTier "Hot" -MinimumTlsVersion "TLS1_2" -AllowBlobPublicAccess $false -PublicNetworkAccess "Enabled" -Tag $Tags -ErrorAction Stop
                 Add-TrackedResource -Type "storage" -ResourceGroupName $ResourceGroupName -Name $peStorage
             }
             $subnet = $vnet.Subnets | Where-Object { $_.Name -eq $PeSubnetName }
@@ -594,9 +659,8 @@ policyresources
                 Add-Result -Category "PrivateEndpoint" -Check "Private endpoint deployment" -Result "Fail" -Detail "Subnet '$PeSubnetName' not found in VNet '$ExistingVnetName'."
             }
             else {
-                $peName = "pe-nmepf-$rand"
                 $plsc = New-AzPrivateLinkServiceConnection -Name "$peName-conn" -PrivateLinkServiceId $stAcct.Id -GroupId "blob" -ErrorAction Stop
-                $pe = New-AzPrivateEndpoint -ResourceGroupName $ResourceGroupName -Name $peName -Location $Location -Subnet $subnet -PrivateLinkServiceConnection $plsc -ErrorAction Stop
+                $pe = New-AzPrivateEndpoint -ResourceGroupName $ResourceGroupName -Name $peName -Location $Location -Subnet $subnet -PrivateLinkServiceConnection $plsc -Tag $Tags -ErrorAction Stop
                 Add-TrackedResource -Type "privateendpoint" -ResourceGroupName $ResourceGroupName -Name $peName -Id $pe.Id
                 Add-Result -Category "PrivateEndpoint" -Check "Private endpoint deployment" -Result "Pass" -Detail "Deployed a private endpoint (blob) into subnet '$PeSubnetName'."
 
@@ -641,11 +705,11 @@ policyresources
                     Add-Result -Category "Connectivity" -Check "App subnet delegation" -Result "Pass" -Detail "Subnet '$AppSubnetName' is delegated to Microsoft.Web/serverFarms."
 
                     # Ensure an App Service Plan + Web App exist to integrate.
-                    $planName = "asp-nmepfconn-$rand"
-                    New-AzAppServicePlan -ResourceGroupName $ResourceGroupName -Name $planName -Location $Location -Tier "Basic" -WorkerSize "Small" -NumberOfWorkers 1 -ErrorAction Stop | Out-Null
+                    $planName = $connAspName
+                    New-AzAppServicePlan -ResourceGroupName $ResourceGroupName -Name $planName -Location $Location -Tier "Basic" -WorkerSize "Small" -NumberOfWorkers 1 -Tag $Tags -ErrorAction Stop | Out-Null
                     Add-TrackedResource -Type "asp" -ResourceGroupName $ResourceGroupName -Name $planName
-                    $webName = "app-nmepfconn-$rand"
-                    $web = New-AzWebApp -ResourceGroupName $ResourceGroupName -Name $webName -Location $Location -AppServicePlan $planName -ErrorAction Stop
+                    $webName = $connWebName
+                    $web = New-AzWebApp -ResourceGroupName $ResourceGroupName -Name $webName -Location $Location -AppServicePlan $planName -Tag $Tags -ErrorAction Stop
                     Add-TrackedResource -Type "webapp" -ResourceGroupName $ResourceGroupName -Name $webName -Id $web.Id
 
                     # Enable regional VNet integration via the swift-connection REST call.
