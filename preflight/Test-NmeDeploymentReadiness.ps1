@@ -250,7 +250,7 @@ catch {
     return
 }
 
-if (-not (Read-YesNo -Prompt "Proceed? [y/n]" -Default "n")) {
+if (-not (Read-YesNo -Prompt "Proceed? [y/N]" -Default "n")) {
     Write-Host -ForegroundColor "Cyan" "Aborted. No changes made."
     return
 }
@@ -309,7 +309,7 @@ try {
         # Supplied via -ResourceGroupName; validated (and re-prompted if bad) in the loop below.
         $useExisting = $true
     }
-    elseif (Read-YesNo -Prompt "Use an EXISTING (empty) resource group for the test resources? (Selecting 'n' will create a new temporary resource group) [y/n]" -Default "n") {
+    elseif (Read-YesNo -Prompt "Use an EXISTING (empty) resource group for the test resources? (Selecting 'n' will create a new temporary resource group) [y/N]" -Default "n") {
         $useExisting = $true
         $ResourceGroupName = $null
     }
@@ -373,11 +373,11 @@ try {
     $TestVnetIntegration = $false
     $CreateNewVnet = $false
     $ExistingVnetRg = $null; $ExistingVnetName = $null; $PeSubnetName = $null; $AppSubnetName = $null
-    if (Read-YesNo -Prompt "Do you want to deploy Nerdio Manager with PRIVATE ENDPOINTS? [y/n]" -Default "n") {
+    if (Read-YesNo -Prompt "Do you want to deploy Nerdio Manager with PRIVATE ENDPOINTS? [y/N]" -Default "n") {
         $TestPrivate = $true
         $TestVnetIntegration = $true
 
-        if (Read-YesNo -Prompt "Will you deploy to an EXISTING VNet? (Choosing 'n' creates a new VNet; you'll get the option to provide a custom name.) [Y/n]" -Default "y") {
+        if (Read-YesNo -Prompt "Will you deploy to an EXISTING VNet? (Choosing 'n' creates a new VNet; you'll get the option to provide a custom name.) [y/N]" -Default "n") {
             # Validate the VNet exists up front and re-prompt on a bad value, so the user isn't told the
             # name was wrong only after the deployability phase has already created resources.
             $intakeVnet = $null
@@ -516,13 +516,13 @@ try {
     # Tags applied to every resource this script creates (never to a pre-existing resource group).
     # Only user-specified tags are applied - none are added by default.
     $Tags = @{}
-    if (Read-YesNo -Prompt "Add custom tags to all resources this script creates? [y/n]" -Default "n") {
+    if (Read-YesNo -Prompt "Add custom tags to all resources this script creates? [y/N]" -Default "n") {
         do {
             $tagName = Read-Host -Prompt "  Tag name"
             if ([string]::IsNullOrWhiteSpace($tagName)) { break }
             $tagValue = Read-Host -Prompt "  Tag value"
             $Tags[$tagName] = $tagValue
-        } while (Read-YesNo -Prompt "  Add another tag? [y/n]" -Default "n")
+        } while (Read-YesNo -Prompt "  Add another tag? [y/N]" -Default "n")
     }
     Write-Host ""
 
@@ -567,6 +567,19 @@ try {
     #region Fast checks --------------------------------------------------------------------------
     Write-Host -ForegroundColor "Cyan" "Running permission and policy checks..."
 
+    # Resolve the true signed-in user's Entra object id via Graph. In Azure Cloud Shell,
+    # (Get-AzContext).Account.Id reports the internal MSI token-broker reference (e.g. "MSI@50342"),
+    # not the user's UPN, which breaks Get-AzRoleAssignment -SignInName below. Falls back to
+    # Account.Id for normal sessions where it's already a valid UPN/object id.
+    $meObjectId = $null
+    try {
+        $meResp = Invoke-AzRestMethod -Uri "$GraphBase/v1.0/me`?`$select=id" -Method GET -ErrorAction Stop
+        if ($meResp.StatusCode -eq 200) {
+            $meObjectId = ($meResp.Content | ConvertFrom-Json).id
+        }
+    }
+    catch { }
+
     # Entra directory roles WITHOUT the Microsoft.Graph module.
     # Invoke-AzRestMethod (Az.Accounts) reuses the existing Connect-AzAccount token and calls Graph
     # REST directly, sidestepping the Microsoft.Graph module which is frequently blocked/broken.
@@ -599,23 +612,43 @@ try {
     }
 
     # Azure Owner on the subscription (required to install).
+    # Prefer the real Entra object id resolved via Graph above; Account.Id is unreliable in Cloud
+    # Shell (reports "MSI@<port>" instead of the user's UPN), which would fail -SignInName lookups.
+    $subScope = "/subscriptions/$SubscriptionId"
+    $principalParam = if ($meObjectId) { @{ ObjectId = $meObjectId } } else { @{ SignInName = (Get-AzContext).Account.Id } }
+
+    $direct = $null
+    $directError = $null
     try {
-        $subScope = "/subscriptions/$SubscriptionId"
-        $acct = (Get-AzContext).Account.Id
-        $direct = Get-AzRoleAssignment -SignInName $acct -Scope $subScope -ErrorAction SilentlyContinue | Where-Object { $_.RoleDefinitionName -eq "Owner" }
-        $viaGroup = Get-AzRoleAssignment -SignInName $acct -Scope $subScope -ExpandPrincipalGroups -ErrorAction SilentlyContinue | Where-Object { $_.RoleDefinitionName -eq "Owner" }
-        if ($direct) {
-            Add-Result -Category "Permissions" -Check "Azure Owner on subscription" -Result "Pass" -Detail "Directly assigned Owner."
-        }
-        elseif ($viaGroup) {
-            Add-Result -Category "Permissions" -Check "Azure Owner on subscription" -Result "Pass" -Detail "Owner via group membership."
-        }
-        else {
-            Add-Result -Category "Permissions" -Check "Azure Owner on subscription" -Result "Warn" -Detail "Owner not detected on the subscription (or you are a guest). Owner is required to install Nerdio Manager."
-        }
+        $direct = Get-AzRoleAssignment @principalParam -Scope $subScope -ErrorAction Stop | Where-Object { $_.RoleDefinitionName -eq "Owner" }
     }
     catch {
-        Add-Result -Category "Permissions" -Check "Azure Owner on subscription" -Result "Warn" -Detail "Could not evaluate subscription role assignments." -Message $_.Exception.Message
+        $directError = $_.Exception.Message
+    }
+
+    $viaGroup = $null
+    $viaGroupError = $null
+    try {
+        $viaGroup = Get-AzRoleAssignment @principalParam -Scope $subScope -ExpandPrincipalGroups -ErrorAction Stop | Where-Object { $_.RoleDefinitionName -eq "Owner" }
+    }
+    catch {
+        $viaGroupError = $_.Exception.Message
+    }
+
+    if ($direct) {
+        Add-Result -Category "Permissions" -Check "Azure Owner on subscription" -Result "Pass" -Detail "Directly assigned Owner."
+    }
+    elseif ($viaGroup) {
+        Add-Result -Category "Permissions" -Check "Azure Owner on subscription" -Result "Pass" -Detail "Owner via group membership."
+    }
+    elseif ($directError -and $viaGroupError) {
+        Add-Result -Category "Permissions" -Check "Azure Owner on subscription" -Result "Warn" -Detail "Could not evaluate subscription role assignments." -Message "$directError | $viaGroupError"
+    }
+    elseif ($viaGroupError) {
+        Add-Result -Category "Permissions" -Check "Azure Owner on subscription" -Result "Warn" -Detail "Owner not detected directly; could not evaluate group-based Owner assignments." -Message $viaGroupError
+    }
+    else {
+        Add-Result -Category "Permissions" -Check "Azure Owner on subscription" -Result "Warn" -Detail "Owner not detected on the subscription (or you are a guest). Owner is required to install Nerdio Manager."
     }
 
     # Resource providers.
