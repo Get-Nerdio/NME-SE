@@ -154,25 +154,39 @@ function Get-PolicyFromError {
     }
     if ([string]::IsNullOrEmpty($ExceptionMessage)) { return $out }
 
-    $rawJson = $null
-    if ($ExceptionMessage -match "({.*}$)") {
-        $rawJson = $Matches[0]
+    # Primary: ARM embeds a "Policy identifiers: '[{"policyAssignment":{"name":"...","id":"..."},
+    # "policyDefinition":{"name":"...","id":"..."}}]'" block directly in the denial message text. This
+    # is present regardless of which SDK/exception shape wraps it, and - critically - regardless of
+    # whatever other diagnostic text (ErrorDetails, response body, etc.) got concatenated around it, so
+    # search for this specific marker instead of assuming the whole message is (or ends in) one valid
+    # JSON blob. The bracketed text can be plain or JSON-escaped (nested a level inside another JSON
+    # string), depending on which cmdlet threw it - strip any escaping before parsing.
+    if ($ExceptionMessage -match "Policy identifiers:\s*'(\[.*?\])'") {
         try {
-            $parsed = $rawJson | ConvertFrom-Json -ErrorAction Stop
-            if ($parsed.error.message) { $out.Message = $parsed.error.message }
+            $piArr = @(($Matches[1] -replace '\\"', '"') | ConvertFrom-Json -ErrorAction Stop)
+            $first = $piArr | Select-Object -First 1
+            if ($first) {
+                if ($first.policyAssignment.name) { $out.PolicyAssignmentDisplayName = $first.policyAssignment.name }
+                if ($first.policyAssignment.id) { $out.PolicyAssignmentId = $first.policyAssignment.id }
+                if ($first.policyDefinition.name) { $out.PolicyDefinitionDisplayName = $first.policyDefinition.name }
+                if ($first.policyDefinition.id) { $out.PolicyDefinitionId = $first.policyDefinition.id }
+            }
         }
         catch {}
     }
 
-    # Preferred: the same structured error.additionalInfo[].info shape the Activity Log carries -
-    # it has both ids AND display names, and (for Initiative-assigned policies) the set definition id.
-    if ($rawJson) {
+    # Secondary: the error.additionalInfo[].info shape (ids, display names, and - for Initiative-
+    # assigned policies - the set definition id). Only attempted when the primary parse above didn't
+    # already resolve a name, and only trusted when the message truly is one clean trailing JSON blob -
+    # appended diagnostic text (ErrorDetails/response body/etc.) can otherwise garble this parse.
+    if (-not $out.PolicyAssignmentDisplayName -and -not $out.PolicyDefinitionDisplayName -and $ExceptionMessage -match "({.*}$)") {
         try {
-            $j = $rawJson | ConvertFrom-Json -ErrorAction Stop
+            $j = $Matches[0] | ConvertFrom-Json -ErrorAction Stop
+            if ($j.error.message) { $out.Message = $j.error.message }
             $info = ($j.error.additionalInfo | Where-Object { $_.type -eq "PolicyViolation" } | Select-Object -First 1).info
             if ($info) {
-                if ($info.policyDefinitionId) { $out.PolicyDefinitionId = $info.policyDefinitionId }
-                if ($info.policyAssignmentId) { $out.PolicyAssignmentId = $info.policyAssignmentId }
+                if (-not $out.PolicyDefinitionId -and $info.policyDefinitionId) { $out.PolicyDefinitionId = $info.policyDefinitionId }
+                if (-not $out.PolicyAssignmentId -and $info.policyAssignmentId) { $out.PolicyAssignmentId = $info.policyAssignmentId }
                 if ($info.policySetDefinitionId) { $out.PolicySetDefinitionId = $info.policySetDefinitionId }
                 if ($info.policyDefinitionDisplayName) { $out.PolicyDefinitionDisplayName = $info.policyDefinitionDisplayName }
                 if ($info.policyAssignmentDisplayName) { $out.PolicyAssignmentDisplayName = $info.policyAssignmentDisplayName }
@@ -181,25 +195,9 @@ function Get-PolicyFromError {
         catch {}
     }
 
-    # Fallback: regex the raw text for anything the structured parse didn't fill in (older/odd shapes).
-    if (-not $out.PolicyDefinitionId) {
-        if ($out.Message -match "policyDefinitionId'?:?\s*'?(/[^',\s\}]+)") { $out.PolicyDefinitionId = $Matches[1] }
-        elseif ($ExceptionMessage -match "policyDefinitionId'?:?\s*'?(/[^',\s\}]+)") { $out.PolicyDefinitionId = $Matches[1] }
-    }
-    if (-not $out.PolicyAssignmentId) {
-        if ($out.Message -match "policyAssignmentId'?:?\s*'?(/[^',\s\}]+)") { $out.PolicyAssignmentId = $Matches[1] }
-        elseif ($ExceptionMessage -match "policyAssignmentId'?:?\s*'?(/[^',\s\}]+)") { $out.PolicyAssignmentId = $Matches[1] }
-    }
-
-    # Many Az module cmdlets (e.g. Az.Sql, Az.Storage) throw an exception whose .Message is just the
-    # inner ARM error text - no outer {"error":{...}} envelope, so the additionalInfo parse above never
-    # runs. That inner text still embeds a "Policy identifiers: '[{"policyAssignment":{"name":"...",
-    # "id":"..."},"policyDefinition":{"name":"...","id":"..."}}]'" block with the display names already
-    # resolved - pull straight from that, regardless of whether the outer envelope survived.
-    if (-not $out.PolicyAssignmentDisplayName -and $ExceptionMessage -match '"policyAssignment"\s*:\s*\{\s*"name"\s*:\s*"([^"]+)"') { $out.PolicyAssignmentDisplayName = $Matches[1] }
-    if (-not $out.PolicyDefinitionDisplayName -and $ExceptionMessage -match '"policyDefinition"\s*:\s*\{\s*"name"\s*:\s*"([^"]+)"') { $out.PolicyDefinitionDisplayName = $Matches[1] }
-    if (-not $out.PolicyAssignmentId -and $ExceptionMessage -match '"policyAssignment"\s*:\s*\{[^\}]*?"id"\s*:\s*"([^"]+)"') { $out.PolicyAssignmentId = $Matches[1] }
-    if (-not $out.PolicyDefinitionId -and $ExceptionMessage -match '"policyDefinition"\s*:\s*\{[^\}]*?"id"\s*:\s*"([^"]+)"') { $out.PolicyDefinitionId = $Matches[1] }
+    # Last resort: bare policyDefinitionId/policyAssignmentId resource-id keys (older/odd shapes).
+    if (-not $out.PolicyDefinitionId -and $ExceptionMessage -match "policyDefinitionId'?:?\s*'?(/[^',\s\}]+)") { $out.PolicyDefinitionId = $Matches[1] }
+    if (-not $out.PolicyAssignmentId -and $ExceptionMessage -match "policyAssignmentId'?:?\s*'?(/[^',\s\}]+)") { $out.PolicyAssignmentId = $Matches[1] }
     return $out
 }
 
