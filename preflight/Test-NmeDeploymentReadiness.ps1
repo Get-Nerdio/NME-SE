@@ -182,12 +182,12 @@ function Resolve-PolicyName {
 # When an ARM error doesn't embed the blocking policy's identifiers (New-AzResourceGroup's
 # RequestDisallowedByPolicy frequently doesn't), the Activity Log does: the failed control-plane
 # operation is recorded with a PolicyViolation carrying the policy/assignment ids AND display names.
-# Activity Log ingestion lags the operation by a few seconds, so poll for it.
+# Activity Log ingestion can lag the operation by minutes, so poll for up to 5 minutes by default.
 function Get-PolicyFromActivityLog {
     param(
         [Parameter(Mandatory = $true)][string] $ResourceGroupName,
         [datetime] $StartTime,
-        [int] $MaxAttempts = 6,
+        [int] $MaxAttempts = 30,
         [int] $DelaySeconds = 10
     )
     $out = [pscustomobject]@{
@@ -367,6 +367,24 @@ try {
     if ([string]::IsNullOrEmpty($StorageSuffix)) { $StorageSuffix = "core.windows.net" }
     if ([string]::IsNullOrEmpty($SqlSuffix)) { $SqlSuffix = ".database.windows.net" }
     if ([string]::IsNullOrEmpty($KeyVaultSuffix)) { $KeyVaultSuffix = "vault.azure.net" }
+
+    # Resolve the true signed-in user's Entra identity via Graph. In Azure Cloud Shell,
+    # (Get-AzContext).Account.Id reports the internal MSI token-broker reference (e.g. "MSI@50342"),
+    # not the user's UPN, which breaks both the report's "Run by" field and Get-AzRoleAssignment
+    # -SignInName lookups further down. Falls back to Account.Id for normal sessions where it's
+    # already a valid UPN/object id.
+    $meObjectId = $null
+    $meUpn = $null
+    try {
+        $meResp = Invoke-AzRestMethod -Uri "$GraphBase/v1.0/me`?`$select=id,userPrincipalName" -Method GET -ErrorAction Stop
+        if ($meResp.StatusCode -eq 200) {
+            $meJson = $meResp.Content | ConvertFrom-Json
+            $meObjectId = $meJson.id
+            $meUpn = $meJson.userPrincipalName
+        }
+    }
+    catch { }
+    $SignedInAccount = if ($meUpn) { $meUpn } else { (Get-AzContext).Account.Id }
     $SqlSuffix = $SqlSuffix.TrimStart(".")
 
     # Private DNS zones the installer creates/links for a private deployment (suffixes are
@@ -626,7 +644,7 @@ try {
             # New-AzResourceGroup's RequestDisallowedByPolicy error usually omits the policy identifiers,
             # so fall back to the Activity Log, which records the denied operation with the policy name.
             if (-not $policySource) {
-                Write-Host -ForegroundColor "Yellow" "  Resource group creation was blocked by policy. Querying the Activity Log for the specific policy (can take up to a minute)..."
+                Write-Host -ForegroundColor "Yellow" "  Resource group creation was blocked by policy. Querying the Activity Log for the specific policy - this can take up to 5 minutes while Azure ingests the event..."
                 $al = Get-PolicyFromActivityLog -ResourceGroupName $ResourceGroupName -StartTime $rgCreateStart
                 if ($al.Found) {
                     $alName = if ($al.PolicyAssignmentName) { $al.PolicyAssignmentName } elseif ($al.PolicyDefinitionName) { $al.PolicyDefinitionName } else { $null }
@@ -647,12 +665,12 @@ try {
                 "Blocked by Azure Policy id '$policyName' (display name could not be resolved). The resource group could not be created$(if ($Tags.Count -gt 0) { ' - review the tags you supplied against required-tag/tag-value policies' })."
             }
             else {
-                "The resource group could not be created$(if ($Tags.Count -gt 0) { ' (this often indicates a required-tag/tag-value Deny policy - review the supplied tags)' }). Could not identify the specific policy from the ARM error or the Activity Log (it may not have been ingested yet)."
+                "The resource group could not be created$(if ($Tags.Count -gt 0) { ' (this often indicates a required-tag/tag-value Deny policy - review the supplied tags)' }). Could not identify the specific policy from the ARM error or the Activity Log after waiting up to 5 minutes for ingestion - check the Activity Log manually for '$ResourceGroupName'."
             }
             Add-Result -Category "Deployability" -Check "Resource group creation" -Result "Fail" -Detail $detail -PolicyName $policyName -Message $policyInfo.Message
             # We return before the ConfigSummary is normally populated, so record enough here that the
             # report still shows the SE what was attempted.
-            $ConfigSummary["Run by (signed-in account)"] = (Get-AzContext).Account.Id
+            $ConfigSummary["Run by (signed-in account)"] = $SignedInAccount
             $ConfigSummary["Subscription"] = "$($Context.Subscription.Name) ($SubscriptionId)"
             $ConfigSummary["Cloud"] = $AzEnv.Name
             $ConfigSummary["Region"] = $Location
@@ -702,19 +720,6 @@ try {
     #region Fast checks --------------------------------------------------------------------------
     Write-Host -ForegroundColor "Cyan" "Running permission and resource provider checks..."
 
-    # Resolve the true signed-in user's Entra object id via Graph. In Azure Cloud Shell,
-    # (Get-AzContext).Account.Id reports the internal MSI token-broker reference (e.g. "MSI@50342"),
-    # not the user's UPN, which breaks Get-AzRoleAssignment -SignInName below. Falls back to
-    # Account.Id for normal sessions where it's already a valid UPN/object id.
-    $meObjectId = $null
-    try {
-        $meResp = Invoke-AzRestMethod -Uri "$GraphBase/v1.0/me`?`$select=id" -Method GET -ErrorAction Stop
-        if ($meResp.StatusCode -eq 200) {
-            $meObjectId = ($meResp.Content | ConvertFrom-Json).id
-        }
-    }
-    catch { }
-
     # Entra directory roles WITHOUT the Microsoft.Graph module.
     # Invoke-AzRestMethod (Az.Accounts) reuses the existing Connect-AzAccount token and calls Graph
     # REST directly, sidestepping the Microsoft.Graph module which is frequently blocked/broken.
@@ -750,7 +755,7 @@ try {
     # Prefer the real Entra object id resolved via Graph above; Account.Id is unreliable in Cloud
     # Shell (reports "MSI@<port>" instead of the user's UPN), which would fail -SignInName lookups.
     $subScope = "/subscriptions/$SubscriptionId"
-    $principalParam = if ($meObjectId) { @{ ObjectId = $meObjectId } } else { @{ SignInName = (Get-AzContext).Account.Id } }
+    $principalParam = if ($meObjectId) { @{ ObjectId = $meObjectId } } else { @{ SignInName = $SignedInAccount } }
 
     $direct = $null
     $directError = $null
