@@ -962,6 +962,15 @@ policyresources
                         Add-Result -Category "Connectivity" -Check "VNet integration" -Result "Pass" -Detail "Regional VNet integration enabled to '$AppSubnetName'."
                         # Route all traffic through the VNet so the test reflects NME behavior.
                         try { Set-AzWebApp -ResourceGroupName $ResourceGroupName -Name $webName -AppSettings @{ WEBSITE_VNET_ROUTE_ALL = "1" } -ErrorAction SilentlyContinue | Out-Null } catch {}
+
+                    if ($CreateNewVnet) {
+                        # On a brand-new VNet there's no existing outbound routing/DNS/firewall setup to validate -
+                        # the resources above confirm the VNet, subnet delegation, and integration are configured
+                        # correctly, but running the live Kudu outbound test here would only be testing Azure's
+                        # default (wide-open) egress, not anything the customer will actually configure.
+                        Add-Result -Category "Connectivity" -Check "Outbound connectivity test" -Result "Info" -Detail "Skipped - VNet '$ExistingVnetName' is brand-new with no customer-configured routing/firewall/DNS yet. VNet integration, subnet delegation, and the test App Service were created and confirmed configured correctly. Once the customer's real egress controls (firewall, UDRs, custom DNS) are in place, run NmeNetworkTest.ps1 against the real NME App Service to validate outbound connectivity."
+                    }
+                    else {
                         Start-Sleep -Seconds 20
 
                         # Build the outbound endpoint list (environment-aware).
@@ -1003,6 +1012,7 @@ policyresources
                         catch {
                             Add-Result -Category "Connectivity" -Check "Kudu outbound test" -Result "Warn" -Detail "Could not run the in-worker connectivity test via Kudu. From the App Service Kudu console for '$webName': $NmeNetworkTestHint Endpoints to test: $($endpoints -join ', ')." -Message $_.Exception.Message
                         }
+                    }
                     }
                     else {
                         Add-Result -Category "Connectivity" -Check "VNet integration" -Result "Warn" -Detail "Could not enable VNet integration (HTTP $($swift.StatusCode)) on the test App Service. After the real NME install has working VNet integration, verify outbound access with NmeNetworkTest.ps1." -Message $swift.Content
