@@ -291,6 +291,22 @@ try {
         $CreatedResourceGroup = $true
     }
 
+    if (-not $PendingRgCreate) {
+        try {
+            $existingResources = Get-AzResource -ResourceGroupName $ResourceGroupName -ErrorAction Stop
+            if ($existingResources -and $existingResources.Count -gt 0) {
+                Write-Host -ForegroundColor "Yellow" "[!] Resource group '$ResourceGroupName' is not empty - it already contains $($existingResources.Count) resource(s). Test resources will be created alongside them and cleanup will only remove what this script creates."
+            }
+            else {
+                Write-Host -ForegroundColor "Green" "[$([char]0x2713)] Resource group '$ResourceGroupName' is empty."
+            }
+        }
+        catch {
+            Write-Host -ForegroundColor "Yellow" "  Could not check whether resource group '$ResourceGroupName' is empty." -NoNewline
+            Write-Host " $($_.Exception.Message)"
+        }
+    }
+
     # Private-network scenarios.
     $TestPrivate = $false
     $TestVnetIntegration = $false
