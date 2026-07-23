@@ -330,7 +330,7 @@ catch {
     return
 }
 
-if (-not (Read-YesNo -Prompt "Proceed? [y/N]" -Default "n")) {
+if (-not (Read-YesNo -Prompt "Proceed? [Y/n]" -Default "y")) {
     Write-Host -ForegroundColor "Cyan" "Aborted. No changes made."
     return
 }
