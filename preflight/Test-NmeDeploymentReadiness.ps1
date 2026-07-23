@@ -836,10 +836,15 @@ try {
     $subScope = "/subscriptions/$SubscriptionId"
     $principalParam = if ($meObjectId) { @{ ObjectId = $meObjectId } } else { @{ SignInName = $SignedInAccount } }
 
+    # Roles checked for: Owner (sufficient alone), or Contributor + User Access Administrator, which
+    # together are functionally equivalent to Owner for install purposes (Contributor covers
+    # resource create/manage, User Access Administrator covers the role-assignment writes NME needs).
+    $relevantRoles = @("Owner", "Contributor", "User Access Administrator")
+
     $direct = $null
     $directError = $null
     try {
-        $direct = Get-AzRoleAssignment @principalParam -Scope $subScope -ErrorAction Stop | Where-Object { $_.RoleDefinitionName -eq "Owner" }
+        $direct = Get-AzRoleAssignment @principalParam -Scope $subScope -ErrorAction Stop | Where-Object { $_.RoleDefinitionName -in $relevantRoles }
     }
     catch {
         $directError = $_.Exception.Message
@@ -848,26 +853,48 @@ try {
     $viaGroup = $null
     $viaGroupError = $null
     try {
-        $viaGroup = Get-AzRoleAssignment @principalParam -Scope $subScope -ExpandPrincipalGroups -ErrorAction Stop | Where-Object { $_.RoleDefinitionName -eq "Owner" }
+        $viaGroup = Get-AzRoleAssignment @principalParam -Scope $subScope -ExpandPrincipalGroups -ErrorAction Stop | Where-Object { $_.RoleDefinitionName -in $relevantRoles }
     }
     catch {
         $viaGroupError = $_.Exception.Message
     }
 
-    if ($direct) {
+    $directOwner = $direct | Where-Object { $_.RoleDefinitionName -eq "Owner" }
+    $viaGroupOwner = $viaGroup | Where-Object { $_.RoleDefinitionName -eq "Owner" }
+
+    if ($directOwner) {
         Add-Result -Category "Permissions" -Check "Azure Owner on subscription" -Result "Pass" -Detail "Directly assigned Owner."
     }
-    elseif ($viaGroup) {
+    elseif ($viaGroupOwner) {
         Add-Result -Category "Permissions" -Check "Azure Owner on subscription" -Result "Pass" -Detail "Owner via group membership."
     }
     elseif ($directError -and $viaGroupError) {
         Add-Result -Category "Permissions" -Check "Azure Owner on subscription" -Result "Warn" -Detail "Could not evaluate subscription role assignments." -Message "$directError | $viaGroupError"
     }
-    elseif ($viaGroupError) {
-        Add-Result -Category "Permissions" -Check "Azure Owner on subscription" -Result "Warn" -Detail "Owner not detected directly; could not evaluate group-based Owner assignments." -Message $viaGroupError
-    }
     else {
-        Add-Result -Category "Permissions" -Check "Azure Owner on subscription" -Result "Warn" -Detail "Owner not detected on the subscription (or you are a guest). Owner is required to install Nerdio Manager."
+        # Owner ruled out; at least one query returned data. Evaluate the Contributor + User Access
+        # Administrator combo across whatever succeeded (both, or just the one that didn't error - a
+        # partial failure, e.g. -ExpandPrincipalGroups needing extra rights, must not discard the
+        # direct data). If only one query errored and the combo wasn't found, note the evaluation may
+        # be incomplete rather than reporting a clean "not present".
+        $allAssignments = @($direct) + @($viaGroup)
+        $hasContributor = [bool]($allAssignments | Where-Object { $_.RoleDefinitionName -eq "Contributor" })
+        $hasUaa = [bool]($allAssignments | Where-Object { $_.RoleDefinitionName -eq "User Access Administrator" })
+        $partialErr = if ($directError) { $directError } elseif ($viaGroupError) { $viaGroupError } else { $null }
+        $partialNote = if ($partialErr) { " One role query failed, so this may be incomplete." } else { "" }
+
+        if ($hasContributor -and $hasUaa) {
+            Add-Result -Category "Permissions" -Check "Azure Owner on subscription" -Result "Pass" -Detail "Contributor + User Access Administrator (functionally equivalent to Owner for install).$partialNote" -Message $partialErr
+        }
+        elseif ($hasContributor) {
+            Add-Result -Category "Permissions" -Check "Azure Owner on subscription" -Result "Warn" -Detail "Have Contributor but missing User Access Administrator; need Owner, or Contributor + User Access Administrator, to install.$partialNote" -Message $partialErr
+        }
+        elseif ($hasUaa) {
+            Add-Result -Category "Permissions" -Check "Azure Owner on subscription" -Result "Warn" -Detail "Have User Access Administrator but missing Contributor; need Owner, or Contributor + User Access Administrator, to install.$partialNote" -Message $partialErr
+        }
+        else {
+            Add-Result -Category "Permissions" -Check "Azure Owner on subscription" -Result "Warn" -Detail "Owner not detected on the subscription (or you are a guest). Owner (or Contributor + User Access Administrator) is required to install Nerdio Manager.$partialNote" -Message $partialErr
+        }
     }
 
     # Resource providers.
