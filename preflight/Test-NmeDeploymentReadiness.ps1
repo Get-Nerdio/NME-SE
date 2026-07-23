@@ -369,7 +369,8 @@ try {
     if ($TestVnetIntegration) { $connAspName = $NamePlan["ConnAsp"].Value; $connWebName = $NamePlan["ConnWebApp"].Value }
 
     # Tags applied to every resource this script creates (never to a pre-existing resource group).
-    $Tags = @{ Application = "Nerdio Manager"; Environment = "Preflight"; CreatedDate = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss") }
+    # Only user-specified tags are applied - none are added by default.
+    $Tags = @{}
     if (Read-YesNo -Prompt "Add custom tags to all resources this script creates? [y/n]" -Default "n") {
         do {
             $tagName = Read-Host -Prompt "  Tag name"
