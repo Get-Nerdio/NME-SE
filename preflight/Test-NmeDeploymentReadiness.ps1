@@ -444,7 +444,7 @@ Write-Host ""
 Write-Host -ForegroundColor "Yellow" "It will NOT modify anything outside the test resource group, other than (if you opt in)"
 Write-Host -ForegroundColor "Yellow" "creating and then removing private endpoints in the existing subnet you specify."
 Write-Host ""
-Write-Host "Typical runtime: 2-3 minutes."
+Write-Host "Typical runtime: 2-10 minutes."
 Write-Host ""
 
 # Auth guard - a valid Az token is the only hard prerequisite.
