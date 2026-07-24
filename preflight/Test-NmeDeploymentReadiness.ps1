@@ -1556,7 +1556,7 @@ try {
                     Add-TrackedResource -Type "webapp" -ResourceGroupName $ResourceGroupName -Name $webName -Id $web.Id
 
                     # Enable regional VNet integration via the swift-connection REST call.
-                    $swiftUri = "https://management.azure.com$($web.Id)/networkConfig/virtualNetwork?api-version=2023-01-01"
+                    $swiftUri = "$($AzEnv.ResourceManagerUrl.TrimEnd('/'))$($web.Id)/networkConfig/virtualNetwork?api-version=2023-01-01"
                     $swiftBody = @{ properties = @{ subnetResourceId = $appSubnet.Id; swiftSupported = $true } } | ConvertTo-Json -Depth 5
                     $swift = Invoke-AzRestMethod -Method PUT -Uri $swiftUri -Payload $swiftBody -ErrorAction Stop
                     if ($swift.StatusCode -ge 200 -and $swift.StatusCode -lt 300) {
@@ -1652,9 +1652,9 @@ try {
                         # API so it uses the VNet's real routing and DNS - the same approach
                         # NmeNetworkTest.ps1 uses.
                         $scmHost = ($web.EnabledHostNames | Where-Object { $_ -match "\.scm\." } | Select-Object -First 1)
-                        if (-not $scmHost) { $scmHost = "$webName.scm.azurewebsites.net" }
+                        if (-not $scmHost) { $scmHost = "$webName.scm.$(if ($AzEnv.Name -eq 'AzureUSGovernment') { 'azurewebsites.us' } elseif ($AzEnv.Name -eq 'AzureChinaCloud') { 'chinacloudsites.cn' } else { 'azurewebsites.net' })" }
                         # Newer Az.Accounts returns the token as a SecureString; handle both forms.
-                        $rawTok = (Get-AzAccessToken -ResourceUrl "https://management.azure.com" -ErrorAction Stop).Token
+                        $rawTok = (Get-AzAccessToken -ResourceUrl $AzEnv.ResourceManagerUrl -ErrorAction Stop).Token
                         $kuduToken = if ($rawTok -is [System.Security.SecureString]) { [System.Net.NetworkCredential]::new("", $rawTok).Password } else { $rawTok }
                         $epList = ($targets | ForEach-Object { "'$($_.Key)|$($_.Port)'" }) -join ","
                         $remoteCmd = "`$ProgressPreference='SilentlyContinue';foreach(`$e in @($epList)){`$pp=`$e -split '\|';`$u=`$pp[0];`$p=[int]`$pp[1];`$ip='';try{`$ip=(([System.Net.Dns]::GetHostAddresses(`$u))|Where-Object{`$_.AddressFamily -eq 'InterNetwork'}|Select-Object -First 1).IPAddressToString}catch{};`$ok=`$false;try{`$c=New-Object System.Net.Sockets.TcpClient;`$ar=`$c.BeginConnect(`$u,`$p,`$null,`$null);if(`$ar.AsyncWaitHandle.WaitOne(10000)){try{`$c.EndConnect(`$ar);`$ok=`$c.Connected}catch{}};`$c.Close()}catch{};`$sub='';if(`$p -eq 443 -and `$ok){try{`$sp=[System.Net.ServicePointManager]::FindServicePoint('https://'+`$u);`$null=Invoke-RestMethod -Uri ('https://'+`$u) -TimeoutSec 15 -ErrorAction SilentlyContinue;`$sub=`$sp.Certificate.Subject}catch{}};`$st=if(`$ok){'OK'}else{'BLOCKED'};Write-Output (`$u+'|'+`$st+'|'+`$ip+'|'+`$sub)}"
