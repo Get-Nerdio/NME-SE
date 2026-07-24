@@ -603,7 +603,7 @@ try {
     $privateChoice = Read-Choice -Prompt "Do you want to deploy Nerdio Manager with PRIVATE ENDPOINTS?" -Options @(
         "Yes - deploy with private endpoints (no public internet exposure)",
         "No - use public endpoints (default)"
-    ) -Default 2 -Help "Private endpoints give NME's PaaS dependencies (SQL Database, Key Vault, Storage, and the App Service) private IPs on your VNet instead of public endpoints. Pros: no public exposure of the NME data plane; meets network-isolation requirements. Cons: increases complexity and can extend the Nerdio Proof of Value timeline. `r`n`r`nNOTE: Private endpoints can be enabled after proving value and before going to production."
+    ) -Default 2 -Help "Private endpoints give NME's PaaS dependencies (SQL Database, Key Vault, Storage, and the App Service) private IPs on your VNet instead of public endpoints. `r`n`r`nPros: no public exposure of the NME data plane; meets network-isolation requirements. Note: public endpoints are still protected by Azure authentication and authorization requirements. `r`n`r`nCons: increases complexity and can extend the Nerdio Proof of Value timeline. `r`n`r`nNOTE: Private endpoints can be enabled after proving value and before going to production."
     if ($privateChoice -eq 1) {
         $TestPrivate = $true
         $TestVnetIntegration = $true
