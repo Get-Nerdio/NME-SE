@@ -612,7 +612,7 @@ try {
             "Use an EXISTING VNet (you provide RG, VNet, and both subnet names)",
             "Create a NEW VNet for Nerdio Manager (this script creates and later deletes a vnet. The NME deployment process will create a new VNet during installation as well. You will be able to specify the address space for the actual deployment.)",
             "I don't know yet - the VNet hasn't been created yet"
-        ) -Default 2 -Help "NME can be deployed to a new VNet created during deployment, which simplifies DNS and networking - this is the preferred/default deployment. Deploying into an EXISTING VNet is recommended when your organization requires routing all traffic through centralized firewalls. `r`n`r`nSelecting an EXISTING VNet tests against the real network NME will use - its subnets, DNS settings, and any private DNS zone links - so the result of this test reflects your production topology. You must provide the VNet's resource group, its name, a subnet for private endpoints, and a separate subnet delegated to Microsoft.Web/serverFarms for App Service integration. `r`n`r`nA NEW VNet lets the script prove the resources CAN be created (VNet, subnets, delegation, private endpoint) in a clean 10.60.0.0/16 space it creates and then deletes. `r`n`r`nIf you plan to use your own existing VNet but haven't created it yet, choose the third option - the script will skip private endpoint / VNet integration testing this run and note that it still needs to be validated later."
+        ) -Default 2 -Help "NME can be deployed to a new VNet created during deployment, which simplifies DNS and networking - this is the preferred/default deployment. Deploying into an EXISTING VNet is recommended when your organization requires routing all traffic through centralized firewalls. `r`n`r`nSelecting an EXISTING VNet tests against the real network NME will use - its subnets, DNS settings, and any private DNS zone links - so the result of this test reflects your production topology. You must provide the VNet's resource group, its name, a subnet for private endpoints, and a separate subnet delegated to Microsoft.Web/serverFarms for App Service integration. `r`n`r`nA NEW VNet lets the script prove the resources CAN be created (VNet, subnets, delegation, private endpoint) in a clean 10.60.0.0/16 space it creates and then deletes. `r`n`r`nIf you plan to use your own existing VNet but haven't created it yet, choose the third option - the script will skip private endpoint / VNet integration testing this run, but you must have the VNet's resource group, name, and subnet names ready before the actual NME POV installation."
         if ($vnetChoice -eq 1) {
             # Validate the VNet exists up front and re-prompt on a bad value, so the user isn't told the
             # name was wrong only after the deployability phase has already created resources.
@@ -671,17 +671,26 @@ try {
                     # VNet turns out to use custom/on-prem DNS.
                     $dnsZonesChoice = Read-Choice -Prompt "  Will you use EXISTING Azure Private DNS zones, or have NME/this script create NEW ones?" -Options @(
                         "Use EXISTING Private DNS zones (you will be asked to provide the subscription + resource group of the existing zones)",
-                        "Create NEW Private DNS zones (the installer/runbook creates them at deploy time)"
-                    ) -Default 2 -Help "NME's private endpoints need these Azure Private DNS zones, linked to the VNet, to resolve to private IPs: `r`n`r`nprivatelink.database.windows.net (SQL)`r`nprivatelink.vaultcore.azure.net (Key Vault)`r`nprivatelink.blob.core.windows.net (Storage)`r`nprivatelink.azurewebsites.net (App Service)`r`nprivatelink.azure-automation.net (Automation).`n`r`n`r`nEXISTING: your org already manages these zones centrally (common with hub/spoke + Azure Policy auto-registration) - you will be asked to provide the subscription and resource group that holds them, and this script reports which required zones are MISSING there. `r`n`r`nNEW: NME's deployment (or the Enable Private Endpoints runbook) will create and link the zones for you - this script only tests that the required zones CAN be created (in the throwaway test resource group) and does NOT link them to your VNet; the real installer/runbook creates and links them at deploy time. (Gov/China clouds use the equivalent .us/.cn zone names, derived automatically.)"
+                        "Create NEW Private DNS zones (the installer/runbook creates them at deploy time)",
+                        "I don't know yet - will use EXISTING zones but the subscription/resource group aren't known yet"
+                    ) -Default 2 -Help "NME's private endpoints need these Azure Private DNS zones, linked to the VNet, to resolve to private IPs: `r`n`r`nprivatelink.database.windows.net (SQL)`r`nprivatelink.vaultcore.azure.net (Key Vault)`r`nprivatelink.blob.core.windows.net (Storage)`r`nprivatelink.azurewebsites.net (App Service)`r`nprivatelink.azure-automation.net (Automation).`n`r`n`r`nEXISTING: your org already manages these zones centrally (common with hub/spoke + Azure Policy auto-registration) - you will be asked to provide the subscription and resource group that holds them, and this script reports which required zones are MISSING there. `r`n`r`nNEW: NME's deployment (or the Enable Private Endpoints runbook) will create and link the zones for you - this script only tests that the required zones CAN be created (in the throwaway test resource group) and does NOT link them to your VNet; the real installer/runbook creates and links them at deploy time. (Gov/China clouds use the equivalent .us/.cn zone names, derived automatically.) `r`n`r`nIf you'll use EXISTING zones but don't yet know their subscription/resource group, choose the third option - this script will skip the zone verification this run, but you must have that information ready before the actual NME POV installation."
                     if ($dnsZonesChoice -eq 1) {
                         $PrivateDnsZonesMode = "Existing"
                         do { $PrivateDnsZoneSubId = Read-Host -Prompt "    Subscription ID where the Azure Private DNS zones live" } while ([string]::IsNullOrWhiteSpace($PrivateDnsZoneSubId))
                         do { $PrivateDnsZoneRg = Read-Host -Prompt "    Resource group name for the Azure Private DNS zones" } while ([string]::IsNullOrWhiteSpace($PrivateDnsZoneRg))
                         $ConfigSummary["Private DNS zones plan"] = "Existing (subscription '$PrivateDnsZoneSubId', resource group '$PrivateDnsZoneRg')"
                     }
-                    else {
+                    elseif ($dnsZonesChoice -eq 2) {
                         $PrivateDnsZonesMode = "New"
                         $ConfigSummary["Private DNS zones plan"] = "New (created at install)"
+                    }
+                    else {
+                        # Subscription/RG for the existing zones aren't known yet - nothing to prompt for
+                        # and nothing this script can verify against. Note it clearly so it doesn't get
+                        # missed before the actual NME POV installation, which needs this to link the zones.
+                        $PrivateDnsZonesMode = "Unknown"
+                        Write-Host -ForegroundColor "Yellow" "  Since the Private DNS zones' subscription/resource group aren't known yet, this script cannot verify the required Private DNS zones now. Have that information ready before the actual NME POV installation - NME's installer/runbook needs to know which existing zones to link."
+                        $ConfigSummary["Private DNS zones plan"] = "Existing zones planned - subscription/resource group not yet known; NOT verified. Have this information ready before the actual NME POV installation."
                     }
                 }
             }
@@ -715,8 +724,9 @@ try {
                 # path; here the mode is already known to be Azure, so this always applies).
                 $dnsZonesChoice = Read-Choice -Prompt "  Will you use EXISTING Azure Private DNS zones, or have NME/this script create NEW ones?" -Options @(
                     "Use EXISTING Private DNS zones (you provide the subscription + resource group)",
-                    "Create NEW Private DNS zones (the installer/runbook creates them at deploy time)"
-                ) -Default 2 -Help "NME's private endpoints need these Azure Private DNS zones, linked to the VNet, to resolve to private IPs: privatelink.database.windows.net (SQL), privatelink.vaultcore.azure.net (Key Vault), privatelink.blob.core.windows.net (Storage), privatelink.azurewebsites.net (App Service), privatelink.azure-automation.net (Automation). `r`n`r`n`r`n`r`nEXISTING: your org already manages these zones centrally (common with hub/spoke + Azure Policy auto-registration) - provide the subscription and resource group that holds them, and this script reports which required zones are MISSING there. `r`n`r`n`r`n`r`nNEW: NME's deployment (or the Enable Private Endpoints runbook) creates and links the zones for you - this script only tests that the required zones CAN be created (in the throwaway test resource group) and does NOT link them to your VNet; the real installer/runbook creates and links them at deploy time. (Gov/China clouds use the equivalent .us/.cn zone names, derived automatically.)"
+                    "Create NEW Private DNS zones (the installer/runbook creates them at deploy time)",
+                    "I don't know yet - will use EXISTING zones but the subscription/resource group aren't known yet"
+                ) -Default 2 -Help "NME's private endpoints need these Azure Private DNS zones, linked to the VNet, to resolve to private IPs: privatelink.database.windows.net (SQL), privatelink.vaultcore.azure.net (Key Vault), privatelink.blob.core.windows.net (Storage), privatelink.azurewebsites.net (App Service), privatelink.azure-automation.net (Automation). `r`n`r`n`r`n`r`nEXISTING: your org already manages these zones centrally (common with hub/spoke + Azure Policy auto-registration) - provide the subscription and resource group that holds them, and this script reports which required zones are MISSING there. `r`n`r`n`r`n`r`nNEW: NME's deployment (or the Enable Private Endpoints runbook) creates and links the zones for you - this script only tests that the required zones CAN be created (in the throwaway test resource group) and does NOT link them to your VNet; the real installer/runbook creates and links them at deploy time. (Gov/China clouds use the equivalent .us/.cn zone names, derived automatically.) `r`n`r`n`r`n`r`nIf you'll use EXISTING zones but don't yet know their subscription/resource group, choose the third option - this script will skip the zone verification this run, but you must have that information ready before the actual NME POV installation."
                 if ($dnsZonesChoice -eq 1) {
                     $PrivateDnsZonesMode = "Existing"
                     do { $PrivateDnsZoneSubId = Read-Host -Prompt "    Subscription ID where the Azure Private DNS zones live" } while ([string]::IsNullOrWhiteSpace($PrivateDnsZoneSubId))
@@ -724,10 +734,19 @@ try {
                     $ConfigSummary["Private DNS zones plan"] = "Existing (subscription '$PrivateDnsZoneSubId', resource group '$PrivateDnsZoneRg')"
                     $ConfigSummary["Private DNS resolution (new VNet)"] = "Azure Private DNS Zones - subscription '$PrivateDnsZoneSubId', resource group '$PrivateDnsZoneRg' (recorded only; not verified or modified by this script)"
                 }
-                else {
+                elseif ($dnsZonesChoice -eq 2) {
                     $PrivateDnsZonesMode = "New"
                     $ConfigSummary["Private DNS zones plan"] = "New (created at install)"
                     $ConfigSummary["Private DNS resolution (new VNet)"] = "Azure Private DNS Zones - created at install (this script test-creates the required zones in the throwaway test resource group)"
+                }
+                else {
+                    # Subscription/RG for the existing zones aren't known yet - nothing to prompt for
+                    # and nothing this script can verify against. Note it clearly so it doesn't get
+                    # missed before the actual NME POV installation, which needs this to link the zones.
+                    $PrivateDnsZonesMode = "Unknown"
+                    Write-Host -ForegroundColor "Yellow" "  Since the Private DNS zones' subscription/resource group aren't known yet, this script cannot verify the required Private DNS zones now. Have that information ready before the actual NME POV installation - NME's installer/runbook needs to know which existing zones to link."
+                    $ConfigSummary["Private DNS zones plan"] = "Existing zones planned - subscription/resource group not yet known; NOT verified. Have this information ready before the actual NME POV installation."
+                    $ConfigSummary["Private DNS resolution (new VNet)"] = "Azure Private DNS Zones - existing zones planned, subscription/resource group not yet known (not verified by this script)"
                 }
             }
             else {
@@ -1304,7 +1323,7 @@ try {
                 # linked to any pre-existing private DNS zone - use the DNS mode captured at intake
                 # instead of inferring it, and only record/report, per that intake choice.
                 $usesCustomDns = ($NewVnetDnsMode -eq "Custom")
-                $dnsServers = if ($usesCustomDns) { "Custom/on-prem DNS (per intake answer)" } elseif ($PrivateDnsZonesMode -eq "Existing") { "Azure Private DNS Zones - subscription '$PrivateDnsZoneSubId', RG '$PrivateDnsZoneRg' (per intake answer)" } else { "Azure Private DNS Zones - created at install (per intake answer)" }
+                $dnsServers = if ($usesCustomDns) { "Custom/on-prem DNS (per intake answer)" } elseif ($PrivateDnsZonesMode -eq "Existing") { "Azure Private DNS Zones - subscription '$PrivateDnsZoneSubId', RG '$PrivateDnsZoneRg' (per intake answer)" } elseif ($PrivateDnsZonesMode -eq "Unknown") { "Azure Private DNS Zones - existing zones planned, subscription/RG not yet known (per intake answer)" } else { "Azure Private DNS Zones - created at install (per intake answer)" }
             }
             else {
                 $usesCustomDns = $vnet.DhcpOptions.DnsServers -and $vnet.DhcpOptions.DnsServers.Count -gt 0
@@ -1400,6 +1419,13 @@ try {
                 finally {
                     if ($dnsZoneCtxSwitched) { try { Set-AzContext -Subscription $SubscriptionId -ErrorAction Stop | Out-Null } catch {} }
                 }
+            }
+            elseif ($PrivateDnsZonesMode -eq "Unknown") {
+                # The subscription/RG holding the existing zones weren't known at intake time, so there's
+                # nothing to look up against - skip straight past the Get-AzPrivateDnsZone calls (which
+                # would otherwise be called with a null resource group) rather than crashing or silently
+                # reporting nothing.
+                Add-Result -Category "PrivateDns" -Check "Private DNS zones" -Result "Info" -Detail "Not verified - the existing Private DNS zones' subscription/resource group weren't known at test time. Confirm the required zones exist and are linked before the actual NME POV installation."
             }
             else {
                 # New zones (either VNet path): the installer/runbook is expected to create and link the
