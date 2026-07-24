@@ -392,8 +392,10 @@ function Read-Choice {
     while ($true) {
         Write-Host ""
         Write-Host $Prompt
+        Write-Host ""
         for ($i = 0; $i -lt $Options.Count; $i++) { Write-Host ("  {0}) {1}" -f ($i + 1), $Options[$i]) }
         if ($hasHelp) { Write-Host "  ?) More information" }
+        Write-Host ""
         $r = Read-Host -Prompt "Choose [$choiceStr] (default $Default)"
         if ([string]::IsNullOrWhiteSpace($r)) { Write-Host ""; return $Default }
         if ($hasHelp -and $r -eq "?") { Write-HelpText -Text $Help; continue }
