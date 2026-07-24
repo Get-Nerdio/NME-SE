@@ -1818,10 +1818,16 @@ finally {
     Write-Host "Check results"
     Write-Host ("-" * 60)
     $resultTokens = @{ Pass = "[PASS]"; Fail = "[FAIL]"; Warn = "[WARN]"; Info = "[INFO]" }
+    $resultColors = @{ Pass = "Green"; Fail = "Red"; Warn = "Yellow"; Info = "Cyan" }
     $catCap = 16
     $catWidth = [Math]::Min($catCap, (($Results | ForEach-Object { $_.Category.Length } | Measure-Object -Maximum).Maximum))
     $detailIndent = " " * 8
     $wrapWidth = 130
+    function Write-TokenLine {
+        param($Token, $Color, $Rest)
+        Write-Host -NoNewline -ForegroundColor $Color $Token
+        Write-Host $Rest
+    }
     foreach ($r in $Results) {
         # Only genuine "missing required zone" rows (Detail starts "MISSING from ...") get the terse
         # [MISSING] treatment - NOT the new-zone test-CREATION failure rows, which share the same
@@ -1831,30 +1837,31 @@ finally {
             $token = "[MISSING]"
             $catPadded = $r.Category.PadRight($catWidth)
             $check = $r.Check -replace "^Private DNS zone: ", ""
-            Write-Host ("{0}  {1}  {2}" -f $token, $catPadded, $check)
+            Write-TokenLine -Token $token -Color $resultColors["Fail"] -Rest ("  {0}  {1}" -f $catPadded, $check)
             continue
         }
         $token = if ($resultTokens.ContainsKey($r.Result)) { $resultTokens[$r.Result] } else { "[{0}]" -f $r.Result.ToUpper().Substring(0, [Math]::Min(4, $r.Result.Length)) }
+        $color = if ($resultColors.ContainsKey($r.Result)) { $resultColors[$r.Result] } else { "White" }
         $catPadded = $r.Category.PadRight($catWidth)
-        $prefix = "{0}  {1}  {2}" -f $token, $catPadded, $r.Check
+        $restHead = "  {0}  {1}" -f $catPadded, $r.Check
         $d = ($r.Detail -replace "[`r`n]+", " ").Trim()
         if (-not $d) {
-            Write-Host $prefix
+            Write-TokenLine -Token $token -Color $color -Rest $restHead
             continue
         }
         $isZoneCreated = $r.Category -eq "PrivateDns" -and $r.Result -eq "Pass" -and $r.Check -like "Private DNS zone: *"
         if ($isZoneCreated) {
-            Write-Host "$prefix $d"
+            Write-TokenLine -Token $token -Color $color -Rest "$restHead $d"
             continue
         }
         # Prefer a single combined line; only fall back to wrapped, indented continuation
         # lines when the check + detail genuinely don't fit on one line.
-        $oneLine = "$prefix > $d"
-        if ($oneLine.Length -le $wrapWidth) {
-            Write-Host $oneLine
+        $oneLine = "$restHead > $d"
+        if (($token.Length + $oneLine.Length) -le $wrapWidth) {
+            Write-TokenLine -Token $token -Color $color -Rest $oneLine
             continue
         }
-        Write-Host $prefix
+        Write-TokenLine -Token $token -Color $color -Rest $restHead
         $words = $d -split "\s+"
         $line = ""
         $first = $true
