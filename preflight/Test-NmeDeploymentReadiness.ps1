@@ -690,7 +690,7 @@ try {
                         # missed before the actual NME POV installation, which needs this to link the zones.
                         $PrivateDnsZonesMode = "Unknown"
                         Write-Host -ForegroundColor "Yellow" "  Since the Private DNS zones' subscription/resource group aren't known yet, this script cannot verify the required Private DNS zones now. Have that information ready before the actual NME POV installation - NME's installer/runbook needs to know which existing zones to link."
-                        $ConfigSummary["Private DNS zones plan"] = "Existing zones planned - subscription/resource group not yet known; NOT verified. Have this information ready before the actual NME POV installation."
+                        $ConfigSummary["Private DNS zones plan"] = "Existing zones planned - subscription/resource group not yet known; NOT verified."
                     }
                 }
             }
@@ -745,7 +745,7 @@ try {
                     # missed before the actual NME POV installation, which needs this to link the zones.
                     $PrivateDnsZonesMode = "Unknown"
                     Write-Host -ForegroundColor "Yellow" "  Since the Private DNS zones' subscription/resource group aren't known yet, this script cannot verify the required Private DNS zones now. Have that information ready before the actual NME POV installation - NME's installer/runbook needs to know which existing zones to link."
-                    $ConfigSummary["Private DNS zones plan"] = "Existing zones planned - subscription/resource group not yet known; NOT verified. Have this information ready before the actual NME POV installation."
+                    $ConfigSummary["Private DNS zones plan"] = "Existing zones planned - subscription/resource group not yet known; NOT verified."
                     $ConfigSummary["Private DNS resolution (new VNet)"] = "Azure Private DNS Zones - existing zones planned, subscription/resource group not yet known (not verified by this script)"
                 }
             }
