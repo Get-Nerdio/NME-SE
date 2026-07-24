@@ -1671,7 +1671,7 @@ try {
                                 $line = $outLines | Where-Object { ($_ -split "\|")[0] -eq $t.Key } | Select-Object -First 1
                                 if ($t.IsPe) {
                                     if ($line -and $line -match "\|OK\|") {
-                                        Add-Result -Category "Connectivity" -Check $t.Label -Result "Pass" -Detail "Reachable at $($t.Key):$($t.Port) from the VNet-integrated worker (app subnet -> PE subnet path OK)."
+                                        Add-Result -Category "Connectivity" -Check $t.Label -Result "Pass" -Detail "$($t.Key):$($t.Port) reachable."
                                     }
                                     elseif ($line -and $line -match "\|BLOCKED\|") {
                                         Add-Result -Category "Connectivity" -Check $t.Label -Result "Warn" -Detail "NOT reachable at $($t.Key):$($t.Port) from the VNet-integrated worker - check NSG / UDR / routing between subnet '$AppSubnetName' and subnet '$PeSubnetName'."
@@ -1690,21 +1690,18 @@ try {
                                     if ($line) { $resolvedIp = ($line -split "\|")[2] }
                                     if ($resolvedIp -and $resolvedIp -eq $t.ExpectedIp) {
                                         $dnsConfirmedCount++
-                                        Add-Result -Category "Connectivity" -Check $t.Label -Result "Pass" -Detail "$($t.Key) resolves to the private endpoint IP $resolvedIp from the VNet - private DNS is auto-registering (e.g. Azure Policy DINE or a linked private DNS zone)."
+                                        Add-Result -Category "Connectivity" -Check $t.Label -Result "Pass" -Detail "Resolves to private IP (auto-registered)."
                                     }
                                     elseif ($resolvedIp) {
-                                        Add-Result -Category "Connectivity" -Check $t.Label -Result "Info" -Detail "$($t.Key) resolves to $resolvedIp (not the private endpoint) from the VNet - private DNS is NOT auto-registering these endpoints; the privatelink zone must be created and linked at install. This is expected and not a failure of this test."
+                                        Add-Result -Category "Connectivity" -Check $t.Label -Result "Info" -Detail "Resolves to public IP - private DNS zone required at install."
                                     }
                                     else {
-                                        Add-Result -Category "Connectivity" -Check $t.Label -Result "Info" -Detail "$($t.Key) did not resolve from the VNet - private DNS zone config will be required at install. Not a failure of this test."
+                                        Add-Result -Category "Connectivity" -Check $t.Label -Result "Info" -Detail "Did not resolve - private DNS zone required at install."
                                     }
                                 }
                                 else {
                                     if ($line -and $line -match "\|OK\|") {
-                                        $parts = $line -split "\|"
-                                        $ip = $parts[2]
-                                        $cert = if ($parts.Count -gt 3) { $parts[3] } else { "" }
-                                        Add-Result -Category "Connectivity" -Check $t.Label -Result "Pass" -Detail "$($t.Purpose) - reachable from the VNet-integrated worker (resolved $ip)$(if ($cert) { "; TLS cert: $cert" })."
+                                        Add-Result -Category "Connectivity" -Check $t.Label -Result "Pass" -Detail "$($t.Purpose)."
                                     }
                                     elseif ($line -and $line -match "\|BLOCKED\|") {
                                         $parts = $line -split "\|"
@@ -1726,13 +1723,13 @@ try {
                         # the privatelink FQDNs is proven when it isn't - reachability above is proven by
                         # private IP only unless private DNS auto-registration was just confirmed.
                         if ($usesCustomDns) {
-                            Add-Result -Category "Connectivity" -Check "Private endpoint DNS resolution (overall)" -Result "Info" -Detail "VNet uses custom DNS servers - private endpoint name resolution depends on your DNS servers/forwarders and was NOT tested here. Reachability above was tested by private IP only."
+                            Add-Result -Category "Connectivity" -Check "Private endpoint DNS resolution (overall)" -Result "Info" -Detail "Custom DNS - not tested; reachability confirmed by private IP only."
                         }
                         elseif ($dnsConfirmedCount -eq 0) {
-                            Add-Result -Category "Connectivity" -Check "Private endpoint DNS resolution (overall)" -Result "Info" -Detail "Reachability above was tested by private IP. Production DNS resolution of the privatelink FQDNs is NOT yet confirmed - it requires the private DNS zones to be created and linked at install (unless Azure Policy auto-registers them)."
+                            Add-Result -Category "Connectivity" -Check "Private endpoint DNS resolution (overall)" -Result "Info" -Detail "All public - private DNS zones required at install."
                         }
                         else {
-                            Add-Result -Category "Connectivity" -Check "Private endpoint DNS resolution (overall)" -Result "Info" -Detail "$dnsConfirmedCount of $dnsProbeCount private endpoint FQDNs already resolve to their private IPs from the VNet (auto-registration is active); the rest require private DNS zone config at install."
+                            Add-Result -Category "Connectivity" -Check "Private endpoint DNS resolution (overall)" -Result "Info" -Detail "$dnsConfirmedCount of $dnsProbeCount resolve privately; rest require private DNS zone config at install."
                         }
                     }
                     }
@@ -1814,7 +1811,7 @@ finally {
     $catCap = 16
     $catWidth = [Math]::Min($catCap, (($Results | ForEach-Object { $_.Category.Length } | Measure-Object -Maximum).Maximum))
     $detailIndent = " " * 8
-    $wrapWidth = 92
+    $wrapWidth = 130
     foreach ($r in $Results) {
         # Only genuine "missing required zone" rows (Detail starts "MISSING from ...") get the terse
         # [MISSING] treatment - NOT the new-zone test-CREATION failure rows, which share the same
@@ -1829,23 +1826,33 @@ finally {
         }
         $token = if ($resultTokens.ContainsKey($r.Result)) { $resultTokens[$r.Result] } else { "[{0}]" -f $r.Result.ToUpper().Substring(0, [Math]::Min(4, $r.Result.Length)) }
         $catPadded = $r.Category.PadRight($catWidth)
-        Write-Host ("{0}  {1}  {2}" -f $token, $catPadded, $r.Check)
+        $prefix = "{0}  {1}  {2}" -f $token, $catPadded, $r.Check
         $d = ($r.Detail -replace "[`r`n]+", " ").Trim()
-        if ($d) {
-            $words = $d -split "\s+"
-            $line = ""
-            $first = $true
-            foreach ($word in $words) {
-                if ($line.Length -eq 0) { $line = $word }
-                elseif (($line.Length + 1 + $word.Length) -le $wrapWidth) { $line = "$line $word" }
-                else {
-                    Write-Host ("{0}{1} {2}" -f $detailIndent, "$(if ($first) { '>' } else { ' ' })", $line)
-                    $first = $false
-                    $line = $word
-                }
-            }
-            if ($line.Length -gt 0) { Write-Host ("{0}{1} {2}" -f $detailIndent, "$(if ($first) { '>' } else { ' ' })", $line) }
+        if (-not $d) {
+            Write-Host $prefix
+            continue
         }
+        # Prefer a single combined line; only fall back to wrapped, indented continuation
+        # lines when the check + detail genuinely don't fit on one line.
+        $oneLine = "$prefix > $d"
+        if ($oneLine.Length -le $wrapWidth) {
+            Write-Host $oneLine
+            continue
+        }
+        Write-Host $prefix
+        $words = $d -split "\s+"
+        $line = ""
+        $first = $true
+        foreach ($word in $words) {
+            if ($line.Length -eq 0) { $line = $word }
+            elseif (($line.Length + 1 + $word.Length) -le $wrapWidth) { $line = "$line $word" }
+            else {
+                Write-Host ("{0}{1} {2}" -f $detailIndent, "$(if ($first) { '>' } else { ' ' })", $line)
+                $first = $false
+                $line = $word
+            }
+        }
+        if ($line.Length -gt 0) { Write-Host ("{0}{1} {2}" -f $detailIndent, "$(if ($first) { '>' } else { ' ' })", $line) }
     }
     Write-Host ""
     Write-Host -ForegroundColor "Green" "====== END - COPY EVERYTHING ABOVE ======"
