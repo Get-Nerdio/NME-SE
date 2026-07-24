@@ -350,14 +350,18 @@ function Write-HelpText {
     # re-prompt below.
     Write-Host ""
     $width = 90
-    $words = $Text -split "\s+"
-    $line = ""
-    foreach ($word in $words) {
-        if ($line.Length -eq 0) { $line = $word }
-        elseif (($line.Length + 1 + $word.Length) -le $width) { $line = "$line $word" }
-        else { Write-Host -ForegroundColor "Cyan" "    $line"; $line = $word }
+    $paragraphs = $Text -split "`r`n|\n|\r"
+    foreach ($paragraph in $paragraphs) {
+        if ([string]::IsNullOrWhiteSpace($paragraph)) { Write-Host ""; continue }
+        $words = $paragraph -split "\s+"
+        $line = ""
+        foreach ($word in $words) {
+            if ($line.Length -eq 0) { $line = $word }
+            elseif (($line.Length + 1 + $word.Length) -le $width) { $line = "$line $word" }
+            else { Write-Host -ForegroundColor "Cyan" "    $line"; $line = $word }
+        }
+        if ($line.Length -gt 0) { Write-Host -ForegroundColor "Cyan" "    $line" }
     }
-    if ($line.Length -gt 0) { Write-Host -ForegroundColor "Cyan" "    $line" }
     Write-Host ""
 }
 
@@ -597,7 +601,7 @@ try {
     $privateChoice = Read-Choice -Prompt "Do you want to deploy Nerdio Manager with PRIVATE ENDPOINTS?" -Options @(
         "Yes - deploy with private endpoints (no public internet exposure)",
         "No - use public endpoints (default)"
-    ) -Default 2 -Help "Private endpoints give NME's PaaS dependencies (SQL Database, Key Vault, Storage, and the App Service) private IPs on your VNet instead of public endpoints. Pros: no public exposure of the NME data plane; meets network-isolation requirements. Cons: increases complexity and can extend the Nerdio Proof of Value timeline. \r\n\r\nNOTE: Private endpoints can be enabled after proving value and before going to production."
+    ) -Default 2 -Help "Private endpoints give NME's PaaS dependencies (SQL Database, Key Vault, Storage, and the App Service) private IPs on your VNet instead of public endpoints. Pros: no public exposure of the NME data plane; meets network-isolation requirements. Cons: increases complexity and can extend the Nerdio Proof of Value timeline. `r`n`r`nNOTE: Private endpoints can be enabled after proving value and before going to production."
     if ($privateChoice -eq 1) {
         $TestPrivate = $true
         $TestVnetIntegration = $true
@@ -605,7 +609,7 @@ try {
         $vnetChoice = Read-Choice -Prompt "Will you deploy to an EXISTING VNet?" -Options @(
             "Use an EXISTING VNet (you provide RG, VNet, and both subnet names)",
             "Create a NEW VNet for Nerdio Manager (this script creates and later deletes a vnet. The NME )"
-        ) -Default 2 -Help "NME can be deployed to a new VNet created during deployment, which simplifies DNS and networking - this is the preferred/default deployment. Deploying into an EXISTING VNet is recommended when your organization requires routing all traffic through centralized firewalls. \r\n\r\nSelecting an EXISTING VNet tests against the real network NME will use - its subnets, DNS settings, and any private DNS zone links - so the result of this test reflects your production topology. You must provide the VNet's resource group, its name, a subnet for private endpoints, and a separate subnet delegated to Microsoft.Web/serverFarms for App Service integration. \r\n\r\nA NEW VNet lets the script prove the resources CAN be created (VNet, subnets, delegation, private endpoint) in a clean 10.60.0.0/16 space it creates and then deletes."
+        ) -Default 2 -Help "NME can be deployed to a new VNet created during deployment, which simplifies DNS and networking - this is the preferred/default deployment. Deploying into an EXISTING VNet is recommended when your organization requires routing all traffic through centralized firewalls. `r`n`r`nSelecting an EXISTING VNet tests against the real network NME will use - its subnets, DNS settings, and any private DNS zone links - so the result of this test reflects your production topology. You must provide the VNet's resource group, its name, a subnet for private endpoints, and a separate subnet delegated to Microsoft.Web/serverFarms for App Service integration. `r`n`r`nA NEW VNet lets the script prove the resources CAN be created (VNet, subnets, delegation, private endpoint) in a clean 10.60.0.0/16 space it creates and then deletes."
         if ($vnetChoice -eq 1) {
             # Validate the VNet exists up front and re-prompt on a bad value, so the user isn't told the
             # name was wrong only after the deployability phase has already created resources.
@@ -665,7 +669,7 @@ try {
                     $dnsZonesChoice = Read-Choice -Prompt "  Will you use EXISTING Azure Private DNS zones, or have NME/this script create NEW ones?" -Options @(
                         "Use EXISTING Private DNS zones (you will be asked to provide the subscription + resource group of the existing zones)",
                         "Create NEW Private DNS zones (the installer/runbook creates them at deploy time)"
-                    ) -Default 2 -Help "NME's private endpoints need these Azure Private DNS zones, linked to the VNet, to resolve to private IPs: \r\n\r\nprivatelink.database.windows.net (SQL), \r\n\r\nprivatelink.vaultcore.azure.net (Key Vault), \r\n\r\nprivatelink.blob.* and privatelink.file.* (Storage), \r\n\r\nprivatelink.azurewebsites.net (App Service), \r\n\r\nprivatelink.azure-automation.net (Automation). \r\n\r\n\r\n\r\nEXISTING: your org already manages these zones centrally (common with hub/spoke + Azure Policy auto-registration) - provide the subscription and resource group that holds them, and this script reports which required zones are MISSING there. \r\n\r\n\r\n\r\nNEW: NME's deployment (or the Enable Private Endpoints runbook) creates and links the zones for you - this script only tests that the required zones CAN be created (in the throwaway test resource group) and does NOT link them to your VNet; the real installer/runbook creates and links them at deploy time. (Gov/China clouds use the equivalent .us/.cn zone names, derived automatically.)"
+                    ) -Default 2 -Help "NME's private endpoints need these Azure Private DNS zones, linked to the VNet, to resolve to private IPs: `r`n`r`nprivatelink.database.windows.net (SQL), `r`n`r`nprivatelink.vaultcore.azure.net (Key Vault), `r`n`r`nprivatelink.blob.* and privatelink.file.* (Storage), `r`n`r`nprivatelink.azurewebsites.net (App Service), `r`n`r`nprivatelink.azure-automation.net (Automation). `r`n`r`n`r`n`r`nEXISTING: your org already manages these zones centrally (common with hub/spoke + Azure Policy auto-registration) - provide the subscription and resource group that holds them, and this script reports which required zones are MISSING there. `r`n`r`n`r`n`r`nNEW: NME's deployment (or the Enable Private Endpoints runbook) creates and links the zones for you - this script only tests that the required zones CAN be created (in the throwaway test resource group) and does NOT link them to your VNet; the real installer/runbook creates and links them at deploy time. (Gov/China clouds use the equivalent .us/.cn zone names, derived automatically.)"
                     if ($dnsZonesChoice -eq 1) {
                         $PrivateDnsZonesMode = "Existing"
                         do { $PrivateDnsZoneSubId = Read-Host -Prompt "    Subscription ID where the Azure Private DNS zones live" } while ([string]::IsNullOrWhiteSpace($PrivateDnsZoneSubId))
@@ -691,7 +695,7 @@ try {
             $dnsModeChoice = Read-Choice -Prompt "  Will this VNet use Azure Private DNS Zones to resolve the private endpoints?" -Options @(
                 "Azure Private DNS Zones (Azure resolves the privatelink zones)",
                 "Custom / on-prem DNS servers (your DNS resolves the privatelink names)"
-            ) -Default 1 -Help "NME's private endpoints only work if the privatelink DNS names (e.g. privatelink.database.windows.net) resolve to the private IPs. \r\n\r\n\r\n\r\nAzure Private DNS Zones: Azure hosts those zones and, when linked to the VNet, resolves them automatically - simplest option. \r\n\r\n\r\n\r\nCustom / on-prem DNS: your own DNS servers (set on the VNet) must host or conditionally forward every required privatelink zone; the script will list the exact zones your DNS must resolve. Choose Azure Private DNS Zones unless your organization mandates centralized custom DNS."
+            ) -Default 1 -Help "NME's private endpoints only work if the privatelink DNS names (e.g. privatelink.database.windows.net) resolve to the private IPs. `r`n`r`n`r`n`r`nAzure Private DNS Zones: Azure hosts those zones and, when linked to the VNet, resolves them automatically - simplest option. `r`n`r`n`r`n`r`nCustom / on-prem DNS: your own DNS servers (set on the VNet) must host or conditionally forward every required privatelink zone; the script will list the exact zones your DNS must resolve. Choose Azure Private DNS Zones unless your organization mandates centralized custom DNS."
             if ($dnsModeChoice -eq 1) {
                 $NewVnetDnsMode = "Azure"
 
@@ -700,7 +704,7 @@ try {
                 $dnsZonesChoice = Read-Choice -Prompt "  Will you use EXISTING Azure Private DNS zones, or have NME/this script create NEW ones?" -Options @(
                     "Use EXISTING Private DNS zones (you provide the subscription + resource group)",
                     "Create NEW Private DNS zones (the installer/runbook creates them at deploy time)"
-                ) -Default 2 -Help "NME's private endpoints need these Azure Private DNS zones, linked to the VNet, to resolve to private IPs: privatelink.database.windows.net (SQL), privatelink.vaultcore.azure.net (Key Vault), privatelink.blob.* and privatelink.file.* (Storage), privatelink.azurewebsites.net (App Service), privatelink.azure-automation.net (Automation). \r\n\r\n\r\n\r\nEXISTING: your org already manages these zones centrally (common with hub/spoke + Azure Policy auto-registration) - provide the subscription and resource group that holds them, and this script reports which required zones are MISSING there. \r\n\r\n\r\n\r\nNEW: NME's deployment (or the Enable Private Endpoints runbook) creates and links the zones for you - this script only tests that the required zones CAN be created (in the throwaway test resource group) and does NOT link them to your VNet; the real installer/runbook creates and links them at deploy time. (Gov/China clouds use the equivalent .us/.cn zone names, derived automatically.)"
+                ) -Default 2 -Help "NME's private endpoints need these Azure Private DNS zones, linked to the VNet, to resolve to private IPs: privatelink.database.windows.net (SQL), privatelink.vaultcore.azure.net (Key Vault), privatelink.blob.* and privatelink.file.* (Storage), privatelink.azurewebsites.net (App Service), privatelink.azure-automation.net (Automation). `r`n`r`n`r`n`r`nEXISTING: your org already manages these zones centrally (common with hub/spoke + Azure Policy auto-registration) - provide the subscription and resource group that holds them, and this script reports which required zones are MISSING there. `r`n`r`n`r`n`r`nNEW: NME's deployment (or the Enable Private Endpoints runbook) creates and links the zones for you - this script only tests that the required zones CAN be created (in the throwaway test resource group) and does NOT link them to your VNet; the real installer/runbook creates and links them at deploy time. (Gov/China clouds use the equivalent .us/.cn zone names, derived automatically.)"
                 if ($dnsZonesChoice -eq 1) {
                     $PrivateDnsZonesMode = "Existing"
                     do { $PrivateDnsZoneSubId = Read-Host -Prompt "    Subscription ID where the Azure Private DNS zones live" } while ([string]::IsNullOrWhiteSpace($PrivateDnsZoneSubId))
@@ -1775,7 +1779,7 @@ finally {
     $cfgKeyCap = 34
     $cfgKeyWidth = [Math]::Min($cfgKeyCap, (($ConfigSummary.Keys | ForEach-Object { $_.Length } | Measure-Object -Maximum).Maximum))
     foreach ($ck in $ConfigSummary.Keys) {
-        $cv = ($ConfigSummary[$ck] -replace "[\r\n]+", " ")
+        $cv = ($ConfigSummary[$ck] -replace "[`r`n]+", " ")
         if ($ck.Length -gt $cfgKeyCap) {
             Write-Host $ck
             Write-Host ("   {0}" -f $cv)
@@ -1824,7 +1828,7 @@ finally {
         $token = if ($resultTokens.ContainsKey($r.Result)) { $resultTokens[$r.Result] } else { "[{0}]" -f $r.Result.ToUpper().Substring(0, [Math]::Min(4, $r.Result.Length)) }
         $catPadded = $r.Category.PadRight($catWidth)
         Write-Host ("{0}  {1}  {2}" -f $token, $catPadded, $r.Check)
-        $d = ($r.Detail -replace "[\r\n]+", " ").Trim()
+        $d = ($r.Detail -replace "[`r`n]+", " ").Trim()
         if ($d) {
             $words = $d -split "\s+"
             $line = ""
