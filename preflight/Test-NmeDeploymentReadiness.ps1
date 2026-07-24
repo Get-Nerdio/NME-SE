@@ -597,6 +597,7 @@ try {
     $TestPrivate = $false
     $TestVnetIntegration = $false
     $CreateNewVnet = $false
+    $VnetInfoUnknown = $false
     $ExistingVnetRg = $null; $ExistingVnetName = $null; $PeSubnetName = $null; $AppSubnetName = $null
     $PrivateDnsZonesMode = $null; $PrivateDnsZoneSubId = $null; $PrivateDnsZoneRg = $null
     $privateChoice = Read-Choice -Prompt "Do you want to deploy Nerdio Manager with PRIVATE ENDPOINTS?" -Options @(
@@ -609,8 +610,9 @@ try {
 
         $vnetChoice = Read-Choice -Prompt "Will you deploy to an EXISTING VNet?" -Options @(
             "Use an EXISTING VNet (you provide RG, VNet, and both subnet names)",
-            "Create a NEW VNet for Nerdio Manager (this script creates and later deletes a vnet. The NME deployment process will create a new VNet during installation as well. You will be able to specify the address space for the actual deployment.)"
-        ) -Default 2 -Help "NME can be deployed to a new VNet created during deployment, which simplifies DNS and networking - this is the preferred/default deployment. Deploying into an EXISTING VNet is recommended when your organization requires routing all traffic through centralized firewalls. `r`n`r`nSelecting an EXISTING VNet tests against the real network NME will use - its subnets, DNS settings, and any private DNS zone links - so the result of this test reflects your production topology. You must provide the VNet's resource group, its name, a subnet for private endpoints, and a separate subnet delegated to Microsoft.Web/serverFarms for App Service integration. `r`n`r`nA NEW VNet lets the script prove the resources CAN be created (VNet, subnets, delegation, private endpoint) in a clean 10.60.0.0/16 space it creates and then deletes."
+            "Create a NEW VNet for Nerdio Manager (this script creates and later deletes a vnet. The NME deployment process will create a new VNet during installation as well. You will be able to specify the address space for the actual deployment.)",
+            "I don't know yet - the VNet hasn't been created yet"
+        ) -Default 2 -Help "NME can be deployed to a new VNet created during deployment, which simplifies DNS and networking - this is the preferred/default deployment. Deploying into an EXISTING VNet is recommended when your organization requires routing all traffic through centralized firewalls. `r`n`r`nSelecting an EXISTING VNet tests against the real network NME will use - its subnets, DNS settings, and any private DNS zone links - so the result of this test reflects your production topology. You must provide the VNet's resource group, its name, a subnet for private endpoints, and a separate subnet delegated to Microsoft.Web/serverFarms for App Service integration. `r`n`r`nA NEW VNet lets the script prove the resources CAN be created (VNet, subnets, delegation, private endpoint) in a clean 10.60.0.0/16 space it creates and then deletes. `r`n`r`nIf you plan to use your own existing VNet but haven't created it yet, choose the third option - the script will skip private endpoint / VNet integration testing this run and note that it still needs to be validated later."
         if ($vnetChoice -eq 1) {
             # Validate the VNet exists up front and re-prompt on a bad value, so the user isn't told the
             # name was wrong only after the deployability phase has already created resources.
@@ -683,6 +685,15 @@ try {
                     }
                 }
             }
+        }
+        elseif ($vnetChoice -eq 3) {
+            # User intends to use their own existing VNet, but hasn't created it yet - nothing to
+            # validate against, so skip straight past the RG/VNet/subnet prompts and the
+            # Get-AzVirtualNetwork lookup entirely rather than stalling the whole script on it.
+            $TestPrivate = $false
+            $TestVnetIntegration = $false
+            $VnetInfoUnknown = $true
+            Write-Host -ForegroundColor "Yellow" "  Since the VNet's details aren't known yet, private endpoint / VNet integration connectivity cannot be tested now. This will be noted in the report - re-run this script once you have the VNet's resource group, name, and subnet names to validate connectivity before deploying."
         }
         else {
             # New VNet, created by this script alongside the other test resources below. Its name and
@@ -919,7 +930,10 @@ try {
     $ConfigSummary["Region"] = $Location
     $ConfigSummary["Resource group"] = "$ResourceGroupName $(if ($PendingRgCreate) { '(created by this script)' } else { '(existing, user-supplied)' })"
     if ($Tags.Count -gt 0) { $ConfigSummary["Tags applied"] = (($Tags.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join "; ") } else { $ConfigSummary["Tags applied"] = "(none specified)" }
-    if ($TestPrivate) {
+    if ($VnetInfoUnknown) {
+        $ConfigSummary["Private endpoint scenario"] = "Planned - existing VNet, details not yet known; NOT tested. Re-run this script once the VNet's resource group, name, and subnet names are known to validate private endpoint connectivity before deploying."
+    }
+    elseif ($TestPrivate) {
         $ConfigSummary["Private endpoint scenario"] = "Yes - $(if ($CreateNewVnet) { 'new' } else { 'existing' }) VNet, 4 test private endpoints (SQL, Key Vault, Storage, Automation)"
         $ConfigSummary["$(if ($CreateNewVnet) { 'New' } else { 'Existing' }) VNet"] = "'$ExistingVnetName'"
         $ConfigSummary["VNet RG"] = "'$ExistingVnetRg'"
@@ -928,7 +942,7 @@ try {
     else {
         $ConfigSummary["Private endpoint scenario"] = "Not tested"
     }
-    $ConfigSummary["App Service VNet integration"] = if ($TestVnetIntegration) { "Yes" } else { "Not tested" }
+    $ConfigSummary["App Service VNet integration"] = if ($VnetInfoUnknown) { "Planned - existing VNet, details not yet known; NOT tested." } elseif ($TestVnetIntegration) { "Yes" } else { "Not tested" }
     if ($TestVnetIntegration) {
         $ConfigSummary["Web app subnet"] = "'$AppSubnetName'"
     }
