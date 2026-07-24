@@ -346,6 +346,9 @@ function New-RandomString {
 function Write-HelpText {
     param([string] $Text)
     if ([string]::IsNullOrWhiteSpace($Text)) { return }
+    # Bracket the help block with blank lines so it stands apart from the prompt above and the
+    # re-prompt below.
+    Write-Host ""
     $width = 90
     $words = $Text -split "\s+"
     $line = ""
@@ -355,6 +358,7 @@ function Write-HelpText {
         else { Write-Host -ForegroundColor "Cyan" "    $line"; $line = $word }
     }
     if ($line.Length -gt 0) { Write-Host -ForegroundColor "Cyan" "    $line" }
+    Write-Host ""
 }
 
 function Read-YesNo {
@@ -366,6 +370,7 @@ function Read-YesNo {
         if ([string]::IsNullOrWhiteSpace($r)) { $r = $Default }
         if ($Help -and $r -eq "?") { Write-HelpText -Text $Help; continue }
     } while ($r -notmatch "^[YyNn]$")
+    Write-Host ""
     return ($r -match "^[Yy]$")
 }
 
@@ -386,9 +391,9 @@ function Read-Choice {
         for ($i = 0; $i -lt $Options.Count; $i++) { Write-Host ("  {0}) {1}" -f ($i + 1), $Options[$i]) }
         if ($hasHelp) { Write-Host "  ?) More information" }
         $r = Read-Host -Prompt "Choose [$choiceStr] (default $Default)"
-        if ([string]::IsNullOrWhiteSpace($r)) { return $Default }
+        if ([string]::IsNullOrWhiteSpace($r)) { Write-Host ""; return $Default }
         if ($hasHelp -and $r -eq "?") { Write-HelpText -Text $Help; continue }
-        if ($r -match "^\d+$" -and [int]$r -ge 1 -and [int]$r -le $Options.Count) { return [int]$r }
+        if ($r -match "^\d+$" -and [int]$r -ge 1 -and [int]$r -le $Options.Count) { Write-Host ""; return [int]$r }
         Write-Host -ForegroundColor "Yellow" "  Invalid choice. Try again."
     }
 }
@@ -523,7 +528,7 @@ try {
         # Supplied via -ResourceGroupName; validated (and re-prompted if bad) in the loop below.
         $useExisting = $true
     }
-    elseif (Read-YesNo -Prompt "Use an EXISTING (empty) resource group for the test resources? [y/N]" -Default "n" -Help "Nerdio Manager for Enterprise installs only into a new or completely empty resource group - this test mirrors that requirement so the result reflects what a real install would encounter. Answering No has this script create a temporary resource group of its own, which it deletes (along with everything created inside it) at the end of the run.") {
+    elseif (Read-YesNo -Prompt "Use an EXISTING (empty) resource group for the test resources? [y/N]" -Default "n" -Help "Nerdio Manager for Enterprise installs only into a new or completely empty resource group. Answering No has this script create a temporary resource group of its own, which it deletes (along with everything created inside it) at the end of the run.") {
         $useExisting = $true
         $ResourceGroupName = $null
     }
@@ -591,15 +596,15 @@ try {
     $privateChoice = Read-Choice -Prompt "Do you want to deploy Nerdio Manager with PRIVATE ENDPOINTS?" -Options @(
         "Yes - deploy with private endpoints (no public internet exposure)",
         "No - use public endpoints (default)"
-    ) -Default 2 -Help "Private endpoints give NME's PaaS dependencies (SQL Database, Key Vault, Storage, and the App Service) private IPs on your VNet instead of public endpoints. Pros: no public exposure of the NME data plane; meets network-isolation requirements. Cons/requirements: configuration of DNS and network routing can complicate the setup and extend the Nerdio Proof of Value timeline. Private endpoints can be deployed after proving value and before going to production."
+    ) -Default 2 -Help "Private endpoints give NME's PaaS dependencies (SQL Database, Key Vault, Storage, and the App Service) private IPs on your VNet instead of public endpoints. Pros: no public exposure of the NME data plane; meets network-isolation requirements. Cons: increases complexity and can extend the Nerdio Proof of Value timeline. `r`n`r`nNOTE: Private endpoints can be enabled after proving value and before going to production."
     if ($privateChoice -eq 1) {
         $TestPrivate = $true
         $TestVnetIntegration = $true
 
         $vnetChoice = Read-Choice -Prompt "Will you deploy to an EXISTING VNet?" -Options @(
             "Use an EXISTING VNet (you provide RG, VNet, and both subnet names)",
-            "Create a NEW VNet for this test (this script creates and later deletes it)"
-        ) -Default 2 -Help "NME can be deployed to a brand-new VNet, which simplifies DNS and networking - this is the preferred/default deployment. Deploying into an EXISTING VNet is recommended only when your organization requires routing all traffic through centralized firewalls; note that using an existing VNet makes initial configuration more time-consuming. An EXISTING VNet tests against the real network NME will use - its subnets, DNS settings, and any private DNS zone links - so the result reflects your production topology. You must provide the VNet's resource group, its name, a subnet for private endpoints, and a separate subnet delegated to Microsoft.Web/serverFarms for App Service integration. A NEW VNet lets the script prove the resources CAN be created (VNet, subnets, delegation, private endpoint) in a clean 10.60.0.0/16 space it creates and then deletes, but it cannot validate your real DNS/routing/firewall because none exists yet."
+            "Create a NEW VNet for Nerdio Manager (this script creates and later deletes a vnet. The NME )"
+        ) -Default 2 -Help "NME can be deployed to a new VNet created during deployment, which simplifies DNS and networking - this is the preferred/default deployment. Deploying into an EXISTING VNet is recommended when your organization requires routing all traffic through centralized firewalls. `r`n`r`nSelecting an EXISTING VNet tests against the real network NME will use - its subnets, DNS settings, and any private DNS zone links - so the result of this test reflects your production topology. You must provide the VNet's resource group, its name, a subnet for private endpoints, and a separate subnet delegated to Microsoft.Web/serverFarms for App Service integration. `r`n`r`nA NEW VNet lets the script prove the resources CAN be created (VNet, subnets, delegation, private endpoint) in a clean 10.60.0.0/16 space it creates and then deletes."
         if ($vnetChoice -eq 1) {
             # Validate the VNet exists up front and re-prompt on a bad value, so the user isn't told the
             # name was wrong only after the deployability phase has already created resources.
@@ -657,9 +662,9 @@ try {
                     # verification step gates on the real detected mode, simply ignoring this answer if the
                     # VNet turns out to use custom/on-prem DNS.
                     $dnsZonesChoice = Read-Choice -Prompt "  Will you use EXISTING Azure Private DNS zones, or have NME/this script create NEW ones?" -Options @(
-                        "Use EXISTING Private DNS zones (you provide the subscription + resource group)",
+                        "Use EXISTING Private DNS zones (you will be asked to provide the subscription + resource group of the existing zones)",
                         "Create NEW Private DNS zones (the installer/runbook creates them at deploy time)"
-                    ) -Default 2 -Help "NME's private endpoints need these Azure Private DNS zones, linked to the VNet, to resolve to private IPs: privatelink.database.windows.net (SQL), privatelink.vaultcore.azure.net (Key Vault), privatelink.blob.* and privatelink.file.* (Storage), privatelink.azurewebsites.net (App Service), privatelink.azure-automation.net (Automation). EXISTING: your org already manages these zones centrally (common with hub/spoke + Azure Policy auto-registration) - provide the subscription and resource group that holds them, and this script reports which required zones are MISSING there. NEW: NME's deployment (or the Enable Private Endpoints runbook) creates and links the zones for you - this script only tests that the required zones CAN be created (in the throwaway test resource group) and does NOT link them to your VNet; the real installer/runbook creates and links them at deploy time. (Gov/China clouds use the equivalent .us/.cn zone names, derived automatically.)"
+                    ) -Default 2 -Help "NME's private endpoints need these Azure Private DNS zones, linked to the VNet, to resolve to private IPs: `r`n`r`nprivatelink.database.windows.net (SQL), `r`n`r`nprivatelink.vaultcore.azure.net (Key Vault), `r`n`r`nprivatelink.blob.* and privatelink.file.* (Storage), `r`n`r`nprivatelink.azurewebsites.net (App Service), `r`n`r`nprivatelink.azure-automation.net (Automation). `r`n`r`n`r`n`r`nEXISTING: your org already manages these zones centrally (common with hub/spoke + Azure Policy auto-registration) - provide the subscription and resource group that holds them, and this script reports which required zones are MISSING there. `r`n`r`n`r`n`r`nNEW: NME's deployment (or the Enable Private Endpoints runbook) creates and links the zones for you - this script only tests that the required zones CAN be created (in the throwaway test resource group) and does NOT link them to your VNet; the real installer/runbook creates and links them at deploy time. (Gov/China clouds use the equivalent .us/.cn zone names, derived automatically.)"
                     if ($dnsZonesChoice -eq 1) {
                         $PrivateDnsZonesMode = "Existing"
                         do { $PrivateDnsZoneSubId = Read-Host -Prompt "    Subscription ID where the Azure Private DNS zones live" } while ([string]::IsNullOrWhiteSpace($PrivateDnsZoneSubId))
@@ -685,7 +690,7 @@ try {
             $dnsModeChoice = Read-Choice -Prompt "  Will this VNet use Azure Private DNS Zones to resolve the private endpoints?" -Options @(
                 "Azure Private DNS Zones (Azure resolves the privatelink zones)",
                 "Custom / on-prem DNS servers (your DNS resolves the privatelink names)"
-            ) -Default 1 -Help "NME's private endpoints only work if the privatelink DNS names (e.g. privatelink.database.windows.net) resolve to the private IPs. Azure Private DNS Zones: Azure hosts those zones and, when linked to the VNet, resolves them automatically - simplest option. Custom / on-prem DNS: your own DNS servers (set on the VNet) must host or conditionally forward every required privatelink zone; the script will list the exact zones your DNS must resolve. Choose Azure Private DNS Zones unless your organization mandates centralized custom DNS."
+            ) -Default 1 -Help "NME's private endpoints only work if the privatelink DNS names (e.g. privatelink.database.windows.net) resolve to the private IPs. `r`n`r`n`r`n`r`nAzure Private DNS Zones: Azure hosts those zones and, when linked to the VNet, resolves them automatically - simplest option. `r`n`r`n`r`n`r`nCustom / on-prem DNS: your own DNS servers (set on the VNet) must host or conditionally forward every required privatelink zone; the script will list the exact zones your DNS must resolve. Choose Azure Private DNS Zones unless your organization mandates centralized custom DNS."
             if ($dnsModeChoice -eq 1) {
                 $NewVnetDnsMode = "Azure"
 
@@ -694,7 +699,7 @@ try {
                 $dnsZonesChoice = Read-Choice -Prompt "  Will you use EXISTING Azure Private DNS zones, or have NME/this script create NEW ones?" -Options @(
                     "Use EXISTING Private DNS zones (you provide the subscription + resource group)",
                     "Create NEW Private DNS zones (the installer/runbook creates them at deploy time)"
-                ) -Default 2 -Help "NME's private endpoints need these Azure Private DNS zones, linked to the VNet, to resolve to private IPs: privatelink.database.windows.net (SQL), privatelink.vaultcore.azure.net (Key Vault), privatelink.blob.* and privatelink.file.* (Storage), privatelink.azurewebsites.net (App Service), privatelink.azure-automation.net (Automation). EXISTING: your org already manages these zones centrally (common with hub/spoke + Azure Policy auto-registration) - provide the subscription and resource group that holds them, and this script reports which required zones are MISSING there. NEW: NME's deployment (or the Enable Private Endpoints runbook) creates and links the zones for you - this script only tests that the required zones CAN be created (in the throwaway test resource group) and does NOT link them to your VNet; the real installer/runbook creates and links them at deploy time. (Gov/China clouds use the equivalent .us/.cn zone names, derived automatically.)"
+                ) -Default 2 -Help "NME's private endpoints need these Azure Private DNS zones, linked to the VNet, to resolve to private IPs: privatelink.database.windows.net (SQL), privatelink.vaultcore.azure.net (Key Vault), privatelink.blob.* and privatelink.file.* (Storage), privatelink.azurewebsites.net (App Service), privatelink.azure-automation.net (Automation). `r`n`r`n`r`n`r`nEXISTING: your org already manages these zones centrally (common with hub/spoke + Azure Policy auto-registration) - provide the subscription and resource group that holds them, and this script reports which required zones are MISSING there. `r`n`r`n`r`n`r`nNEW: NME's deployment (or the Enable Private Endpoints runbook) creates and links the zones for you - this script only tests that the required zones CAN be created (in the throwaway test resource group) and does NOT link them to your VNet; the real installer/runbook creates and links them at deploy time. (Gov/China clouds use the equivalent .us/.cn zone names, derived automatically.)"
                 if ($dnsZonesChoice -eq 1) {
                     $PrivateDnsZonesMode = "Existing"
                     do { $PrivateDnsZoneSubId = Read-Host -Prompt "    Subscription ID where the Azure Private DNS zones live" } while ([string]::IsNullOrWhiteSpace($PrivateDnsZoneSubId))
@@ -809,7 +814,7 @@ try {
     # Tags applied to every resource this script creates (never to a pre-existing resource group).
     # Only user-specified tags are applied - none are added by default.
     $Tags = @{}
-    if (Read-YesNo -Prompt "Add custom tags to all resources this script creates? [y/N]" -Default "n" -Help "Required-tag and tag-value Deny policies are a common deployment blocker in customer environments. Testing with the same tags your customer's Azure Policy mandates surfaces those policy blocks now, instead of during the real Nerdio Manager install.") {
+    if (Read-YesNo -Prompt "Add custom tags to all resources this script creates? [y/N]" -Default "n" -Help "Required-tag and tag-value Deny policies are a common deployment blocker in customer environments. Testing with the same tags your organization's Azure Policy mandates surfaces those policy blocks now, instead of during the real Nerdio Manager install.") {
         do {
             $tagName = Read-Host -Prompt "  Tag name"
             if ([string]::IsNullOrWhiteSpace($tagName)) { break }
