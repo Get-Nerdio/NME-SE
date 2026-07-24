@@ -645,7 +645,7 @@ try {
                 $dnsZonesChoice = Read-Choice -Prompt "  Will you use EXISTING Azure Private DNS zones, or have NME/this script create NEW ones?" -Options @(
                     "Use EXISTING Private DNS zones (you provide the subscription + resource group)",
                     "Create NEW Private DNS zones (the installer/runbook creates them at deploy time)"
-                ) -Default 2 -Help "NME's private endpoints need these Azure Private DNS zones, linked to the VNet, to resolve to private IPs: privatelink.database.windows.net (SQL), privatelink.vaultcore.azure.net (Key Vault), privatelink.blob.* and privatelink.file.* (Storage), privatelink.azurewebsites.net (App Service), privatelink.azure-automation.net (Automation). EXISTING: your org already manages these zones centrally (common with hub/spoke + Azure Policy auto-registration) - provide the subscription and resource group that holds them, and this script reports which required zones are MISSING there. NEW: NME's deployment (or the Enable Private Endpoints runbook) creates and links the zones for you - this script tests that the zones CAN be created in the test resource group. (Gov/China clouds use the equivalent .us/.cn zone names, derived automatically.)"
+                ) -Default 2 -Help "NME's private endpoints need these Azure Private DNS zones, linked to the VNet, to resolve to private IPs: privatelink.database.windows.net (SQL), privatelink.vaultcore.azure.net (Key Vault), privatelink.blob.* and privatelink.file.* (Storage), privatelink.azurewebsites.net (App Service), privatelink.azure-automation.net (Automation). EXISTING: your org already manages these zones centrally (common with hub/spoke + Azure Policy auto-registration) - provide the subscription and resource group that holds them, and this script reports which required zones are MISSING there. NEW: NME's deployment (or the Enable Private Endpoints runbook) creates and links the zones for you - this script only tests that the required zones CAN be created (in the throwaway test resource group) and does NOT link them to your VNet; the real installer/runbook creates and links them at deploy time. (Gov/China clouds use the equivalent .us/.cn zone names, derived automatically.)"
                 if ($dnsZonesChoice -eq 1) {
                     $PrivateDnsZonesMode = "Existing"
                     do { $PrivateDnsZoneSubId = Read-Host -Prompt "    Subscription ID where the Azure Private DNS zones live" } while ([string]::IsNullOrWhiteSpace($PrivateDnsZoneSubId))
@@ -679,24 +679,24 @@ try {
                 $dnsZonesChoice = Read-Choice -Prompt "  Will you use EXISTING Azure Private DNS zones, or have NME/this script create NEW ones?" -Options @(
                     "Use EXISTING Private DNS zones (you provide the subscription + resource group)",
                     "Create NEW Private DNS zones (the installer/runbook creates them at deploy time)"
-                ) -Default 2 -Help "NME's private endpoints need these Azure Private DNS zones, linked to the VNet, to resolve to private IPs: privatelink.database.windows.net (SQL), privatelink.vaultcore.azure.net (Key Vault), privatelink.blob.* and privatelink.file.* (Storage), privatelink.azurewebsites.net (App Service), privatelink.azure-automation.net (Automation). EXISTING: your org already manages these zones centrally (common with hub/spoke + Azure Policy auto-registration) - provide the subscription and resource group that holds them, and this script reports which required zones are MISSING there. NEW: NME's deployment (or the Enable Private Endpoints runbook) creates and links the zones for you - this script tests that the zones CAN be created in the test resource group. (Gov/China clouds use the equivalent .us/.cn zone names, derived automatically.)"
+                ) -Default 2 -Help "NME's private endpoints need these Azure Private DNS zones, linked to the VNet, to resolve to private IPs: privatelink.database.windows.net (SQL), privatelink.vaultcore.azure.net (Key Vault), privatelink.blob.* and privatelink.file.* (Storage), privatelink.azurewebsites.net (App Service), privatelink.azure-automation.net (Automation). EXISTING: your org already manages these zones centrally (common with hub/spoke + Azure Policy auto-registration) - provide the subscription and resource group that holds them, and this script reports which required zones are MISSING there. NEW: NME's deployment (or the Enable Private Endpoints runbook) creates and links the zones for you - this script only tests that the required zones CAN be created (in the throwaway test resource group) and does NOT link them to your VNet; the real installer/runbook creates and links them at deploy time. (Gov/China clouds use the equivalent .us/.cn zone names, derived automatically.)"
                 if ($dnsZonesChoice -eq 1) {
                     $PrivateDnsZonesMode = "Existing"
                     do { $PrivateDnsZoneSubId = Read-Host -Prompt "    Subscription ID where the Azure Private DNS zones live" } while ([string]::IsNullOrWhiteSpace($PrivateDnsZoneSubId))
                     do { $PrivateDnsZoneRg = Read-Host -Prompt "    Resource group name for the Azure Private DNS zones" } while ([string]::IsNullOrWhiteSpace($PrivateDnsZoneRg))
                     $ConfigSummary["Private DNS zones plan"] = "Existing (subscription '$PrivateDnsZoneSubId', resource group '$PrivateDnsZoneRg')"
-                    $ConfigSummary["Private DNS resolution plan (new VNet)"] = "Azure Private DNS Zones - subscription '$PrivateDnsZoneSubId', resource group '$PrivateDnsZoneRg' (recorded only; not verified or modified by this script)"
+                    $ConfigSummary["Private DNS resolution (new VNet)"] = "Azure Private DNS Zones - subscription '$PrivateDnsZoneSubId', resource group '$PrivateDnsZoneRg' (recorded only; not verified or modified by this script)"
                 }
                 else {
                     $PrivateDnsZonesMode = "New"
                     $ConfigSummary["Private DNS zones plan"] = "New (created at install)"
-                    $ConfigSummary["Private DNS resolution plan (new VNet)"] = "Azure Private DNS Zones - created at install (this script test-creates the required zones in the throwaway test resource group)"
+                    $ConfigSummary["Private DNS resolution (new VNet)"] = "Azure Private DNS Zones - created at install (this script test-creates the required zones in the throwaway test resource group)"
                 }
             }
             else {
                 $NewVnetDnsMode = "Custom"
                 $zoneList = ($RequiredPrivateDnsZones | ForEach-Object { "$($_.Zone) ($($_.Purpose))" }) -join "; "
-                $ConfigSummary["Private DNS resolution plan (new VNet)"] = "Custom/on-prem DNS - the custom DNS server(s) must resolve: $zoneList"
+                $ConfigSummary["Private DNS resolution (new VNet)"] = "Custom/on-prem DNS - the custom DNS server(s) must resolve: $zoneList"
             }
         }
     }
@@ -896,7 +896,7 @@ try {
     $ConfigSummary["Resource group"] = "$ResourceGroupName $(if ($PendingRgCreate) { '(created by this script)' } else { '(existing, user-supplied)' })"
     if ($Tags.Count -gt 0) { $ConfigSummary["Tags applied"] = (($Tags.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join "; ") } else { $ConfigSummary["Tags applied"] = "(none specified)" }
     $ConfigSummary["Private endpoint scenario"] = if ($TestPrivate) { "Yes - $(if ($CreateNewVnet) { 'new' } else { 'existing' }) VNet '$ExistingVnetName' (RG '$ExistingVnetRg'), private endpoint subnet '$PeSubnetName'" } else { "Not tested" }
-    $ConfigSummary["App Service VNet integration scenario"] = if ($TestVnetIntegration) { "Yes - app integration subnet '$AppSubnetName' in VNet '$ExistingVnetName'" } else { "Not tested" }
+    $ConfigSummary["App Service VNet integration"] = if ($TestVnetIntegration) { "Yes - app integration subnet '$AppSubnetName' in VNet '$ExistingVnetName'" } else { "Not tested" }
     $ConfigSummary["VNet DNS configuration"] = "Not tested"
     #endregion
 
@@ -1419,21 +1419,6 @@ try {
                 $pe = New-AzPrivateEndpoint -ResourceGroupName $ResourceGroupName -Name $peName -Location $Location -Subnet $subnet -PrivateLinkServiceConnection $plsc -Tag $Tags -ErrorAction Stop
                 Add-TrackedResource -Type "privateendpoint" -ResourceGroupName $ResourceGroupName -Name $peName -Id $pe.Id
                 Add-Result -Category "PrivateEndpoint" -Check "Private endpoint deployment" -Result "Pass" -Detail "Deployed a private endpoint (blob) into subnet '$PeSubnetName'."
-
-                # Resolution check.
-                $peFqdn = "$peStorage.privatelink.blob.$StorageSuffix"
-                try {
-                    $r = Resolve-DnsName -Name $peFqdn -ErrorAction Stop | Where-Object { $_.IPAddress } | Select-Object -First 1
-                    if ($r) {
-                        $ip = $r.IPAddress
-                        $isPrivate = $ip -match "^10\." -or $ip -match "^192\.168\." -or $ip -match "^172\.(1[6-9]|2[0-9]|3[0-1])\."
-                        if ($isPrivate) { Add-Result -Category "PrivateEndpoint" -Check "Private DNS resolution" -Result "Pass" -Detail "$peFqdn resolves to private IP $ip." }
-                        else { Add-Result -Category "PrivateEndpoint" -Check "Private DNS resolution" -Result "Warn" -Detail "$peFqdn resolves to $ip (not a private IP). This shell may not use the VNet's DNS; verify from within the VNet." }
-                    }
-                }
-                catch {
-                    Add-Result -Category "PrivateEndpoint" -Check "Private DNS resolution" -Result "Info" -Detail "Could not resolve $peFqdn from this shell (expected if the shell isn't on the VNet)." -Message $_.Exception.Message
-                }
             }
         }
         catch {
@@ -1505,21 +1490,24 @@ try {
                         $rawTok = (Get-AzAccessToken -ResourceUrl "https://management.azure.com" -ErrorAction Stop).Token
                         $kuduToken = if ($rawTok -is [System.Security.SecureString]) { [System.Net.NetworkCredential]::new("", $rawTok).Password } else { $rawTok }
                         $epList = ($endpoints | ForEach-Object { "'$_'" }) -join ","
-                        $remoteCmd = "`$ProgressPreference='SilentlyContinue';foreach(`$u in @($epList)){try{`$null=Invoke-RestMethod -Uri (\`"https://`$u\`") -TimeoutSec 15 -ErrorAction SilentlyContinue}catch{};`$sp=[System.Net.ServicePointManager]::FindServicePoint(\`"https://`$u\`");`$sub=try{`$sp.Certificate.Subject}catch{''};Write-Output (\`"`$u|OK|`$sub\`")}"
-                        $kbody = @{ command = "powershell -NoProfile -Command `"$remoteCmd`""; dir = "site\\wwwroot" } | ConvertTo-Json
+                        $remoteCmd = "`$ProgressPreference='SilentlyContinue';foreach(`$u in @($epList)){try{`$null=Invoke-RestMethod -Uri ('https://'+`$u) -TimeoutSec 15 -ErrorAction SilentlyContinue}catch{};`$sp=[System.Net.ServicePointManager]::FindServicePoint('https://'+`$u);`$sub='';try{`$sub=`$sp.Certificate.Subject}catch{};`$st=if(`$sub){'OK'}else{'BLOCKED'};Write-Output (`$u+'|'+`$st+'|'+`$sub)}"
+                        $kbody = @{ command = "powershell -NoProfile -Command `"$remoteCmd`""; dir = "site\wwwroot" } | ConvertTo-Json
                         $headers = @{ Authorization = "Bearer $kuduToken"; "Content-Type" = "application/json" }
                         try {
                             $kresp = Invoke-RestMethod -Method POST -Uri "https://$scmHost/api/command" -Headers $headers -Body $kbody -TimeoutSec 120 -ErrorAction Stop
                             $outLines = @()
-                            if ($kresp.Output) { $outLines = $kresp.Output -split "`n" | Where-Object { $_ -match "\|OK\|" } }
+                            if ($kresp.Output) { $outLines = $kresp.Output -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -match "\|(OK|BLOCKED)\|" } }
                             foreach ($ep in $endpoints) {
-                                $line = $outLines | Where-Object { $_ -like "$ep*" } | Select-Object -First 1
-                                if ($line) {
+                                $line = $outLines | Where-Object { ($_ -split "\|")[0] -eq $ep } | Select-Object -First 1
+                                if ($line -and $line -match "\|OK\|") {
                                     $subject = ($line -split "\|")[2]
-                                    Add-Result -Category "Connectivity" -Check "Outbound: $ep" -Result "Pass" -Detail "Reachable from the VNet-integrated worker. Cert: $subject"
+                                    Add-Result -Category "Connectivity" -Check "Outbound: $ep" -Result "Pass" -Detail "Reachable from the VNet-integrated worker.$(if ($subject) { " TLS cert: $subject" })"
+                                }
+                                elseif ($line -and $line -match "\|BLOCKED\|") {
+                                    Add-Result -Category "Connectivity" -Check "Outbound: $ep" -Result "Warn" -Detail "Not reachable from the VNet-integrated worker (blocked, or DNS did not resolve)."
                                 }
                                 else {
-                                    Add-Result -Category "Connectivity" -Check "Outbound: $ep" -Result "Warn" -Detail "No confirmation from the worker - may be blocked. $NmeNetworkTestHint"
+                                    Add-Result -Category "Connectivity" -Check "Outbound: $ep" -Result "Warn" -Detail "No result returned from the worker for this endpoint."
                                 }
                             }
                         }
@@ -1608,6 +1596,17 @@ finally {
     $detailIndent = " " * 8
     $wrapWidth = 92
     foreach ($r in $Results) {
+        # Only genuine "missing required zone" rows (Detail starts "MISSING from ...") get the terse
+        # [MISSING] treatment - NOT the new-zone test-CREATION failure rows, which share the same
+        # Category/Result/Check shape but carry the blocking-policy reason in Detail and must keep it.
+        $isMissingZone = $r.Category -eq "PrivateDns" -and $r.Result -eq "Fail" -and $r.Check -like "Private DNS zone: *" -and $r.Detail -like "MISSING from *"
+        if ($isMissingZone) {
+            $token = "[MISSING]"
+            $catPadded = $r.Category.PadRight($catWidth)
+            $check = $r.Check -replace "^Private DNS zone: ", ""
+            Write-Host ("{0}  {1}  {2}" -f $token, $catPadded, $check)
+            continue
+        }
         $token = if ($resultTokens.ContainsKey($r.Result)) { $resultTokens[$r.Result] } else { "[{0}]" -f $r.Result.ToUpper().Substring(0, [Math]::Min(4, $r.Result.Length)) }
         $catPadded = $r.Category.PadRight($catWidth)
         Write-Host ("{0}  {1}  {2}" -f $token, $catPadded, $r.Check)
