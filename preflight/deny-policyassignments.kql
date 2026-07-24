@@ -1,0 +1,27 @@
+policyresources
+| where type == "microsoft.authorization/policyassignments"
+| extend definitionId = tostring(properties.policyDefinitionId),
+         assignmentEffect = tostring(properties.parameters.effect.value)
+| join kind=leftouter (
+    policyresources
+    | where type == "microsoft.authorization/policydefinitions"
+    | extend defaultEffect = tostring(properties.parameters.effect.defaultValue),
+             hardCodedEffect = tostring(properties.policyRule.then.effect),
+             policyDisplayName = tostring(properties.displayName)
+    | project definitionId = id,
+              policyDisplayName,
+              hardCodedEffect,
+              defaultEffect
+) on definitionId
+| extend resolvedEffect = case(
+    isnotempty(assignmentEffect), assignmentEffect,
+    isnotempty(hardCodedEffect) and hardCodedEffect !~ "[parameters('effect')]", hardCodedEffect,
+    isnotempty(defaultEffect), defaultEffect,
+    "unknown"
+)
+| where resolvedEffect == "Deny"
+| project assignmentId = id,
+          assignmentName = name,
+          scope = properties.scope,
+          policyDisplayName,
+          resolvedEffect
