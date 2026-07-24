@@ -602,14 +602,14 @@ try {
     $privateChoice = Read-Choice -Prompt "Do you want to deploy Nerdio Manager with PRIVATE ENDPOINTS?" -Options @(
         "Yes - deploy with private endpoints (no public internet exposure)",
         "No - use public endpoints (default)"
-    ) -Default 2 -Help "Private endpoints give NME's PaaS dependencies (SQL Database, Key Vault, Storage, and the App Service) private IPs on your VNet instead of public endpoints. `r`n`r`nPros: no public exposure of the NME data plane; meets network-isolation requirements. Note: public endpoints are still protected by Azure authentication and authorization requirements. `r`n`r`nCons: increases complexity and can extend the Nerdio Proof of Value timeline. `r`n`r`nNOTE: Private endpoints can be enabled after proving value and before going to production."
+    ) -Default 2 -Help "Private endpoints give NME's PaaS dependencies (SQL Database, Key Vault, Storage, and the App Service) private IPs on your VNet instead of public endpoints. `r`n`r`nPros: no public exposure of the NME data plane; meets network-isolation requirements. Note that public endpoints are still protected by Azure authentication and authorization requirements. `r`n`r`nCons: increases complexity and can extend the Nerdio Proof of Value timeline. `r`n`r`nNOTE: Private endpoints can be enabled after proving value and before going to production."
     if ($privateChoice -eq 1) {
         $TestPrivate = $true
         $TestVnetIntegration = $true
 
         $vnetChoice = Read-Choice -Prompt "Will you deploy to an EXISTING VNet?" -Options @(
             "Use an EXISTING VNet (you provide RG, VNet, and both subnet names)",
-            "Create a NEW VNet for Nerdio Manager (this script creates and later deletes a vnet. The NME )"
+            "Create a NEW VNet for Nerdio Manager (this script creates and later deletes a vnet. The NME deployment process will create a new VNet during installation as well. You will be able to specify the address space for the actual deployment.)"
         ) -Default 2 -Help "NME can be deployed to a new VNet created during deployment, which simplifies DNS and networking - this is the preferred/default deployment. Deploying into an EXISTING VNet is recommended when your organization requires routing all traffic through centralized firewalls. `r`n`r`nSelecting an EXISTING VNet tests against the real network NME will use - its subnets, DNS settings, and any private DNS zone links - so the result of this test reflects your production topology. You must provide the VNet's resource group, its name, a subnet for private endpoints, and a separate subnet delegated to Microsoft.Web/serverFarms for App Service integration. `r`n`r`nA NEW VNet lets the script prove the resources CAN be created (VNet, subnets, delegation, private endpoint) in a clean 10.60.0.0/16 space it creates and then deletes."
         if ($vnetChoice -eq 1) {
             # Validate the VNet exists up front and re-prompt on a bad value, so the user isn't told the
@@ -642,7 +642,7 @@ try {
             # EXISTING VNet mutates real customer network resources (even though everything is removed
             # at cleanup), unlike the new-VNet path where the whole VNet is throwaway. Get explicit
             # confirmation before proceeding, and make clear this will NOT touch DNS configuration.
-            Write-Host -ForegroundColor "Cyan" "  On the EXISTING VNet '$ExistingVnetName', this test will:"
+            Write-Host -ForegroundColor "Cyan" "`r`n  On the EXISTING VNet '$ExistingVnetName', this test will:"
             Write-HelpText -Text "1) Create TEMPORARY private endpoints in subnet '$PeSubnetName' for SQL, Key Vault, Storage, and Automation. `r`n`r`n2) Enable App Service VNet integration on subnet '$AppSubnetName'. `r`n`r`n3) Test DNS resolution and outbound/private connectivity from a temporary App Service. `r`n`r`n4) DELETE everything it created at the end. `r`n`r`nIt will NOT change any DNS settings - no Private DNS zone creation or linking, no VNet DNS-server changes - it only READS current configuration and TESTS resolution/connectivity."
             $peConsent = Read-YesNo -Prompt "Proceed with private endpoint + VNet integration testing on this existing VNet? [Y/n]" -Default "y"
             if (-not $peConsent) {
@@ -919,8 +919,19 @@ try {
     $ConfigSummary["Region"] = $Location
     $ConfigSummary["Resource group"] = "$ResourceGroupName $(if ($PendingRgCreate) { '(created by this script)' } else { '(existing, user-supplied)' })"
     if ($Tags.Count -gt 0) { $ConfigSummary["Tags applied"] = (($Tags.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join "; ") } else { $ConfigSummary["Tags applied"] = "(none specified)" }
-    $ConfigSummary["Private endpoint scenario"] = if ($TestPrivate) { "Yes - $(if ($CreateNewVnet) { 'new' } else { 'existing' }) VNet '$ExistingVnetName' (RG '$ExistingVnetRg'), private endpoint subnet '$PeSubnetName', 4 test private endpoints (SQL, Key Vault, Storage, Automation)" } else { "Not tested" }
-    $ConfigSummary["App Service VNet integration"] = if ($TestVnetIntegration) { "Yes - app integration subnet '$AppSubnetName' in VNet '$ExistingVnetName'" } else { "Not tested" }
+    if ($TestPrivate) {
+        $ConfigSummary["Private endpoint scenario"] = "Yes - $(if ($CreateNewVnet) { 'new' } else { 'existing' }) VNet, 4 test private endpoints (SQL, Key Vault, Storage, Automation)"
+        $ConfigSummary["$(if ($CreateNewVnet) { 'New' } else { 'Existing' }) VNet"] = "'$ExistingVnetName'"
+        $ConfigSummary["VNet RG"] = "'$ExistingVnetRg'"
+        $ConfigSummary["Private endpoint subnet"] = "'$PeSubnetName'"
+    }
+    else {
+        $ConfigSummary["Private endpoint scenario"] = "Not tested"
+    }
+    $ConfigSummary["App Service VNet integration"] = if ($TestVnetIntegration) { "Yes" } else { "Not tested" }
+    if ($TestVnetIntegration) {
+        $ConfigSummary["Web app subnet"] = "'$AppSubnetName'"
+    }
     $ConfigSummary["VNet DNS configuration"] = "Not tested"
     #endregion
 
@@ -1219,7 +1230,7 @@ try {
         try {
             # The actual check: can the install's "briefly enable public access" step succeed.
             Update-AzKeyVault -VaultName $kvName -ResourceGroupName $ResourceGroupName -PublicNetworkAccess "Enabled" -ErrorAction Stop | Out-Null
-            Add-Result -Category "Deployability" -Check "Key Vault temporary public access (install step)" -Result "Pass" -Detail "Public network access can be toggled on as the installer does during setup."
+            Add-Result -Category "Deployability" -Check "Key Vault temporary public access (confirmed allowed)" -Result "Pass"
         }
         catch {
             $kvToggleErrMsg = $_.Exception.Message
@@ -1413,7 +1424,7 @@ try {
                     $zr = $zoneJobResults | Where-Object { $_.Zone -eq $rz.Zone } | Select-Object -First 1
                     if ($zr -and $zr.Ok) {
                         Add-TrackedResource -Type "privatednszone" -ResourceGroupName $ResourceGroupName -Name $rz.Zone
-                        Add-Result -Category "PrivateDns" -Check "Private DNS zone: $($rz.Zone)" -Result "Pass" -Detail "Test-created successfully in resource group '$ResourceGroupName'."
+                        Add-Result -Category "PrivateDns" -Check "Private DNS zone: $($rz.Zone)" -Result "Pass" -Detail "created successfully"
                     }
                     else {
                         $zoneErrMsg = if ($zr) { $zr.Error } else { "No result returned from the create job." }
@@ -1692,7 +1703,7 @@ try {
                                         Add-Result -Category "Connectivity" -Check $t.Label -Result "Pass" -Detail "Resolves to private IP (auto-registered)."
                                     }
                                     elseif ($resolvedIp) {
-                                        Add-Result -Category "Connectivity" -Check $t.Label -Result "Info" -Detail "Resolves to public IP - private DNS zone required at install."
+                                        Add-Result -Category "Connectivity" -Check $t.Label -Result "Warn" -Detail "Resolves to public IP"
                                     }
                                     else {
                                         Add-Result -Category "Connectivity" -Check $t.Label -Result "Info" -Detail "Did not resolve - private DNS zone required at install."
@@ -1829,6 +1840,11 @@ finally {
         $d = ($r.Detail -replace "[`r`n]+", " ").Trim()
         if (-not $d) {
             Write-Host $prefix
+            continue
+        }
+        $isZoneCreated = $r.Category -eq "PrivateDns" -and $r.Result -eq "Pass" -and $r.Check -like "Private DNS zone: *"
+        if ($isZoneCreated) {
+            Write-Host "$prefix $d"
             continue
         }
         # Prefer a single combined line; only fall back to wrapped, indented continuation
