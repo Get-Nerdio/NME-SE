@@ -678,6 +678,12 @@ function Read-Choice {
         [int] $Default = 1
     )
     $hasHelp = -not [string]::IsNullOrWhiteSpace($Help)
+
+    # Present the default option first, but keep track of each displayed position's original
+    # index so the function still returns the original 1-based index into $Options.
+    $originalIndices = @($Default) + @(1..$Options.Count | Where-Object { $_ -ne $Default })
+    $displayOptions = @($originalIndices | ForEach-Object { $Options[$_ - 1] })
+
     $tokens = @(1..$Options.Count | ForEach-Object { "$_" })
     if ($hasHelp) { $tokens += "?" }
     $choiceStr = $tokens -join "/"
@@ -685,13 +691,13 @@ function Read-Choice {
         Write-Host ""
         Write-Host $Prompt
         Write-Host ""
-        for ($i = 0; $i -lt $Options.Count; $i++) { Write-Host ("  {0}) {1}" -f ($i + 1), $Options[$i]) }
+        for ($i = 0; $i -lt $displayOptions.Count; $i++) { Write-Host ("  {0}) {1}" -f ($i + 1), $displayOptions[$i]) }
         if ($hasHelp) { Write-Host "  ?) More information" }
         Write-Host ""
-        $r = Read-Host -Prompt "Choose [$choiceStr] (default $Default)"
+        $r = Read-Host -Prompt "Choose [$choiceStr] (default 1)"
         if ([string]::IsNullOrWhiteSpace($r)) { Write-Host ""; return $Default }
         if ($hasHelp -and $r -eq "?") { Write-HelpText -Text $Help; continue }
-        if ($r -match "^\d+$" -and [int]$r -ge 1 -and [int]$r -le $Options.Count) { Write-Host ""; return [int]$r }
+        if ($r -match "^\d+$" -and [int]$r -ge 1 -and [int]$r -le $displayOptions.Count) { Write-Host ""; return $originalIndices[[int]$r - 1] }
         Write-Host -ForegroundColor "Yellow" "  Invalid choice. Try again."
     }
 }
