@@ -1287,10 +1287,10 @@ try {
             $CAA = "158c047a-c907-4556-b7ef-446551a6b5f7"
             $roleNames = ($roles.displayName | Sort-Object -Unique) -join ", "
             if ($templateIds -contains $GA) {
-                Add-Result -Category "Permissions" -Check "Entra role for install" -Result "Pass" -Detail "You have Global Administrator."
+                Add-Result -Category "Permissions" -Check "Entra role for install" -Result "Pass" -Detail "User has Global Administrator."
             }
             elseif (($templateIds -contains $PRA) -and ($templateIds -contains $CAA)) {
-                Add-Result -Category "Permissions" -Check "Entra role for install" -Result "Pass" -Detail "You have Privileged Role Administrator + Cloud Application Administrator."
+                Add-Result -Category "Permissions" -Check "Entra role for install" -Result "Pass" -Detail "User has Privileged Role Administrator + Cloud Application Administrator."
             }
             else {
                 Add-Result -Category "Permissions" -Check "Entra role for install" -Result "Warn" -Detail "Missing Global Administrator (or Privileged Role Administrator + Cloud Application Administrator). Roles found: $($roleNames)."
@@ -1415,7 +1415,7 @@ try {
     #endregion
 
     #region Deployability tests (parallel) -------------------------------------------------------
-    Write-Host -ForegroundColor "Cyan" "Testing resource deployability (in parallel). This will take several minutes..."
+    Write-Host -ForegroundColor "Cyan" "Testing resource deployability. This will take several minutes..."
 
     # -PrivateEndpointOnly forces the resources that support a create-time public-access flag (Storage,
     # SQL, Key Vault) to deploy with public network access disabled from the start, for environments
