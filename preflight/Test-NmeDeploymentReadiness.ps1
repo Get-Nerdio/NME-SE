@@ -37,7 +37,9 @@
         Azure region for created resources / the temporary resource group. Prompted for if omitted.
 
     .PARAMETER OutFile
-        Path for the JSON results file. Defaults to NmeReadinessOutput.json in the working directory.
+        Path for the JSON results file. Defaults to NmeReadinessOutput_<timestamp>.json in the working
+        directory, where <timestamp> identifies the run and orders its date component (y/M/d) to match
+        the current culture's short date pattern, e.g. yyyy-MM-dd_HHmm vs dd-MM-yyyy_HHmm.
 
     .EXAMPLE
         Run in Azure Cloud Shell with a single command:
@@ -64,7 +66,7 @@ param (
     [System.String] $Location,
 
     [Parameter(Mandatory = $false)]
-    [System.String] $OutFile = (Join-Path -Path $PWD -ChildPath "NmeReadinessOutput.json"),
+    [System.String] $OutFile,
 
     [Parameter(Mandatory = $false)]
     [switch] $PrivateEndpointOnly
@@ -73,6 +75,20 @@ param (
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 $WarningPreference = "SilentlyContinue"
+
+if (-not $OutFile) {
+    # Order the y/M/d tokens the same way the current culture's short date pattern does (e.g.
+    # dd/MM/yyyy vs MM/dd/yyyy), so the default filename's date order matches what the user expects,
+    # but always zero-padded and hyphen-joined so it stays a valid, sortable filename on any OS.
+    $dateTokens = [System.Collections.Generic.List[string]]::new()
+    foreach ($ch in (Get-Culture).DateTimeFormat.ShortDatePattern.ToCharArray()) {
+        $token = switch ($ch) { 'y' { 'yyyy' }; 'M' { 'MM' }; 'd' { 'dd' }; default { $null } }
+        if ($token -and -not $dateTokens.Contains($token)) { $dateTokens.Add($token) }
+    }
+    if ($dateTokens.Count -ne 3) { $dateTokens = @('yyyy', 'MM', 'dd') }
+    $timestampFormat = ($dateTokens -join '-') + '_HHmm'
+    $OutFile = Join-Path -Path $PWD -ChildPath "NmeReadinessOutput_$(Get-Date -Format $timestampFormat).json"
+}
 
 #region Shared state and helpers ------------------------------------------------------------------
 # Single flat result list. Every check appends one object with this exact shape.
@@ -2162,7 +2178,6 @@ finally {
         $rawJson = [pscustomobject]@{ Metadata = $summaryMeta; Configuration = $ConfigSummary; Results = $Results; CreatedResources = $Tracker } |
             ConvertTo-Json -Depth 8
         $rawJson | Out-File -FilePath $OutFile -Force
-        Write-Host -ForegroundColor "Cyan" "Detailed results written to: $OutFile"
     }
     catch { Write-Host -ForegroundColor "Yellow" "Could not write JSON output: $($_.Exception.Message)" }
 
@@ -2173,7 +2188,6 @@ finally {
     try {
         $html = New-ReadinessHtmlReport -Results $Results -ConfigSummary $ConfigSummary -CustomResourceNames $CustomResourceNames -Meta $summaryMeta -CreatedResources $Tracker -RawJson $rawJson
         $html | Out-File -FilePath $HtmlOutFile -Force -Encoding utf8
-        Write-Host -ForegroundColor "Cyan" "HTML report written to:      $HtmlOutFile"
     }
     catch { Write-Host -ForegroundColor "Yellow" "Could not write HTML report: $($_.Exception.Message)"; $HtmlOutFile = $null }
 
@@ -2226,6 +2240,9 @@ finally {
     Write-ConsoleResultsTable -Results $Results
     Write-Host ""
     Write-Host -ForegroundColor "Green" "====== END REPORT ======"
+    Write-Host ""
+    Write-Host -ForegroundColor "Cyan" "Detailed results written to: $OutFile"
+    Write-Host -ForegroundColor "Cyan" "HTML report written to:      $HtmlOutFile"
     Write-Host ""
     if ($script:IsCloudShell) {
         Invoke-CloudShellDownload -Path $HtmlOutFile
