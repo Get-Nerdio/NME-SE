@@ -217,9 +217,7 @@ table.res tr:hover td{background:var(--card);}
 font-size:11px;font-weight:700;letter-spacing:.03em;}
 .pill.Pass{background:var(--pass);}.pill.Fail{background:var(--fail);}.pill.Warn{background:var(--warn);}.pill.Info{background:var(--info);}
 .cat{color:var(--muted);white-space:nowrap;}
-.detail{color:var(--fg);}.reason{color:var(--muted);font-size:12px;margin-top:3px;white-space:pre-wrap;}
-.policy{display:inline-block;margin-top:3px;font-size:11px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
-background:var(--card);border:1px solid var(--border);border-radius:4px;padding:1px 6px;}
+.detail{color:var(--fg);}
 details{margin-top:26px;}summary{cursor:pointer;color:var(--muted);font-size:13px;}
 pre{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:12px;overflow:auto;font-size:12px;
 font-family:ui-monospace,SFMono-Regular,Menlo,monospace;}
@@ -270,8 +268,6 @@ font-family:ui-monospace,SFMono-Regular,Menlo,monospace;}
         $cls = if ($script:StatusStyle.ContainsKey($r.Result)) { $r.Result } else { "Info" }
         $lbl = if ($script:StatusStyle.ContainsKey($r.Result)) { $script:StatusStyle[$r.Result].Label } else { $r.Result.ToUpper() }
         $detailHtml = ConvertTo-HtmlText (($r.Detail -replace "[`r`n]+", " ").Trim())
-        if ($r.PolicyName) { $detailHtml += "<div class=`"policy`">Blocking policy: $(ConvertTo-HtmlText $r.PolicyName)</div>" }
-        if ($r.Message) { $detailHtml += "<div class=`"reason`">$(ConvertTo-HtmlText (($r.Message -replace "[`r`n]+", " ").Trim()))</div>" }
         [void]$sb.AppendLine("<tr><td><span class=`"pill $cls`">$lbl</span></td><td class=`"cat`">$(ConvertTo-HtmlText $r.Category)</td><td>$(ConvertTo-HtmlText $r.Check)</td><td class=`"detail`">$detailHtml</td></tr>")
     }
     [void]$sb.AppendLine('</tbody></table>')
@@ -314,7 +310,6 @@ function Write-ConsoleResultsTable {
 
     foreach ($r in $Results) {
         $d = ($r.Detail -replace "[`r`n]+", " ").Trim()
-        if ($r.PolicyName) { $d = if ($d) { "$d [blocking policy: $($r.PolicyName)]" } else { "blocking policy: $($r.PolicyName)" } }
         $text = if ($d) { "$($r.Check) > $d" } else { $r.Check }
 
         # Word-wrap the check+detail column.
@@ -930,7 +925,7 @@ try {
             # Both subnets are validated against the VNet's actual subnets and must be distinct - a subnet
             # delegated to Microsoft.Web/serverFarms cannot also host private endpoints.
             $subnetNames = @($intakeVnet.Subnets.Name)
-            Write-Host -ForegroundColor "Cyan" "  Subnets in '$ExistingVnetName': $($subnetNames -join ', ')"
+            Write-Host -ForegroundColor "Cyan" "`r`n  Subnets in '$ExistingVnetName': $($subnetNames -join ', ')`r`n"
             do {
                 $PeSubnetName = Read-Host -Prompt "  Subnet name for private endpoints"
                 if ([string]::IsNullOrWhiteSpace($PeSubnetName)) { continue }
@@ -976,7 +971,7 @@ try {
                         "Use EXISTING Private DNS zones (you will be asked to provide the subscription + resource group of the existing zones)",
                         "Create NEW Private DNS zones (the installer/runbook creates them at deploy time)",
                         "I don't know yet - will use EXISTING zones but the subscription/resource group aren't known yet"
-                    ) -Default 2 -Help "NME's private endpoints need these Azure Private DNS zones, linked to the VNet, to resolve to private IPs: `r`n`r`nprivatelink.database.windows.net (SQL)`r`nprivatelink.vaultcore.azure.net (Key Vault)`r`nprivatelink.blob.core.windows.net (Storage)`r`nprivatelink.azurewebsites.net (App Service)`r`nprivatelink.azure-automation.net (Automation).`n`r`n`r`nEXISTING: your org already manages these zones centrally (common with hub/spoke + Azure Policy auto-registration) - you will be asked to provide the subscription and resource group that holds them, and this script reports which required zones are MISSING there. `r`n`r`nNEW: NME's deployment (or the Enable Private Endpoints runbook) will create and link the zones for you - this script only tests that the required zones CAN be created (in the throwaway test resource group) and does NOT link them to your VNet; the real installer/runbook creates and links them at deploy time. (Gov/China clouds use the equivalent .us/.cn zone names, derived automatically.) `r`n`r`nIf you'll use EXISTING zones but don't yet know their subscription/resource group, choose the third option - this script will skip the zone verification this run, but you must have that information ready before the actual NME POV installation."
+                    ) -Default 2 -Help "NME's private endpoints need these Azure Private DNS zones, linked to the VNet, to resolve to private IPs: `r`n`r`nprivatelink.database.windows.net (SQL)`r`nprivatelink.vaultcore.azure.net (Key Vault)`r`nprivatelink.blob.core.windows.net (Storage)`r`nprivatelink.azurewebsites.net (App Service)`r`nprivatelink.azure-automation.net (Automation)`n`r`n`r`nEXISTING: your org already manages these zones centrally (common with hub/spoke + Azure Policy auto-registration) - you will be asked to provide the subscription and resource group that holds them, and this script reports which required zones are MISSING there. `r`n`r`nNEW: NME's deployment (or the Enable Private Endpoints runbook) will create and link the zones for you - this script only tests that the required zones CAN be created (in the throwaway test resource group) and does NOT link them to your VNet; the real installer/runbook creates and links them at deploy time. (Gov/China clouds use the equivalent .us/.cn zone names, derived automatically.) `r`n`r`nIf you'll use EXISTING zones but don't yet know their subscription/resource group, choose the third option - this script will skip the zone verification this run, but you must have that information ready before the actual NME POV installation."
                     if ($dnsZonesChoice -eq 1) {
                         $PrivateDnsZonesMode = "Existing"
                         do { $PrivateDnsZoneSubId = Read-Host -Prompt "    Subscription ID where the Azure Private DNS zones live" } while ([string]::IsNullOrWhiteSpace($PrivateDnsZoneSubId))
