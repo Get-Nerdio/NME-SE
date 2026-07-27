@@ -1754,7 +1754,7 @@ try {
                         if (-not $match) {
                             $missingZones += $rz.Zone
                             $whereText = if ($PrivateDnsZoneRg) { "resource group '$PrivateDnsZoneRg'" } else { "this subscription" }
-                            Add-Result -Category "PrivateDns" -Check "Private DNS zone: $($rz.Zone)" -Result "Fail" -Detail "MISSING from $whereText - required for $($rz.Purpose) private endpoints. Create it and link it to '$ExistingVnetName'."
+                            Add-Result -Category "PrivateDns" -Check "Private DNS zone: $($rz.Zone)" -Result "Fail" -Detail "MISSING from $whereText - required for $($rz.Purpose) private endpoints."
                             $dnsZoneReport += "$($rz.Zone) ($($rz.Purpose)): missing from $whereText"
                             continue
                         }
