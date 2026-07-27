@@ -64,7 +64,10 @@ param (
     [System.String] $Location,
 
     [Parameter(Mandatory = $false)]
-    [System.String] $OutFile = (Join-Path -Path $PWD -ChildPath "NmeReadinessOutput.json")
+    [System.String] $OutFile = (Join-Path -Path $PWD -ChildPath "NmeReadinessOutput.json"),
+
+    [Parameter(Mandatory = $false)]
+    [switch] $PrivateEndpointOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -84,7 +87,8 @@ function Add-Result {
         [Parameter(Mandatory = $true)][ValidateSet("Pass", "Fail", "Warn", "Info")][string] $Result,
         [string] $Detail = "",
         [string] $PolicyName = $null,
-        [string] $Message = $null
+        [string] $Message = $null,
+        [string] $RawMessage = $null
     )
     $obj = [pscustomobject]@{
         Category   = $Category
@@ -93,6 +97,7 @@ function Add-Result {
         Detail     = $Detail
         PolicyName = $PolicyName
         Message    = $Message
+        RawMessage = $RawMessage
     }
     $Results.Add($obj) | Out-Null
 
@@ -421,6 +426,47 @@ function Get-PolicyFromError {
     return $out
 }
 
+# Reduce a raw (often multi-part) ARM/SDK error blob to the single actionable line for display - the
+# top-level error.message (e.g. the quota text). The full raw text is preserved separately in the JSON
+# output (Add-Result -RawMessage), so nothing is lost here.
+function Get-ConciseErrorMessage {
+    param([string] $RawMessage)
+    if ([string]::IsNullOrWhiteSpace($RawMessage)) { return $RawMessage }
+
+    $extract = {
+        param($obj)
+        if ($null -eq $obj) { return $null }
+        $m = $null
+        if ($obj.error -and $obj.error.message) { $m = $obj.error.message }
+        elseif ($obj.message) { $m = $obj.message }
+        if ($m -and $obj.error -and $obj.error.details) {
+            $d = @($obj.error.details) | Where-Object { $_.message } | Select-Object -First 1
+            if ($d -and $d.message -and $m -match "multiple error|see details|one or more") { $m = $d.message }
+        }
+        return $m
+    }
+
+    # Candidate JSON snippets: the whole blob first (single clean JSON), then each line that is itself a
+    # JSON object (the raw is a concatenation of Message + ErrorDetails + Response.Content + Body).
+    $snippets = @($RawMessage)
+    $snippets += ($RawMessage -split "`r`n|`n|`r" | Where-Object { $_ -match '^\s*\{.*\}\s*$' })
+    foreach ($s in $snippets) {
+        try {
+            $j = $s | ConvertFrom-Json -ErrorAction Stop
+            $m = & $extract $j
+            if ($m) { return ($m -replace "[`r`n]+", " ").Trim() }
+        }
+        catch {}
+    }
+
+    # No parseable JSON error.message - return the first meaningful line (skip Track1 boilerplate).
+    $line = $RawMessage -split "`r`n|`n|`r" | ForEach-Object { $_.Trim() } |
+        Where-Object { $_ -and $_ -notmatch "Operation returned an invalid status code" } |
+        Select-Object -First 1
+    if ($line) { return $line }
+    return $RawMessage.Trim()
+}
+
 # Resolve a policy definition/assignment id to a friendly display name.
 function Resolve-PolicyName {
     param(
@@ -561,6 +607,21 @@ function New-RandomString {
     param([int] $Length = 8)
     $chars = "abcdefghijklmnopqrstuvwxyz0123456789".ToCharArray()
     return (-join (1..$Length | ForEach-Object { $chars | Get-Random })).ToLower()
+}
+
+function Get-MaskedAccount {
+    # Mask the local part of a UPN for display: keep the first 1 and last 2 characters, replace the
+    # middle with '*' (one per replaced char); leave the domain intact. Local parts of 3 chars or
+    # fewer are returned unchanged (nothing meaningful to mask). No '@' -> treat the whole string as
+    # the local part.  e.g. jsmith@contoso.com -> j***th@contoso.com
+    param([string] $Account)
+    if ([string]::IsNullOrWhiteSpace($Account)) { return $Account }
+    $atIndex = $Account.IndexOf("@")
+    if ($atIndex -ge 0) { $local = $Account.Substring(0, $atIndex); $domain = $Account.Substring($atIndex) }
+    else { $local = $Account; $domain = "" }
+    if ($local.Length -le 3) { return "$local$domain" }
+    $masked = $local.Substring(0, 1) + ("*" * ($local.Length - 3)) + $local.Substring($local.Length - 2, 2)
+    return "$masked$domain"
 }
 
 function Write-HelpText {
@@ -733,6 +794,7 @@ try {
     }
     catch { }
     $SignedInAccount = if ($meUpn) { $meUpn } else { (Get-AzContext).Account.Id }
+    $SignedInAccountMasked = Get-MaskedAccount $SignedInAccount
     $SqlSuffix = $SqlSuffix.TrimStart(".")
 
     # Private DNS zones the installer creates/links for a private deployment (suffixes are
@@ -797,10 +859,29 @@ try {
                 Write-Host -ForegroundColor "Yellow" "  '$Location' is not a valid region for this subscription."
             }
             do {
-                $Location = ((Read-Host -Prompt "Enter the Azure region for the temporary test resources (e.g. eastus)") -replace "\s", "").ToLower()
+                $regionRaw = (Read-Host -Prompt "Enter the Azure region for the temporary test resources (e.g. eastus, or '?' to list all)").Trim()
+                if ($regionRaw -eq "?" -or $regionRaw -ieq "list") {
+                    if ($validRegions.Count -gt 0) {
+                        Write-Host ""
+                        Write-Host -ForegroundColor "Cyan" "  Valid Azure regions for this subscription:"
+                        $sortedRegions = $validRegions | Sort-Object
+                        $colWidth = 28; $perRow = [Math]::Max(1, [Math]::Floor(110 / $colWidth))
+                        for ($ri = 0; $ri -lt $sortedRegions.Count; $ri += $perRow) {
+                            $row = $sortedRegions[$ri..([Math]::Min($ri + $perRow - 1, $sortedRegions.Count - 1))]
+                            Write-Host ("    " + (($row | ForEach-Object { $_.PadRight($colWidth) }) -join ""))
+                        }
+                        Write-Host ""
+                    }
+                    else {
+                        Write-Host -ForegroundColor "Yellow" "  Region list unavailable (could not query Get-AzLocation). Enter the region name, e.g. eastus."
+                    }
+                    $Location = $null
+                    continue
+                }
+                $Location = ($regionRaw -replace "\s", "").ToLower()
                 if ([string]::IsNullOrWhiteSpace($Location)) { continue }
                 if ($validRegions.Count -gt 0 -and $validRegions -notcontains $Location) {
-                    Write-Host -ForegroundColor "Yellow" "  '$Location' is not a valid region. Examples: $((($validRegions | Sort-Object | Select-Object -First 8) -join ', '))..."
+                    Write-Host -ForegroundColor "Yellow" "  '$Location' is not a valid region. Type '?' to list all valid regions."
                     $Location = $null
                 }
             } while ([string]::IsNullOrWhiteSpace($Location))
@@ -1128,10 +1209,10 @@ try {
             else {
                 "The resource group could not be created$(if ($Tags.Count -gt 0) { ' (this often indicates a required-tag/tag-value Deny policy - review the supplied tags)' }). Could not identify the specific policy from the ARM error or the Activity Log after waiting up to 5 minutes for ingestion - check the Activity Log manually for '$ResourceGroupName'."
             }
-            Add-Result -Category "Deployability" -Check "Resource group creation" -Result "Fail" -Detail $detail -PolicyName $policyName -Message $policyInfo.Message
+            Add-Result -Category "Deployability" -Check "Resource group creation" -Result "Fail" -Detail $detail -PolicyName $policyName -Message (Get-ConciseErrorMessage -RawMessage $rgErrMsg) -RawMessage $rgErrMsg
             # We return before the ConfigSummary is normally populated, so record enough here that the
             # report still shows the SE what was attempted.
-            $ConfigSummary["Run by (signed-in account)"] = $SignedInAccount
+            $ConfigSummary["Run by (signed-in account)"] = $SignedInAccountMasked
             $ConfigSummary["Subscription"] = "$($Context.Subscription.Name) ($SubscriptionId)"
             $ConfigSummary["Cloud"] = $AzEnv.Name
             $ConfigSummary["Region"] = $Location
@@ -1163,12 +1244,13 @@ try {
 
     # Record every input/response so the SE has a confirmed-working configuration to refer back to
     # once it's time to actually install NME.
-    $ConfigSummary["Run by (signed-in account)"] = $SignedInAccount
+    $ConfigSummary["Run by (signed-in account)"] = $SignedInAccountMasked
     $ConfigSummary["Subscription"] = "$($Context.Subscription.Name) ($SubscriptionId)"
     $ConfigSummary["Cloud"] = $AzEnv.Name
     $ConfigSummary["Region"] = $Location
     $ConfigSummary["Resource group"] = "$ResourceGroupName $(if ($PendingRgCreate) { '(created by this script)' } else { '(existing, user-supplied)' })"
     if ($Tags.Count -gt 0) { $ConfigSummary["Tags applied"] = (($Tags.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join "; ") } else { $ConfigSummary["Tags applied"] = "(none specified)" }
+    if ($PrivateEndpointOnly) { $ConfigSummary["Public network access on create"] = "Disabled (-PrivateEndpointOnly): Storage, SQL, and Key Vault created with public network access disabled" }
     if ($VnetInfoUnknown) {
         $ConfigSummary["Private endpoint scenario"] = "Planned - existing VNet, details not yet known; NOT tested. Re-run this script once VNet details are known."
     }
@@ -1296,14 +1378,32 @@ try {
         "Microsoft.DesktopVirtualization", "Microsoft.Insights",
         "Microsoft.Network", "Microsoft.OperationalInsights", "Microsoft.RecoveryServices",
         "Microsoft.Storage", "Microsoft.Sql", "Microsoft.Web")
+    # Fan the provider registration-state reads out concurrently (one ThreadJob per provider), then
+    # process results on the main thread in the original order so console/report ordering stays stable.
+    $rpJobs = @()
     foreach ($rp in $ResourceProviders) {
-        try {
-            $state = (Get-AzResourceProvider -ProviderNamespace $rp -ErrorAction Stop | Select-Object -First 1).RegistrationState
-            if ($state -eq "Registered") { Add-Result -Category "ResourceProviders" -Check $rp -Result "Pass" -Detail "Registered." }
-            else { Add-Result -Category "ResourceProviders" -Check $rp -Result "Warn" -Detail "Not registered (state: $state). Register before installing." }
+        $rpJobs += Start-ThreadJob -Name "Rp-$rp" -ScriptBlock {
+            param($rp)
+            try {
+                $state = (Get-AzResourceProvider -ProviderNamespace $rp -ErrorAction Stop | Select-Object -First 1).RegistrationState
+                @{ Rp = $rp; Ok = $true; State = $state }
+            }
+            catch {
+                @{ Rp = $rp; Ok = $false; Error = $_.Exception.Message }
+            }
+        } -ArgumentList $rp
+    }
+    $rpJobResults = $rpJobs | Wait-Job | Receive-Job
+    $rpJobs | Remove-Job -Force -ErrorAction SilentlyContinue
+    foreach ($rp in $ResourceProviders) {
+        $rr = $rpJobResults | Where-Object { $_.Rp -eq $rp } | Select-Object -First 1
+        if ($rr -and $rr.Ok) {
+            if ($rr.State -eq "Registered") { Add-Result -Category "ResourceProviders" -Check $rp -Result "Pass" -Detail "Registered." }
+            else { Add-Result -Category "ResourceProviders" -Check $rp -Result "Warn" -Detail "Not registered (state: $($rr.State)). Register before installing." }
         }
-        catch {
-            Add-Result -Category "ResourceProviders" -Check $rp -Result "Warn" -Detail "Could not query registration state." -Message $_.Exception.Message
+        else {
+            $rpErr = if ($rr) { $rr.Error } else { "No result returned from the registration-state query job." }
+            Add-Result -Category "ResourceProviders" -Check $rp -Result "Warn" -Detail "Could not query registration state." -Message $rpErr
         }
     }
 
@@ -1316,6 +1416,11 @@ try {
 
     #region Deployability tests (parallel) -------------------------------------------------------
     Write-Host -ForegroundColor "Cyan" "Testing resource deployability (in parallel). This will take several minutes..."
+
+    # -PrivateEndpointOnly forces the resources that support a create-time public-access flag (Storage,
+    # SQL, Key Vault) to deploy with public network access disabled from the start, for environments
+    # that reject public-endpoint creation outright.
+    $pna = if ($PrivateEndpointOnly) { "Disabled" } else { "Enabled" }
 
     # Each job returns @{ Target; Ok; Error }. Az context is shared into the thread via -UseNewRunspace:$false default of ThreadJob.
     $jobs = @()
@@ -1336,10 +1441,10 @@ try {
     } -ArgumentList $ResourceGroupName, $lawName, $Location, $Tags
 
     $jobs += Start-ThreadJob -Name "Storage" -ScriptBlock {
-        param($rg, $name, $loc, $sku, $tags)
+        param($rg, $name, $loc, $sku, $tags, $pna)
         try {
             New-AzStorageAccount -ResourceGroupName $rg -Name $name -Location $loc -SkuName $sku -Kind "StorageV2" -AccessTier "Hot" `
-                -MinimumTlsVersion "TLS1_2" -AllowBlobPublicAccess $false -AllowSharedKeyAccess $true -EnableHttpsTrafficOnly $true -PublicNetworkAccess "Enabled" -Tag $tags -ErrorAction Stop | Out-Null
+                -MinimumTlsVersion "TLS1_2" -AllowBlobPublicAccess $false -AllowSharedKeyAccess $true -EnableHttpsTrafficOnly $true -PublicNetworkAccess $pna -Tag $tags -ErrorAction Stop | Out-Null
             @{ Target = "Storage account ($sku)"; Ok = $true; Name = $name; Kind = "storage" }
         }
         catch {
@@ -1352,13 +1457,13 @@ try {
             try { if ($_.Exception.Body) { $errMsg = "$errMsg`n$($_.Exception.Body | ConvertTo-Json -Depth 10 -Compress)" } } catch {}
             @{ Target = "Storage account ($sku)"; Ok = $false; Error = $errMsg; Name = $name; Kind = "storage" }
         }
-    } -ArgumentList $ResourceGroupName, $stName, $Location, $StorageSku, $Tags
+    } -ArgumentList $ResourceGroupName, $stName, $Location, $StorageSku, $Tags, $pna
 
     $jobs += Start-ThreadJob -Name "Sql" -ScriptBlock {
-        param($rg, $name, $loc, $cred, $tags)
+        param($rg, $name, $loc, $cred, $tags, $pna)
         try {
             New-AzSqlServer -ResourceGroupName $rg -ServerName $name -Location $loc -ServerVersion "12.0" -MinimalTlsVersion "1.2" `
-                -PublicNetworkAccess "Enabled" -SqlAdministratorCredentials $cred -Tag $tags -ErrorAction Stop | Out-Null
+                -PublicNetworkAccess $pna -SqlAdministratorCredentials $cred -Tag $tags -ErrorAction Stop | Out-Null
             @{ Target = "SQL Server"; Ok = $true; Name = $name; Kind = "sqlserver" }
         }
         catch {
@@ -1371,7 +1476,7 @@ try {
             try { if ($_.Exception.Body) { $errMsg = "$errMsg`n$($_.Exception.Body | ConvertTo-Json -Depth 10 -Compress)" } } catch {}
             @{ Target = "SQL Server"; Ok = $false; Error = $errMsg; Name = $name; Kind = "sqlserver" }
         }
-    } -ArgumentList $ResourceGroupName, $sqlName, $Location, $sqlCred, $Tags
+    } -ArgumentList $ResourceGroupName, $sqlName, $Location, $sqlCred, $Tags, $pna
 
     $jobs += Start-ThreadJob -Name "AppServicePlan" -ScriptBlock {
         param($rg, $name, $loc, $tags)
@@ -1393,9 +1498,25 @@ try {
     } -ArgumentList $ResourceGroupName, $aspName, $Location, $Tags
 
     $jobs += Start-ThreadJob -Name "KeyVault" -ScriptBlock {
-        param($rg, $name, $loc, $tags)
+        param($rg, $name, $loc, $tags, $pna)
         try {
-            New-AzKeyVault -ResourceGroupName $rg -VaultName $name -Location $loc -Sku "Standard" -SoftDeleteRetentionInDays 90 -DisableRbacAuthorization -Tag $tags -ErrorAction Stop | Out-Null
+            $kvParams = @{ ResourceGroupName = $rg; VaultName = $name; Location = $loc; Sku = "Standard"; SoftDeleteRetentionInDays = 90; DisableRbacAuthorization = $true; Tag = $tags; ErrorAction = "Stop" }
+            if ($pna -eq "Disabled") {
+                try { New-AzKeyVault @kvParams -PublicNetworkAccess "Disabled" | Out-Null }
+                catch {
+                    # Only fall back for the specific "older Az.KeyVault has no -PublicNetworkAccess on
+                    # create" case, identified by PowerShell's canonical parameter-binding error. Do NOT
+                    # match on the bare property name "publicNetworkAccess" - an Azure Policy DENIAL message
+                    # references that property too, and treating a real policy block as a missing-parameter
+                    # would (briefly) create a public Key Vault instead of surfacing the block as a Fail.
+                    if ($_.Exception -is [System.Management.Automation.ParameterBindingException] -or "$($_.Exception.Message)" -match "A parameter cannot be found that matches parameter name") {
+                        New-AzKeyVault @kvParams | Out-Null
+                        Update-AzKeyVault -VaultName $name -ResourceGroupName $rg -PublicNetworkAccess "Disabled" -ErrorAction Stop | Out-Null
+                    }
+                    else { throw }
+                }
+            }
+            else { New-AzKeyVault @kvParams | Out-Null }
             @{ Target = "Key Vault"; Ok = $true; Name = $name; Kind = "kv" }
         }
         catch {
@@ -1408,7 +1529,7 @@ try {
             try { if ($_.Exception.Body) { $errMsg = "$errMsg`n$($_.Exception.Body | ConvertTo-Json -Depth 10 -Compress)" } } catch {}
             @{ Target = "Key Vault"; Ok = $false; Error = $errMsg; Name = $name; Kind = "kv" }
         }
-    } -ArgumentList $ResourceGroupName, $kvName, $Location, $Tags
+    } -ArgumentList $ResourceGroupName, $kvName, $Location, $Tags, $pna
 
     # NME deploys two Automation Accounts (an updater account with a system-assigned identity, and a
     # scripted-actions account with no identity) - test both, matching the installer template.
@@ -1466,8 +1587,9 @@ try {
             $p = Get-PolicyFromError -ExceptionMessage $jr.Error
             $pDisplayHint = if ($p.PolicyAssignmentDisplayName) { $p.PolicyAssignmentDisplayName } elseif ($p.PolicyDefinitionDisplayName) { $p.PolicyDefinitionDisplayName } else { $null }
             $polName = Resolve-PolicyName -PolicyDefinitionId $p.PolicyDefinitionId -PolicyAssignmentId $p.PolicyAssignmentId -PolicySetDefinitionId $p.PolicySetDefinitionId -DisplayNameHint $pDisplayHint
-            $detail = if ($polName) { "Blocked by Azure Policy: '$polName'." } else { "Failed: $($p.Message)" }
-            Add-Result -Category "Deployability" -Check $jr.Target -Result "Fail" -Detail $detail -PolicyName $polName -Message $p.Message
+            $concise = Get-ConciseErrorMessage -RawMessage $jr.Error
+            $detail = if ($polName) { "Blocked by Azure Policy: '$polName'." } else { "Failed: $concise" }
+            Add-Result -Category "Deployability" -Check $jr.Target -Result "Fail" -Detail $detail -PolicyName $polName -Message $concise -RawMessage $jr.Error
         }
     }
 
@@ -1497,8 +1619,9 @@ try {
                 $p = Get-PolicyFromError -ExceptionMessage $kvToggleErrMsg
                 $pDisplayHint = if ($p.PolicyAssignmentDisplayName) { $p.PolicyAssignmentDisplayName } elseif ($p.PolicyDefinitionDisplayName) { $p.PolicyDefinitionDisplayName } else { $null }
                 $polName = Resolve-PolicyName -PolicyDefinitionId $p.PolicyDefinitionId -PolicyAssignmentId $p.PolicyAssignmentId -PolicySetDefinitionId $p.PolicySetDefinitionId -DisplayNameHint $pDisplayHint
-                $detail = if ($polName) { "Blocked by Azure Policy: '$polName'." } else { "Failed: $($p.Message)" }
-                Add-Result -Category "Deployability" -Check "Key Vault temporary public access (install step)" -Result "Fail" -Detail $detail -PolicyName $polName -Message $p.Message
+                $concise = Get-ConciseErrorMessage -RawMessage $kvToggleErrMsg
+                $detail = if ($polName) { "Blocked by Azure Policy: '$polName'." } else { "Failed: $concise" }
+                Add-Result -Category "Deployability" -Check "Key Vault temporary public access (install step)" -Result "Fail" -Detail $detail -PolicyName $polName -Message $concise -RawMessage $kvToggleErrMsg
             }
         }
         # Revert to the hardened end-state (best-effort/cosmetic; the KV is deleted at cleanup anyway).
@@ -1523,8 +1646,9 @@ try {
             $p = Get-PolicyFromError -ExceptionMessage $sqlErrMsg
             $pDisplayHint = if ($p.PolicyAssignmentDisplayName) { $p.PolicyAssignmentDisplayName } elseif ($p.PolicyDefinitionDisplayName) { $p.PolicyDefinitionDisplayName } else { $null }
             $polName = Resolve-PolicyName -PolicyDefinitionId $p.PolicyDefinitionId -PolicyAssignmentId $p.PolicyAssignmentId -PolicySetDefinitionId $p.PolicySetDefinitionId -DisplayNameHint $pDisplayHint
-            $detail = if ($polName) { "Blocked by Azure Policy: '$polName'." } else { "Failed: $($p.Message)" }
-            Add-Result -Category "Deployability" -Check "SQL Database (Standard S1, DTU)" -Result "Fail" -Detail $detail -PolicyName $polName -Message $p.Message
+            $concise = Get-ConciseErrorMessage -RawMessage $sqlErrMsg
+            $detail = if ($polName) { "Blocked by Azure Policy: '$polName'." } else { "Failed: $concise" }
+            Add-Result -Category "Deployability" -Check "SQL Database (Standard S1, DTU)" -Result "Fail" -Detail $detail -PolicyName $polName -Message $concise -RawMessage $sqlErrMsg
         }
     }
     else {
@@ -1532,6 +1656,15 @@ try {
     }
     Write-Host ""
     #endregion
+
+    # If the customer intends a private VNet but didn't have the VNet/subnet details at intake, the
+    # private endpoint / DNS / VNet-integration checks can't run - surface that as WARN (not an
+    # implicit PASS from simply skipping them) so the report flags the still-to-validate work.
+    if ($VnetInfoUnknown) {
+        Add-Result -Category "PrivateEndpoint" -Check "Private endpoint deployment" -Result "Warn" -Detail "Not validated - private VNet intended but VNet/subnet details were not known at test time. Re-run this script once the VNet exists to validate private endpoints."
+        Add-Result -Category "PrivateDns" -Check "Private DNS zones" -Result "Warn" -Detail "Not validated - VNet details were not known at test time. Confirm the required private DNS zones exist and are linked once the VNet is available."
+        Add-Result -Category "Connectivity" -Check "App Service VNet integration" -Result "Warn" -Detail "Not validated - VNet details were not known at test time. Re-run once the VNet/subnets are available."
+    }
 
     #region Private endpoint + DNS ---------------------------------------------------------------
     if ($TestPrivate) {
@@ -1691,8 +1824,9 @@ try {
                         $p = Get-PolicyFromError -ExceptionMessage $zoneErrMsg
                         $pDisplayHint = if ($p.PolicyAssignmentDisplayName) { $p.PolicyAssignmentDisplayName } elseif ($p.PolicyDefinitionDisplayName) { $p.PolicyDefinitionDisplayName } else { $null }
                         $polName = Resolve-PolicyName -PolicyDefinitionId $p.PolicyDefinitionId -PolicyAssignmentId $p.PolicyAssignmentId -PolicySetDefinitionId $p.PolicySetDefinitionId -DisplayNameHint $pDisplayHint
-                        $detail = if ($polName) { "Blocked by Azure Policy: '$polName'." } else { "Failed to test-create: $($p.Message)" }
-                        Add-Result -Category "PrivateDns" -Check "Private DNS zone: $($rz.Zone)" -Result "Fail" -Detail $detail -PolicyName $polName -Message $p.Message
+                        $concise = Get-ConciseErrorMessage -RawMessage $zoneErrMsg
+                        $detail = if ($polName) { "Blocked by Azure Policy: '$polName'." } else { "Failed to test-create: $concise" }
+                        Add-Result -Category "PrivateDns" -Check "Private DNS zone: $($rz.Zone)" -Result "Fail" -Detail $detail -PolicyName $polName -Message $concise -RawMessage $zoneErrMsg
                     }
                 }
             }
@@ -1788,8 +1922,9 @@ try {
                         $p = Get-PolicyFromError -ExceptionMessage $peErrMsgOut
                         $pDisplayHint = if ($p.PolicyAssignmentDisplayName) { $p.PolicyAssignmentDisplayName } elseif ($p.PolicyDefinitionDisplayName) { $p.PolicyDefinitionDisplayName } else { $null }
                         $polName = Resolve-PolicyName -PolicyDefinitionId $p.PolicyDefinitionId -PolicyAssignmentId $p.PolicyAssignmentId -PolicySetDefinitionId $p.PolicySetDefinitionId -DisplayNameHint $pDisplayHint
-                        $detail = if ($polName) { "Blocked by Azure Policy: '$polName'." } else { "Failed: $($p.Message)" }
-                        Add-Result -Category "PrivateEndpoint" -Check "Private endpoint: $($svc.Service)" -Result "Fail" -Detail $detail -PolicyName $polName -Message $p.Message
+                        $concise = Get-ConciseErrorMessage -RawMessage $peErrMsgOut
+                        $detail = if ($polName) { "Blocked by Azure Policy: '$polName'." } else { "Failed: $concise" }
+                        Add-Result -Category "PrivateEndpoint" -Check "Private endpoint: $($svc.Service)" -Result "Fail" -Detail $detail -PolicyName $polName -Message $concise -RawMessage $peErrMsgOut
                     }
                 }
             }

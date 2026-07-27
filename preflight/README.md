@@ -33,6 +33,22 @@ Connect-AzAccount -UseDeviceAuthentication
 .\Test-NmeDeploymentReadiness.ps1 -SubscriptionId "00000000-0000-0000-0000-000000000000"
 ```
 
+### Parameters
+
+All parameters are optional; you are prompted interactively for anything omitted.
+
+* `-SubscriptionId` – target subscription id (GUID).
+* `-ResourceGroupName` – an existing **empty** resource group to test in. If omitted, a temporary `rg-nme-preflight-<rand>` is created and removed at the end.
+* `-Location` – Azure region for the created resources / temporary resource group. At the region prompt you can type `?` (or `list`) to print all valid Azure region names for the subscription, then re-enter your choice.
+* `-OutFile` – path for the JSON results file (defaults to `NmeReadinessOutput.json` in the working directory). The HTML report is written alongside it with the same base name.
+* `-PrivateEndpointOnly` – **script-level switch** (not an interactive question) for environments that reject creating resources with public network access enabled at all. When set, the throwaway **Storage account, SQL Server, and Key Vault** are created with public network access **disabled from the start**, so a policy that blocks public-endpoint creation is surfaced up front. The Key Vault "briefly enable public access" install step is still exercised (the vault is toggled public and back), since the real installer performs it. Log Analytics and Automation are created normally (their create cmdlets don't expose a create-time public-access toggle). Example:
+
+  ```powershell
+  .\Test-NmeDeploymentReadiness.ps1 -SubscriptionId "00000000-0000-0000-0000-000000000000" -PrivateEndpointOnly
+  ```
+
+The signed-in account is **masked** wherever it appears in the report (the username local part is obscured, e.g. `jsmith@contoso.com` → `j***th@contoso.com`); the domain is left intact.
+
 ### Requirements
 
 * PowerShell 7 (pre-installed in Azure Cloud Shell)
@@ -42,11 +58,8 @@ Connect-AzAccount -UseDeviceAuthentication
 
 ### Future enhancements
 
-* **Private-endpoint-only deployment mode.** Some customer environments block resources from being created with public network access enabled at all, which is how the script currently deploys its test resources. Add a mode/switch that forces all test resources to deploy with public endpoints disabled from the start, for environments that reject public-endpoint creation outright.
-* **Tag resources for re-run/resume support.** Tag created resources (e.g. with a run ID) so a later invocation targeting the same resource group can find them and pick up/retest anything that previously failed, instead of starting over.
-* **Re-testable DNS/connectivity checks against an existing VNet.** When deploying into an existing customer VNet, the customer may want to keep the test resources around and re-run just the DNS resolution/connectivity checks after changing DNS records or firewall rules. If those checks fail, offer to re-run them before the script exits, and have future runs detect existing resources tied to that VNet and offer to re-run just the network tests against them.
-* **Region help option at the region prompt.** Customers often don't know the exact Azure region name to type. Add a help option (e.g. typing `?` or `list`) at the region prompt that lists all valid Azure region names (from `Get-AzLocation`) as a reference, then re-prompts for the region.
-* **Obfuscate the signed-in username when recorded/displayed.** The signed-in account's username is currently recorded in full. Mask the local part (everything before the `@`), keeping only the first 1 and last 2 characters and replacing the rest with `*`, while leaving the domain name intact (e.g. `jsmith@contoso.com` becomes `j***th@contoso.com`).
+* **Re-testable DNS/connectivity checks against an existing VNet.** When deploying into an existing customer VNet, or to a new vnet using custom dns servers, the customer may want to keep the test resources around and re-run just the DNS resolution/connectivity checks after changing DNS records or firewall rules. If those checks fail, offer to re-run them before the script exits, and have future runs detect existing resources tied to that VNet and offer to re-run just the network tests against them.
+* **DNS resolution test/warning.** If the script will create both the vnet and the private dns zones, we don't need to worry about dns resolution. If using existing vnet, we want to test dns resolution. If DNS resolution has not been tested, as in the case where the user doesn't yet have the vnet info, or the script is creating the vnet but the vnet will use custom dns servers, we want the report to WARN that DNS resolution is untested. These are cases where we want to present the option to test DNS after the initial script finishes, as in the above item.
 
 ---
 
