@@ -951,7 +951,7 @@ try {
 
         $vnetChoice = Read-Choice -Prompt "Will you deploy to an EXISTING VNet?" -Options @(
             "Use an EXISTING VNet (you provide RG, VNet, and both subnet names)",
-            "Create a NEW VNet for Nerdio Manager (this script creates and later deletes a vnet. The NME deployment process will create a new VNet during installation as well. You will be able to specify the address space for the actual deployment.)",
+            "Create a NEW VNet for Nerdio Manager (this script creates and later deletes a vnet. You will be able to specify the address space for the actual deployment.)",
             "I don't know yet - the VNet hasn't been created yet"
         ) -Default 2 -Help "NME can be deployed to a new VNet created during deployment, which simplifies DNS and networking - this is the preferred/default deployment. Deploying into an EXISTING VNet is recommended when your organization requires routing all traffic through centralized firewalls. `r`n`r`nSelecting an EXISTING VNet tests against the real network NME will use - its subnets, DNS settings, and any private DNS zone links - so the result of this test reflects your production topology. You must provide the VNet's resource group, its name, a subnet for private endpoints, and a separate subnet delegated to Microsoft.Web/serverFarms for App Service integration. `r`n`r`nA NEW VNet lets the script prove the resources CAN be created (VNet, subnets, delegation, private endpoint) in a clean 10.60.0.0/16 space it creates and then deletes. `r`n`r`nIf you plan to use your own existing VNet but haven't created it yet, choose the third option - the script will skip private endpoint / VNet integration testing this run, but you must have the VNet's resource group, name, and subnet names ready before the actual NME POV installation."
         if ($vnetChoice -eq 1) {
@@ -1017,7 +1017,7 @@ try {
                     ) -Default 2 -Help "NME's private endpoints need these Azure Private DNS zones, linked to the VNet, to resolve to private IPs: `r`n`r`nprivatelink.database.windows.net (SQL)`r`nprivatelink.vaultcore.azure.net (Key Vault)`r`nprivatelink.blob.core.windows.net (Storage)`r`nprivatelink.azurewebsites.net (App Service)`r`nprivatelink.azure-automation.net (Automation)`n`r`n`r`nEXISTING: your org already manages these zones centrally (common with hub/spoke + Azure Policy auto-registration) - you will be asked to provide the subscription and resource group that holds them, and this script reports which required zones are MISSING there. `r`n`r`nNEW: NME's deployment (or the Enable Private Endpoints runbook) will create and link the zones for you - this script only tests that the required zones CAN be created (in the throwaway test resource group) and does NOT link them to your VNet; the real installer/runbook creates and links them at deploy time. (Gov/China clouds use the equivalent .us/.cn zone names, derived automatically.) `r`n`r`nIf you'll use EXISTING zones but don't yet know their subscription/resource group, choose the third option - this script will skip the zone verification this run, but you must have that information ready before the actual NME POV installation."
                     if ($dnsZonesChoice -eq 1) {
                         $PrivateDnsZonesMode = "Existing"
-                        do { $PrivateDnsZoneSubId = Read-Host -Prompt "    Subscription ID where the Azure Private DNS zones live" } while ([string]::IsNullOrWhiteSpace($PrivateDnsZoneSubId))
+                        do { $PrivateDnsZoneSubId = Read-Host -Prompt "    Subscription ID where the Azure Private DNS zones live" } while ($PrivateDnsZoneSubId -notmatch "^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$")
                         do { $PrivateDnsZoneRg = Read-Host -Prompt "    Resource group name for the Azure Private DNS zones" } while ([string]::IsNullOrWhiteSpace($PrivateDnsZoneRg))
                         $ConfigSummary["Private DNS zones plan"] = "Existing (subscription '$PrivateDnsZoneSubId', resource group '$PrivateDnsZoneRg')"
                     }
@@ -1070,7 +1070,7 @@ try {
                 ) -Default 2 -Help "NME's private endpoints need these Azure Private DNS zones, linked to the VNet, to resolve to private IPs: privatelink.database.windows.net (SQL), privatelink.vaultcore.azure.net (Key Vault), privatelink.blob.core.windows.net (Storage), privatelink.azurewebsites.net (App Service), privatelink.azure-automation.net (Automation). `r`n`r`n`r`n`r`nEXISTING: your org already manages these zones centrally (common with hub/spoke + Azure Policy auto-registration) - provide the subscription and resource group that holds them, and this script reports which required zones are MISSING there. `r`n`r`n`r`n`r`nNEW: NME's deployment (or the Enable Private Endpoints runbook) creates and links the zones for you - this script only tests that the required zones CAN be created (in the throwaway test resource group) and does NOT link them to your VNet; the real installer/runbook creates and links them at deploy time. (Gov/China clouds use the equivalent .us/.cn zone names, derived automatically.) `r`n`r`n`r`n`r`nIf you'll use EXISTING zones but don't yet know their subscription/resource group, choose the third option - this script will skip the zone verification this run, but you must have that information ready before the actual NME POV installation."
                 if ($dnsZonesChoice -eq 1) {
                     $PrivateDnsZonesMode = "Existing"
-                    do { $PrivateDnsZoneSubId = Read-Host -Prompt "    Subscription ID where the Azure Private DNS zones live" } while ([string]::IsNullOrWhiteSpace($PrivateDnsZoneSubId))
+                    do { $PrivateDnsZoneSubId = Read-Host -Prompt "    Subscription ID where the Azure Private DNS zones live" } while ($PrivateDnsZoneSubId -notmatch "^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$")
                     do { $PrivateDnsZoneRg = Read-Host -Prompt "    Resource group name for the Azure Private DNS zones" } while ([string]::IsNullOrWhiteSpace($PrivateDnsZoneRg))
                     $ConfigSummary["Private DNS zones plan"] = "Existing (subscription '$PrivateDnsZoneSubId', resource group '$PrivateDnsZoneRg')"
                     $ConfigSummary["Private DNS resolution (new VNet)"] = "Azure Private DNS Zones - subscription '$PrivateDnsZoneSubId', resource group '$PrivateDnsZoneRg' (recorded only; not verified or modified by this script)"
@@ -1311,7 +1311,7 @@ try {
     #endregion
 
     #region Fast checks --------------------------------------------------------------------------
-    Write-Host -ForegroundColor "Cyan" "Running permission and resource provider checks..."
+    Write-Host -ForegroundColor "Cyan" "Running permission check..."
 
     # Entra directory roles WITHOUT the Microsoft.Graph module.
     # Invoke-AzRestMethod (Az.Accounts) reuses the existing Connect-AzAccount token and calls Graph
@@ -1414,6 +1414,7 @@ try {
     # Resource providers.
     # Providers the installer template deploys, plus the ones NME needs to operate post-install
     # (Compute = session-host VMs, DesktopVirtualization = AVD host pools, RecoveryServices = backup).
+    Write-Host -ForegroundColor "Cyan" -NoNewline "Running resource provider check..."
     $ResourceProviders = @("Microsoft.KeyVault", "Microsoft.Automation", "Microsoft.Compute",
         "Microsoft.DesktopVirtualization", "Microsoft.Insights",
         "Microsoft.Network", "Microsoft.OperationalInsights", "Microsoft.RecoveryServices",
@@ -1433,7 +1434,14 @@ try {
             }
         } -ArgumentList $rp
     }
-    $rpJobResults = $rpJobs | Wait-Job | Receive-Job
+    # Wait-Job blocks silently until every job finishes, which can take a while - poll instead so a
+    # dot can be printed every couple seconds to show the check is still alive.
+    while ($rpJobs | Where-Object { $_.State -eq "Running" }) {
+        Start-Sleep -Seconds 2
+        Write-Host -ForegroundColor "Cyan" -NoNewline "."
+    }
+    Write-Host ""
+    $rpJobResults = $rpJobs | Receive-Job
     $rpJobs | Remove-Job -Force -ErrorAction SilentlyContinue
     foreach ($rp in $ResourceProviders) {
         $rr = $rpJobResults | Where-Object { $_.Rp -eq $rp } | Select-Object -First 1
