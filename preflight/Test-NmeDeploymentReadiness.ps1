@@ -121,6 +121,226 @@ function Add-TrackedResource {
         }) | Out-Null
 }
 
+#region Report rendering (shared palette -> console ANSI + HTML) -----------------------------------
+# One palette drives both the on-screen ANSI table and the HTML file so the two look the same.
+# Hex values are used verbatim in the HTML; the same RGB triplets colour the ANSI status pills.
+$script:StatusStyle = @{
+    Pass = @{ Label = "PASS"; Symbol = [char]0x2713; Rgb = @(45, 164, 78);  Hex = "#2da44e" }
+    Fail = @{ Label = "FAIL"; Symbol = "x";           Rgb = @(229, 72, 77); Hex = "#e5484d" }
+    Warn = @{ Label = "WARN"; Symbol = "!";           Rgb = @(210, 153, 34); Hex = "#d29922" }
+    Info = @{ Label = "INFO"; Symbol = "i";           Rgb = @(59, 130, 246); Hex = "#3b82f6" }
+}
+
+# Whether we can emit ANSI colour. PowerShell 7 in Cloud Shell supports it; honour NO_COLOR and a
+# non-VT host so redirected/piped output stays clean plain text.
+$script:UseAnsi = $false
+try {
+    $script:UseAnsi = [string]::IsNullOrEmpty($env:NO_COLOR) -and
+        ($Host.UI.SupportsVirtualTerminal -or $env:TERM -or $env:ACC_CLOUD)
+}
+catch { $script:UseAnsi = $false }
+
+# Are we running inside Azure Cloud Shell? Used to auto-trigger a browser download of the report.
+$script:IsCloudShell = -not [string]::IsNullOrEmpty($env:ACC_CLOUD) -or
+    ($env:AZUREPS_HOST_ENVIRONMENT -like "cloud-shell*")
+
+function Get-ReadinessVerdict {
+    # Overall verdict from the result set: any Fail -> FAIL; else any Warn -> WARN; else PASS.
+    param([System.Collections.IEnumerable] $Results)
+    $hasFail = $false; $hasWarn = $false
+    foreach ($r in $Results) {
+        if ($r.Result -eq "Fail") { $hasFail = $true }
+        elseif ($r.Result -eq "Warn") { $hasWarn = $true }
+    }
+    if ($hasFail) { return "Fail" }
+    elseif ($hasWarn) { return "Warn" }
+    else { return "Pass" }
+}
+
+function ConvertTo-HtmlText {
+    param([string] $Text)
+    if ($null -eq $Text) { return "" }
+    return ($Text -replace "&", "&amp;" -replace "<", "&lt;" -replace ">", "&gt;" -replace '"', "&quot;")
+}
+
+function New-ReadinessHtmlReport {
+    # Builds a single self-contained HTML document (inline CSS, no external assets) from the same
+    # data the JSON and console report use, so it renders identically offline and can be emailed.
+    param(
+        [System.Collections.IEnumerable] $Results,
+        [System.Collections.Specialized.OrderedDictionary] $ConfigSummary,
+        [System.Collections.Specialized.OrderedDictionary] $CustomResourceNames,
+        [object] $Meta,
+        [System.Collections.IEnumerable] $CreatedResources,
+        [string] $RawJson
+    )
+    $verdict = Get-ReadinessVerdict -Results $Results
+    $vStyle = $script:StatusStyle[$verdict]
+    $counts = @{ Pass = 0; Fail = 0; Warn = 0; Info = 0 }
+    foreach ($r in $Results) { if ($counts.ContainsKey($r.Result)) { $counts[$r.Result]++ } }
+
+    $sb = [System.Text.StringBuilder]::new()
+    [void]$sb.AppendLine('<!DOCTYPE html>')
+    [void]$sb.AppendLine('<html lang="en"><head><meta charset="utf-8">')
+    [void]$sb.AppendLine('<meta name="viewport" content="width=device-width, initial-scale=1">')
+    [void]$sb.AppendLine('<title>NME Deployment Readiness Report</title>')
+    [void]$sb.AppendLine('<style>')
+    [void]$sb.AppendLine(@"
+:root{color-scheme:light dark;--bg:#ffffff;--fg:#1f2328;--muted:#656d76;--card:#f6f8fa;--border:#d0d7de;
+--pass:$($script:StatusStyle.Pass.Hex);--fail:$($script:StatusStyle.Fail.Hex);--warn:$($script:StatusStyle.Warn.Hex);--info:$($script:StatusStyle.Info.Hex);}
+@media (prefers-color-scheme:dark){:root{--bg:#0d1117;--fg:#e6edf3;--muted:#8b949e;--card:#161b22;--border:#30363d;}}
+*{box-sizing:border-box;}
+body{margin:0;padding:24px;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+background:var(--bg);color:var(--fg);line-height:1.45;}
+.wrap{max-width:1100px;margin:0 auto;}
+h1{font-size:22px;margin:0 0 4px;}
+.sub{color:var(--muted);font-size:13px;margin-bottom:20px;}
+.banner{border-radius:10px;padding:16px 20px;margin:18px 0;color:#fff;font-size:18px;font-weight:700;
+display:flex;align-items:center;gap:12px;}
+.chips{display:flex;flex-wrap:wrap;gap:8px;margin:14px 0 22px;}
+.chip{border:1px solid var(--border);border-radius:20px;padding:4px 12px;font-size:13px;font-weight:600;background:var(--card);}
+.chip .n{font-weight:700;}
+.meta,.cfg{width:100%;border-collapse:collapse;margin:8px 0 22px;font-size:13px;}
+.meta td,.cfg td{padding:6px 10px;border-bottom:1px solid var(--border);vertical-align:top;}
+.meta td:first-child,.cfg td:first-child{color:var(--muted);width:34%;white-space:nowrap;}
+h2{font-size:15px;margin:26px 0 8px;padding-bottom:6px;border-bottom:1px solid var(--border);}
+table.res{width:100%;border-collapse:collapse;font-size:13px;}
+table.res th{text-align:left;color:var(--muted);font-weight:600;padding:6px 10px;border-bottom:2px solid var(--border);}
+table.res td{padding:8px 10px;border-bottom:1px solid var(--border);vertical-align:top;}
+table.res tr:hover td{background:var(--card);}
+.pill{display:inline-block;min-width:52px;text-align:center;padding:2px 8px;border-radius:12px;color:#fff;
+font-size:11px;font-weight:700;letter-spacing:.03em;}
+.pill.Pass{background:var(--pass);}.pill.Fail{background:var(--fail);}.pill.Warn{background:var(--warn);}.pill.Info{background:var(--info);}
+.cat{color:var(--muted);white-space:nowrap;}
+.detail{color:var(--fg);}.reason{color:var(--muted);font-size:12px;margin-top:3px;white-space:pre-wrap;}
+.policy{display:inline-block;margin-top:3px;font-size:11px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+background:var(--card);border:1px solid var(--border);border-radius:4px;padding:1px 6px;}
+details{margin-top:26px;}summary{cursor:pointer;color:var(--muted);font-size:13px;}
+pre{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:12px;overflow:auto;font-size:12px;
+font-family:ui-monospace,SFMono-Regular,Menlo,monospace;}
+"@)
+    [void]$sb.AppendLine('</style></head><body><div class="wrap">')
+    [void]$sb.AppendLine('<h1>Nerdio Manager for Enterprise &ndash; Deployment Readiness Report</h1>')
+    [void]$sb.AppendLine("<div class=`"sub`">Generated $(ConvertTo-HtmlText $Meta.TimestampUtc)</div>")
+
+    $vColor = @{ Pass = "var(--pass)"; Fail = "var(--fail)"; Warn = "var(--warn)" }[$verdict]
+    $vText = @{ Pass = "READY &ndash; all checks passed"; Fail = "NOT READY &ndash; one or more checks failed"; Warn = "READY WITH WARNINGS &ndash; review the items below" }[$verdict]
+    [void]$sb.AppendLine("<div class=`"banner`" style=`"background:$vColor`"><span>$($vStyle.Symbol)</span><span>$vText</span></div>")
+
+    [void]$sb.AppendLine('<div class="chips">')
+    [void]$sb.AppendLine("<span class=`"chip`" style=`"border-color:var(--pass)`">Pass <span class=`"n`">$($counts.Pass)</span></span>")
+    [void]$sb.AppendLine("<span class=`"chip`" style=`"border-color:var(--warn)`">Warn <span class=`"n`">$($counts.Warn)</span></span>")
+    [void]$sb.AppendLine("<span class=`"chip`" style=`"border-color:var(--fail)`">Fail <span class=`"n`">$($counts.Fail)</span></span>")
+    [void]$sb.AppendLine("<span class=`"chip`" style=`"border-color:var(--info)`">Info <span class=`"n`">$($counts.Info)</span></span>")
+    [void]$sb.AppendLine('</div>')
+
+    # Run metadata.
+    [void]$sb.AppendLine('<table class="meta">')
+    foreach ($p in $Meta.PSObject.Properties) {
+        [void]$sb.AppendLine("<tr><td>$(ConvertTo-HtmlText $p.Name)</td><td>$(ConvertTo-HtmlText ([string]$p.Value))</td></tr>")
+    }
+    [void]$sb.AppendLine('</table>')
+
+    # Configuration used (reference for install).
+    if ($ConfigSummary -and $ConfigSummary.Count -gt 0) {
+        [void]$sb.AppendLine('<h2>Configuration used (reference for install)</h2><table class="cfg">')
+        foreach ($k in $ConfigSummary.Keys) {
+            $v = ([string]$ConfigSummary[$k]) -replace "[`r`n]+", " "
+            [void]$sb.AppendLine("<tr><td>$(ConvertTo-HtmlText $k)</td><td>$(ConvertTo-HtmlText $v)</td></tr>")
+        }
+        [void]$sb.AppendLine('</table>')
+    }
+    if ($CustomResourceNames -and $CustomResourceNames.Count -gt 0) {
+        [void]$sb.AppendLine('<h2>Custom resource names</h2><table class="cfg">')
+        foreach ($k in $CustomResourceNames.Keys) {
+            [void]$sb.AppendLine("<tr><td>$(ConvertTo-HtmlText $k)</td><td>$(ConvertTo-HtmlText ([string]$CustomResourceNames[$k]))</td></tr>")
+        }
+        [void]$sb.AppendLine('</table>')
+    }
+
+    # Check results.
+    [void]$sb.AppendLine('<h2>Check results</h2>')
+    [void]$sb.AppendLine('<table class="res"><thead><tr><th>Status</th><th>Category</th><th>Check</th><th>Detail</th></tr></thead><tbody>')
+    foreach ($r in $Results) {
+        $cls = if ($script:StatusStyle.ContainsKey($r.Result)) { $r.Result } else { "Info" }
+        $lbl = if ($script:StatusStyle.ContainsKey($r.Result)) { $script:StatusStyle[$r.Result].Label } else { $r.Result.ToUpper() }
+        $detailHtml = ConvertTo-HtmlText (($r.Detail -replace "[`r`n]+", " ").Trim())
+        if ($r.PolicyName) { $detailHtml += "<div class=`"policy`">Blocking policy: $(ConvertTo-HtmlText $r.PolicyName)</div>" }
+        if ($r.Message) { $detailHtml += "<div class=`"reason`">$(ConvertTo-HtmlText (($r.Message -replace "[`r`n]+", " ").Trim()))</div>" }
+        [void]$sb.AppendLine("<tr><td><span class=`"pill $cls`">$lbl</span></td><td class=`"cat`">$(ConvertTo-HtmlText $r.Category)</td><td>$(ConvertTo-HtmlText $r.Check)</td><td class=`"detail`">$detailHtml</td></tr>")
+    }
+    [void]$sb.AppendLine('</tbody></table>')
+
+    if ($RawJson) {
+        [void]$sb.AppendLine('<details><summary>Raw JSON (machine-readable detail)</summary><pre>')
+        [void]$sb.AppendLine((ConvertTo-HtmlText $RawJson))
+        [void]$sb.AppendLine('</pre></details>')
+    }
+    [void]$sb.AppendLine('</div></body></html>')
+    return $sb.ToString()
+}
+
+function Write-StatusPill {
+    # Emits a colour-filled status badge to the console (ANSI truecolor pill, or a plain [TOKEN]).
+    param([string] $Result)
+    $style = if ($script:StatusStyle.ContainsKey($Result)) { $script:StatusStyle[$Result] } else { $script:StatusStyle.Info }
+    $label = " {0} " -f $style.Label
+    if ($script:UseAnsi) {
+        $e = [char]27
+        $rgb = $style.Rgb
+        Write-Host -NoNewline ("{0}[48;2;{1};{2};{3};38;2;255;255;255;1m{4}{0}[0m" -f $e, $rgb[0], $rgb[1], $rgb[2], $label)
+    }
+    else {
+        Write-Host -NoNewline ("[{0}]" -f $style.Label)
+    }
+}
+
+function Write-ConsoleResultsTable {
+    # Renders $Results as a colour-coded table that mirrors the HTML: a status pill, the category,
+    # then the check + detail wrapped into the remaining terminal width.
+    param([System.Collections.IEnumerable] $Results)
+    $width = 120
+    try { if ($Host.UI.RawUI.WindowSize.Width -gt 40) { $width = $Host.UI.RawUI.WindowSize.Width - 1 } } catch {}
+
+    $pillWidth = 7   # " FAIL " padded to a uniform column, plus a trailing gap
+    $catWidth = [Math]::Min(14, (($Results | ForEach-Object { $_.Category.Length } | Measure-Object -Maximum).Maximum))
+    $textWidth = [Math]::Max(30, $width - $pillWidth - $catWidth - 2)
+    $indent = " " * ($pillWidth + $catWidth + 2)
+
+    foreach ($r in $Results) {
+        $d = ($r.Detail -replace "[`r`n]+", " ").Trim()
+        if ($r.PolicyName) { $d = if ($d) { "$d [blocking policy: $($r.PolicyName)]" } else { "blocking policy: $($r.PolicyName)" } }
+        $text = if ($d) { "$($r.Check) > $d" } else { $r.Check }
+
+        # Word-wrap the check+detail column.
+        $lines = [System.Collections.Generic.List[string]]::new()
+        $line = ""
+        foreach ($word in ($text -split "\s+")) {
+            if ($line.Length -eq 0) { $line = $word }
+            elseif (($line.Length + 1 + $word.Length) -le $textWidth) { $line = "$line $word" }
+            else { $lines.Add($line); $line = $word }
+        }
+        if ($line.Length -gt 0) { $lines.Add($line) }
+        if ($lines.Count -eq 0) { $lines.Add("") }
+
+        Write-StatusPill -Result $r.Result
+        Write-Host ("{0}{1}  {2}" -f " ", $r.Category.PadRight($catWidth), $lines[0])
+        for ($i = 1; $i -lt $lines.Count; $i++) { Write-Host ("{0}{1}" -f $indent, $lines[$i]) }
+    }
+}
+
+function Invoke-CloudShellDownload {
+    # In Azure Cloud Shell, trigger a browser download of a file created in the session. No-op (with
+    # a hint) anywhere else, since the `download` helper only exists in Cloud Shell.
+    param([string] $Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    if ($script:IsCloudShell -and (Get-Command download -ErrorAction SilentlyContinue)) {
+        try { download $Path; return }
+        catch { Write-Host -ForegroundColor "Yellow" "  Could not auto-download '$Path': $($_.Exception.Message). Use the Cloud Shell 'Upload/Download files' toolbar button." }
+    }
+}
+#endregion
+
 # The installer applies CanNotDelete locks to the SQL Database, Key Vault, and (DPS) storage
 # account - mirror that here. Tracked as its own resource so cleanup removes the lock first.
 function New-PreflightLock {
@@ -1805,12 +2025,25 @@ finally {
         Region          = $Location
         ResourceGroup   = $ResourceGroupName
     }
+    $rawJson = $null
     try {
-        [pscustomobject]@{ Metadata = $summaryMeta; Configuration = $ConfigSummary; Results = $Results; CreatedResources = $Tracker } |
-            ConvertTo-Json -Depth 8 | Out-File -FilePath $OutFile -Force
+        $rawJson = [pscustomobject]@{ Metadata = $summaryMeta; Configuration = $ConfigSummary; Results = $Results; CreatedResources = $Tracker } |
+            ConvertTo-Json -Depth 8
+        $rawJson | Out-File -FilePath $OutFile -Force
         Write-Host -ForegroundColor "Cyan" "Detailed results written to: $OutFile"
     }
     catch { Write-Host -ForegroundColor "Yellow" "Could not write JSON output: $($_.Exception.Message)" }
+
+    # HTML report - the colour-coded, human-facing deliverable to hand to the SE. Same palette and
+    # data as the console table below, so the two match; recipients can open it in any browser
+    # (and Ctrl+P -> Save as PDF if they want a PDF, no extra tooling required).
+    $HtmlOutFile = [System.IO.Path]::ChangeExtension($OutFile, ".html")
+    try {
+        $html = New-ReadinessHtmlReport -Results $Results -ConfigSummary $ConfigSummary -CustomResourceNames $CustomResourceNames -Meta $summaryMeta -CreatedResources $Tracker -RawJson $rawJson
+        $html | Out-File -FilePath $HtmlOutFile -Force -Encoding utf8
+        Write-Host -ForegroundColor "Cyan" "HTML report written to:      $HtmlOutFile"
+    }
+    catch { Write-Host -ForegroundColor "Yellow" "Could not write HTML report: $($_.Exception.Message)"; $HtmlOutFile = $null }
 
     # Copy/paste report.
     $counts = $Results | Group-Object Result | ForEach-Object { "$($_.Name)=$($_.Count)" }
@@ -1857,68 +2090,22 @@ finally {
     Write-Host ""
     Write-Host "Check results"
     Write-Host ("-" * 60)
-    $resultTokens = @{ Pass = "[PASS]"; Fail = "[FAIL]"; Warn = "[WARN]"; Info = "[INFO]" }
-    $resultColors = @{ Pass = "Green"; Fail = "Red"; Warn = "Yellow"; Info = "Cyan" }
-    $catCap = 16
-    $catWidth = [Math]::Min($catCap, (($Results | ForEach-Object { $_.Category.Length } | Measure-Object -Maximum).Maximum))
-    $detailIndent = " " * 8
-    $wrapWidth = 130
-    function Write-TokenLine {
-        param($Token, $Color, $Rest)
-        Write-Host -NoNewline -ForegroundColor $Color $Token
-        Write-Host $Rest
-    }
-    foreach ($r in $Results) {
-        # Only genuine "missing required zone" rows (Detail starts "MISSING from ...") get the terse
-        # [MISSING] treatment - NOT the new-zone test-CREATION failure rows, which share the same
-        # Category/Result/Check shape but carry the blocking-policy reason in Detail and must keep it.
-        $isMissingZone = $r.Category -eq "PrivateDns" -and $r.Result -eq "Fail" -and $r.Check -like "Private DNS zone: *" -and $r.Detail -like "MISSING from *"
-        if ($isMissingZone) {
-            $token = "[MISSING]"
-            $catPadded = $r.Category.PadRight($catWidth)
-            $check = $r.Check -replace "^Private DNS zone: ", ""
-            Write-TokenLine -Token $token -Color $resultColors["Fail"] -Rest ("  {0}  {1}" -f $catPadded, $check)
-            continue
-        }
-        $token = if ($resultTokens.ContainsKey($r.Result)) { $resultTokens[$r.Result] } else { "[{0}]" -f $r.Result.ToUpper().Substring(0, [Math]::Min(4, $r.Result.Length)) }
-        $color = if ($resultColors.ContainsKey($r.Result)) { $resultColors[$r.Result] } else { "White" }
-        $catPadded = $r.Category.PadRight($catWidth)
-        $restHead = "  {0}  {1}" -f $catPadded, $r.Check
-        $d = ($r.Detail -replace "[`r`n]+", " ").Trim()
-        if (-not $d) {
-            Write-TokenLine -Token $token -Color $color -Rest $restHead
-            continue
-        }
-        $isZoneCreated = $r.Category -eq "PrivateDns" -and $r.Result -eq "Pass" -and $r.Check -like "Private DNS zone: *"
-        if ($isZoneCreated) {
-            Write-TokenLine -Token $token -Color $color -Rest "$restHead $d"
-            continue
-        }
-        # Prefer a single combined line; only fall back to wrapped, indented continuation
-        # lines when the check + detail genuinely don't fit on one line.
-        $oneLine = "$restHead > $d"
-        if (($token.Length + $oneLine.Length) -le $wrapWidth) {
-            Write-TokenLine -Token $token -Color $color -Rest $oneLine
-            continue
-        }
-        Write-TokenLine -Token $token -Color $color -Rest $restHead
-        $words = $d -split "\s+"
-        $line = ""
-        $first = $true
-        foreach ($word in $words) {
-            if ($line.Length -eq 0) { $line = $word }
-            elseif (($line.Length + 1 + $word.Length) -le $wrapWidth) { $line = "$line $word" }
-            else {
-                Write-Host ("{0}{1} {2}" -f $detailIndent, "$(if ($first) { '>' } else { ' ' })", $line)
-                $first = $false
-                $line = $word
-            }
-        }
-        if ($line.Length -gt 0) { Write-Host ("{0}{1} {2}" -f $detailIndent, "$(if ($first) { '>' } else { ' ' })", $line) }
-    }
+    # Colour-coded ANSI table, driven by the same palette as the HTML report so the two match.
+    Write-ConsoleResultsTable -Results $Results
     Write-Host ""
     Write-Host -ForegroundColor "Green" "====== END - COPY EVERYTHING ABOVE ======"
     Write-Host ""
+    if ($HtmlOutFile) {
+        Write-Host -ForegroundColor "Cyan" "For a colour-coded report to send to your Nerdio SE, open or share: $HtmlOutFile"
+        if ($script:IsCloudShell) {
+            Write-Host -ForegroundColor "Cyan" "Downloading the report file(s) from Cloud Shell to your machine..."
+            Invoke-CloudShellDownload -Path $HtmlOutFile
+            if ($rawJson) { Invoke-CloudShellDownload -Path $OutFile }
+        }
+        else {
+            Write-Host -ForegroundColor "Cyan" "(In Azure Cloud Shell, these files download to your machine automatically.)"
+        }
+    }
     #endregion
 
     #region Cleanup ------------------------------------------------------------------------------
