@@ -298,17 +298,19 @@ font-family:ui-monospace,SFMono-Regular,Menlo,monospace;}
 }
 
 function Write-StatusPill {
-    # Emits a colour-filled status badge to the console (ANSI truecolor pill, or a plain [TOKEN]).
+    # Emits a bracketed status token to the console ([PASS]/[FAIL]/...), with the text itself
+    # coloured (ANSI truecolor foreground) rather than a filled background. Falls back to a plain
+    # [TOKEN] where ANSI is unavailable.
     param([string] $Result)
     $style = if ($script:StatusStyle.ContainsKey($Result)) { $script:StatusStyle[$Result] } else { $script:StatusStyle.Info }
-    $label = " {0} " -f $style.Label
+    $label = "[{0}]" -f $style.Label
     if ($script:UseAnsi) {
         $e = [char]27
         $rgb = $style.Rgb
-        Write-Host -NoNewline ("{0}[48;2;{1};{2};{3};38;2;255;255;255;1m{4}{0}[0m" -f $e, $rgb[0], $rgb[1], $rgb[2], $label)
+        Write-Host -NoNewline ("{0}[38;2;{1};{2};{3};1m{4}{0}[0m" -f $e, $rgb[0], $rgb[1], $rgb[2], $label)
     }
     else {
-        Write-Host -NoNewline ("[{0}]" -f $style.Label)
+        Write-Host -NoNewline $label
     }
 }
 
@@ -349,10 +351,29 @@ function Invoke-CloudShellDownload {
     # In Azure Cloud Shell, trigger a browser download of a file created in the session. No-op (with
     # a hint) anywhere else, since the `download` helper only exists in Cloud Shell.
     param([string] $Path)
+    if (-not $script:IsCloudShell) { return }
     if (-not (Test-Path -LiteralPath $Path)) { return }
-    if ($script:IsCloudShell -and (Get-Command download -ErrorAction SilentlyContinue)) {
-        try { download $Path; return }
-        catch { Write-Host -ForegroundColor "Yellow" "  Could not auto-download '$Path': $($_.Exception.Message). Use the Cloud Shell 'Upload/Download files' toolbar button." }
+
+    # The `download` helper is provided by the Cloud Shell profile. Depending on the image it may be
+    # a function, an alias, or a shell shim - and it isn't always discoverable via Get-Command - so
+    # don't gate on Get-Command; just try to invoke it and fall back to the toolbar hint on failure.
+    # `download` wants a path relative to the Cloud Shell home/working directory, so resolve to a
+    # relative path when we can (an absolute path silently fails to produce the browser prompt).
+    $resolved = (Resolve-Path -LiteralPath $Path).Path
+    $arg = $resolved
+    try {
+        $rel = [System.IO.Path]::GetRelativePath($PWD.Path, $resolved)
+        if ($rel -and -not $rel.StartsWith("..")) { $arg = $rel }
+    }
+    catch {}
+
+    try {
+        download $arg
+        return
+    }
+    catch {
+        Write-Host -ForegroundColor "Yellow" "  Could not auto-download '$Path': $($_.Exception.Message)."
+        Write-Host -ForegroundColor "Yellow" "  Use the Cloud Shell 'Manage files -> Download' toolbar button and enter: $arg"
     }
 }
 #endregion
