@@ -339,6 +339,22 @@ function Invoke-CloudShellDownload {
         catch { Write-Host -ForegroundColor "Yellow" "  Could not auto-download '$Path': $($_.Exception.Message). Use the Cloud Shell 'Upload/Download files' toolbar button." }
     }
 }
+
+function Write-Hyperlink {
+    # Emits a clickable terminal hyperlink (OSC 8) when the host supports ANSI; otherwise prints the
+    # label followed by the raw URI so the information is never lost. Terminals that don't implement
+    # OSC 8 silently swallow the escape and show just the label, so this degrades cleanly.
+    param([string] $Uri, [string] $Label, [string] $Color = "Cyan")
+    if ($script:UseAnsi) {
+        $e = [char]27
+        $st = "$e" + '\'   # String Terminator: ESC \
+        Write-Host -ForegroundColor $Color ($e + "]8;;" + $Uri + $st + $Label + $e + "]8;;" + $st)
+    }
+    else {
+        Write-Host -ForegroundColor $Color $Label
+        Write-Host "    $Uri"
+    }
+}
 #endregion
 
 # The installer applies CanNotDelete locks to the SQL Database, Key Vault, and (DPS) storage
@@ -2096,14 +2112,35 @@ finally {
     Write-Host -ForegroundColor "Green" "====== END - COPY EVERYTHING ABOVE ======"
     Write-Host ""
     if ($HtmlOutFile) {
-        Write-Host -ForegroundColor "Cyan" "For a colour-coded report to send to your Nerdio SE, open or share: $HtmlOutFile"
+        Write-Host -ForegroundColor "Cyan" "Colour-coded report to send to your Nerdio SE:"
+
+        # (1) Portable "open in browser" link: the entire self-contained report embedded as a data:
+        # URI. Clicking it opens the rendered report in a new browser tab (then Save / Print-to-PDF)
+        # - no file path, no hosting, works even when the file itself isn't reachable (e.g. the
+        # ephemeral Cloud Shell filesystem). Skipped only if the report is unexpectedly large, since
+        # very long hyperlink URIs can be dropped by some terminals.
+        try {
+            $dataUri = "data:text/html;base64," + [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($html))
+            if ($dataUri.Length -le 120000) {
+                Write-Hyperlink -Uri $dataUri -Label "  -> Open the readiness report in your browser (click), then Save or Print to PDF"
+            }
+        }
+        catch {}
+
+        # (2) Link to the saved file on disk - clickable in local terminals (VS Code, iTerm, Windows
+        # Terminal) to open the file directly.
+        try {
+            $fileUri = ([System.Uri](Resolve-Path -LiteralPath $HtmlOutFile).Path).AbsoluteUri
+            Write-Hyperlink -Uri $fileUri -Label "  -> Open the saved report file: $HtmlOutFile"
+        }
+        catch { Write-Host -ForegroundColor "Cyan" "  Report file: $HtmlOutFile" }
+
+        # (3) Cloud Shell: also trigger the native zero-click browser download of the actual files,
+        # so the user gets them locally without touching the 'Upload/Download files' toolbar.
         if ($script:IsCloudShell) {
-            Write-Host -ForegroundColor "Cyan" "Downloading the report file(s) from Cloud Shell to your machine..."
+            Write-Host -ForegroundColor "Cyan" "  Cloud Shell: downloading the report file(s) to your machine..."
             Invoke-CloudShellDownload -Path $HtmlOutFile
             if ($rawJson) { Invoke-CloudShellDownload -Path $OutFile }
-        }
-        else {
-            Write-Host -ForegroundColor "Cyan" "(In Azure Cloud Shell, these files download to your machine automatically.)"
         }
     }
     #endregion
