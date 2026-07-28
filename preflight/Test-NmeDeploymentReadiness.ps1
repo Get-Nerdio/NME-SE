@@ -1140,7 +1140,7 @@ function Test-PrivateDnsZones {
         # nothing to look up against - skip straight past the Get-AzPrivateDnsZone calls (which
         # would otherwise be called with a null resource group) rather than crashing or silently
         # reporting nothing.
-        Add-Result -Category "PrivateDns" -Check "Private DNS zones" -Result "Info" -Detail "Not verified - the existing Private DNS zones' subscription/resource group weren't known at test time. Confirm the required zones exist and are linked before the actual NME POV installation."
+        Add-Result -Category "PrivateDns" -Check "Private DNS zones" -Result "Warn" -Detail "Not verified - the existing Private DNS zones' subscription/resource group weren't known at test time. Confirm the required zones exist and are linked before the actual NME POV installation."
     }
     else {
         # New zones (either VNet path): the installer/runbook is expected to create and link the
