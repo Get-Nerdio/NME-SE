@@ -656,6 +656,21 @@ function Get-MaskedAccount {
     return "$masked$domain"
 }
 
+function Wait-JobsWithDots {
+    # Wait-Job blocks silently until every job finishes, which can take a while - poll instead so a
+    # dot can be printed every couple seconds to show the check is still alive. Wait for every job to
+    # reach a terminal state, not just to leave Running: ThreadJob's default throttle leaves excess
+    # jobs queued in NotStarted, and right after creation none may be Running yet - so a "while any
+    # Running" loop would exit immediately and Receive-Job would return nothing.
+    param([Parameter(Mandatory)] $Jobs)
+    while ($Jobs | Where-Object { $_.State -notin @("Completed", "Failed", "Stopped") }) {
+        Start-Sleep -Seconds 2
+        Write-Host -ForegroundColor "Cyan" -NoNewline "."
+    }
+    Write-Host ""
+    return $Jobs | Receive-Job
+}
+
 function Write-HelpText {
     param([string] $Text)
     if ([string]::IsNullOrWhiteSpace($Text)) { return }
@@ -1434,17 +1449,7 @@ try {
             }
         } -ArgumentList $rp
     }
-    # Wait-Job blocks silently until every job finishes, which can take a while - poll instead so a
-    # dot can be printed every couple seconds to show the check is still alive. Wait for every job to
-    # reach a terminal state, not just to leave Running: ThreadJob's default throttle (5) leaves the
-    # remaining providers queued in NotStarted, and right after creation none may be Running yet - so
-    # a "while any Running" loop would exit immediately and Receive-Job would return nothing.
-    while ($rpJobs | Where-Object { $_.State -notin @("Completed", "Failed", "Stopped") }) {
-        Start-Sleep -Seconds 2
-        Write-Host -ForegroundColor "Cyan" -NoNewline "."
-    }
-    Write-Host ""
-    $rpJobResults = $rpJobs | Receive-Job
+    $rpJobResults = Wait-JobsWithDots -Jobs $rpJobs
     $rpJobs | Remove-Job -Force -ErrorAction SilentlyContinue
     foreach ($rp in $ResourceProviders) {
         $rr = $rpJobResults | Where-Object { $_.Rp -eq $rp } | Select-Object -First 1
@@ -1620,7 +1625,7 @@ try {
         }
     } -ArgumentList $ResourceGroupName, $aaScriptedActionsName, $Location, $Tags
 
-    $jobResults = $jobs | Wait-Job | Receive-Job
+    $jobResults = Wait-JobsWithDots -Jobs $jobs
     $jobs | Remove-Job -Force -ErrorAction SilentlyContinue
 
     foreach ($jr in $jobResults) {
@@ -1859,7 +1864,7 @@ try {
                         }
                     } -ArgumentList $ResourceGroupName, $rz.Zone, $rz.Purpose
                 }
-                $zoneJobResults = $zoneJobs | Wait-Job | Receive-Job
+                $zoneJobResults = Wait-JobsWithDots -Jobs $zoneJobs
                 $zoneJobs | Remove-Job -Force -ErrorAction SilentlyContinue
 
                 # Process results on the main thread, in the original zone order, so console output
@@ -1956,7 +1961,7 @@ try {
                         }
                     } -ArgumentList $ResourceGroupName, $svc.PeName, $svc.TargetId, $svc.GroupId, $subnet, $Location, $Tags, $svc.Service, $svc.Port
                 }
-                $peJobResults = $peJobs | Wait-Job | Receive-Job
+                $peJobResults = Wait-JobsWithDots -Jobs $peJobs
                 $peJobs | Remove-Job -Force -ErrorAction SilentlyContinue
 
                 # Process results on the main thread, in service order, so console output stays stable.
@@ -2029,7 +2034,13 @@ try {
                         Add-Result -Category "Connectivity" -Check "Outbound connectivity test" -Result "Info" -Detail "Skipped - VNet '$ExistingVnetName' is brand-new with no customer-configured routing/firewall/DNS yet. VNet integration, subnet delegation, and the test App Service were created and confirmed configured correctly. Once the customer's real egress controls (firewall, UDRs, custom DNS) are in place, run NmeNetworkTest.ps1 against the real NME App Service to validate outbound connectivity."
                     }
                     else {
-                        Start-Sleep -Seconds 20
+                        # Give the VNet integration a moment to finish propagating before the live test below.
+                        Write-Host -ForegroundColor "Cyan" -NoNewline "Waiting for VNet integration to propagate..."
+                        for ($i = 0; $i -lt 10; $i++) {
+                            Start-Sleep -Seconds 2
+                            Write-Host -ForegroundColor "Cyan" -NoNewline "."
+                        }
+                        Write-Host ""
 
                         # Build the standard outbound endpoint list (environment-aware), mirroring
                         # NmeNetworkTest.ps1 EXACTLY.
