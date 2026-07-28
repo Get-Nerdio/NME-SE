@@ -645,17 +645,24 @@ function New-RandomString {
 }
 
 function Get-MaskedAccount {
-    # Mask the local part of a UPN for display: keep the first 1 and last 2 characters, replace the
-    # middle with '*' (one per replaced char); leave the domain intact. Local parts of 3 chars or
-    # fewer are returned unchanged (nothing meaningful to mask). No '@' -> treat the whole string as
-    # the local part.  e.g. jsmith@contoso.com -> j***th@contoso.com
+    # Mask the local part of a UPN for display; leave the domain intact. No '@' -> treat the whole
+    # string as the local part. Scales with local-part length so short usernames don't leak most of
+    # their characters: <5 chars -> keep only the first character; <6 -> keep first and last; 6+ ->
+    # keep the first 1 and last 2 (the original scheme). e.g. jsmith@contoso.com -> j***th@contoso.com
     param([string] $Account)
     if ([string]::IsNullOrWhiteSpace($Account)) { return $Account }
     $atIndex = $Account.IndexOf("@")
     if ($atIndex -ge 0) { $local = $Account.Substring(0, $atIndex); $domain = $Account.Substring($atIndex) }
     else { $local = $Account; $domain = "" }
-    if ($local.Length -le 3) { return "$local$domain" }
-    $masked = $local.Substring(0, 1) + ("*" * ($local.Length - 3)) + $local.Substring($local.Length - 2, 2)
+    if ($local.Length -lt 5) {
+        $masked = $local.Substring(0, 1) + ("*" * ($local.Length - 1))
+    }
+    elseif ($local.Length -lt 6) {
+        $masked = $local.Substring(0, 1) + ("*" * ($local.Length - 2)) + $local.Substring($local.Length - 1, 1)
+    }
+    else {
+        $masked = $local.Substring(0, 1) + ("*" * ($local.Length - 3)) + $local.Substring($local.Length - 2, 2)
+    }
     return "$masked$domain"
 }
 
@@ -2072,7 +2079,7 @@ try {
                 Add-Result -Category "Permissions" -Check "Entra role for install" -Result "Pass" -Detail "User has Privileged Role Administrator + Cloud Application Administrator."
             }
             else {
-                Add-Result -Category "Permissions" -Check "Entra role for install" -Result "Warn" -Detail "Missing Global Administrator (or Privileged Role Administrator + Cloud Application Administrator). Roles found: $($roleNames)."
+                Add-Result -Category "Permissions" -Check "Entra role for install" -Result "Fail" -Detail "Missing Global Administrator (or Privileged Role Administrator + Cloud Application Administrator). Roles found: $($roleNames)."
             }
         }
         else {
@@ -2130,13 +2137,13 @@ try {
             Add-Result -Category "Permissions" -Check "Azure Owner on subscription" -Result "Pass" -Detail "Contributor + User Access Administrator (functionally equivalent to Owner for install).$partialNote" -Message $partialErr
         }
         elseif ($hasContributor) {
-            Add-Result -Category "Permissions" -Check "Azure Owner on subscription" -Result "Warn" -Detail "Have Contributor but missing User Access Administrator; need Owner, or Contributor + User Access Administrator, to install.$partialNote" -Message $partialErr
+            Add-Result -Category "Permissions" -Check "Azure Owner on subscription" -Result "Fail" -Detail "Have Contributor but missing User Access Administrator; need Owner, or Contributor + User Access Administrator, to install.$partialNote" -Message $partialErr
         }
         elseif ($hasUaa) {
-            Add-Result -Category "Permissions" -Check "Azure Owner on subscription" -Result "Warn" -Detail "Have User Access Administrator but missing Contributor; need Owner, or Contributor + User Access Administrator, to install.$partialNote" -Message $partialErr
+            Add-Result -Category "Permissions" -Check "Azure Owner on subscription" -Result "Fail" -Detail "Have User Access Administrator but missing Contributor; need Owner, or Contributor + User Access Administrator, to install.$partialNote" -Message $partialErr
         }
         else {
-            Add-Result -Category "Permissions" -Check "Azure Owner on subscription" -Result "Warn" -Detail "Owner not detected on the subscription (or you are a guest). Owner (or Contributor + User Access Administrator) is required to install Nerdio Manager.$partialNote" -Message $partialErr
+            Add-Result -Category "Permissions" -Check "Azure Owner on subscription" -Result "Fail" -Detail "Owner not detected on the subscription (or you are a guest). Owner (or Contributor + User Access Administrator) is required to install Nerdio Manager.$partialNote" -Message $partialErr
         }
     }
 
