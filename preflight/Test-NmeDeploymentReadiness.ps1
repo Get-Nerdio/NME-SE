@@ -672,6 +672,50 @@ function Wait-JobsWithDots {
     return $Jobs | Receive-Job
 }
 
+function Invoke-WithSpinner {
+    # Run a single long, synchronous operation while showing an in-place "still working" indicator:
+    # one line that rewrites itself (spinner frame + activity label + elapsed seconds) instead of
+    # accumulating dots. Use this for a discrete, named step (e.g. "Creating SQL database"); use
+    # Wait-JobsWithDots for a barrier wait on a batch of parallel ThreadJobs.
+    #
+    # The animation runs on a background ThreadJob writing straight to [Console] (process-global, so
+    # it reaches the terminal even while the main thread is blocked inside an Az cmdlet). The main
+    # thread runs $ScriptBlock itself, so all error handling/state changes stay on the main thread and
+    # the scriptblock's return value is passed back unchanged. Keep console-writing work (Add-Result,
+    # Write-Host) OUT of $ScriptBlock - it would corrupt the spinner line; print results after this
+    # returns. When output is redirected (Cloud Shell log, transcript), the spinner is pointless and
+    # would litter carriage returns, so fall back to a plain "label...done." line.
+    param(
+        [Parameter(Mandatory)][string] $Activity,
+        [Parameter(Mandatory)][scriptblock] $ScriptBlock
+    )
+    if ([Console]::IsOutputRedirected) {
+        Write-Host -ForegroundColor "Cyan" -NoNewline "$Activity..."
+        try { return & $ScriptBlock } finally { Write-Host -ForegroundColor "Cyan" " done." }
+    }
+    $flag = [hashtable]::Synchronized(@{ Stop = $false })
+    $spinJob = Start-ThreadJob -Name "Spinner" -ScriptBlock {
+        param($activity, $flag)
+        $frames = '|', '/', '-', '\'; $i = 0; $start = [DateTime]::Now
+        while (-not $flag.Stop) {
+            $secs = [int]([DateTime]::Now - $start).TotalSeconds
+            [Console]::Write("`r$($frames[$i % 4]) $activity ($secs" + "s)   ")
+            Start-Sleep -Milliseconds 150
+            $i++
+        }
+    } -ArgumentList $Activity, $flag
+    try {
+        return & $ScriptBlock
+    }
+    finally {
+        $flag.Stop = $true
+        $spinJob | Wait-Job | Out-Null
+        $spinJob | Remove-Job -Force -ErrorAction SilentlyContinue
+        # Erase the spinner line so the result line that follows starts clean.
+        [Console]::Write("`r" + (' ' * ($Activity.Length + 24)) + "`r")
+    }
+}
+
 function Write-HelpText {
     param([string] $Text)
     if ([string]::IsNullOrWhiteSpace($Text)) { return }
@@ -1472,7 +1516,7 @@ try {
     #endregion
 
     #region Deployability tests (parallel) -------------------------------------------------------
-    Write-Host -ForegroundColor "Cyan" "Testing resource deployability. This will take several minutes..."
+    Write-Host -ForegroundColor "Cyan" -NoNewline "Testing resource deployability. This will take several minutes..."
 
     # -PrivateEndpointOnly forces the resources that support a create-time public-access flag (Storage,
     # SQL, Key Vault) to deploy with public network access disabled from the start, for environments
@@ -1657,55 +1701,75 @@ try {
     # does this toggle, and the check is cheap (two control-plane updates).
     $kvOk = ($jobResults | Where-Object { $_.Kind -eq "kv" -and $_.Ok })
     if ($kvOk) {
-        # Put the KV in its hardened end-state first (best-effort; not the check we care about).
-        try { Update-AzKeyVault -VaultName $kvName -ResourceGroupName $ResourceGroupName -PublicNetworkAccess "Disabled" -ErrorAction Stop | Out-Null } catch {}
-        try {
-            # The actual check: can the install's "briefly enable public access" step succeed.
-            Update-AzKeyVault -VaultName $kvName -ResourceGroupName $ResourceGroupName -PublicNetworkAccess "Enabled" -ErrorAction Stop | Out-Null
+        # Run the toggle (harden -> enable -> harden) under a spinner; return a plain result and print
+        # the Add-Result line afterwards so console writes don't collide with the spinner line.
+        $kvToggle = Invoke-WithSpinner -Activity "Testing Key Vault public-access toggle" -ScriptBlock {
+            # Put the KV in its hardened end-state first (best-effort; not the check we care about).
+            try { Update-AzKeyVault -VaultName $kvName -ResourceGroupName $ResourceGroupName -PublicNetworkAccess "Disabled" -ErrorAction Stop | Out-Null } catch {}
+            try {
+                # The actual check: can the install's "briefly enable public access" step succeed.
+                Update-AzKeyVault -VaultName $kvName -ResourceGroupName $ResourceGroupName -PublicNetworkAccess "Enabled" -ErrorAction Stop | Out-Null
+                $result = @{ Ok = $true }
+            }
+            catch {
+                $kvToggleErrMsg = $_.Exception.Message
+                try { if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $kvToggleErrMsg = "$kvToggleErrMsg`n$($_.ErrorDetails.Message)" } } catch {}
+                try { if ($_.Exception.Response -and $_.Exception.Response.Content) { $kvToggleErrMsg = "$kvToggleErrMsg`n$($_.Exception.Response.Content)" } } catch {}
+                try { if ($_.Exception.Body) { $kvToggleErrMsg = "$kvToggleErrMsg`n$($_.Exception.Body | ConvertTo-Json -Depth 10 -Compress)" } } catch {}
+                $isParamBind = ($_.Exception -is [System.Management.Automation.ParameterBindingException] -or $kvToggleErrMsg -match "A parameter cannot be found")
+                $result = @{ Ok = $false; Error = $kvToggleErrMsg; IsParamBind = $isParamBind }
+            }
+            # Revert to the hardened end-state (best-effort/cosmetic; the KV is deleted at cleanup anyway).
+            try { Update-AzKeyVault -VaultName $kvName -ResourceGroupName $ResourceGroupName -PublicNetworkAccess "Disabled" -ErrorAction Stop | Out-Null } catch {}
+            $result
+        }
+        if ($kvToggle.Ok) {
             Add-Result -Category "Deployability" -Check "Key Vault temporary public access (confirmed allowed)" -Result "Pass"
         }
-        catch {
-            $kvToggleErrMsg = $_.Exception.Message
-            try { if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $kvToggleErrMsg = "$kvToggleErrMsg`n$($_.ErrorDetails.Message)" } } catch {}
-            try { if ($_.Exception.Response -and $_.Exception.Response.Content) { $kvToggleErrMsg = "$kvToggleErrMsg`n$($_.Exception.Response.Content)" } } catch {}
-            try { if ($_.Exception.Body) { $kvToggleErrMsg = "$kvToggleErrMsg`n$($_.Exception.Body | ConvertTo-Json -Depth 10 -Compress)" } } catch {}
-            if ($_.Exception -is [System.Management.Automation.ParameterBindingException] -or $kvToggleErrMsg -match "A parameter cannot be found") {
-                Add-Result -Category "Deployability" -Check "Key Vault temporary public access (install step)" -Result "Warn" -Detail "Could not simulate - Update-AzKeyVault -PublicNetworkAccess not available in this Az version."
-            }
-            else {
-                $p = Get-PolicyFromError -ExceptionMessage $kvToggleErrMsg
-                $pDisplayHint = if ($p.PolicyAssignmentDisplayName) { $p.PolicyAssignmentDisplayName } elseif ($p.PolicyDefinitionDisplayName) { $p.PolicyDefinitionDisplayName } else { $null }
-                $polName = Resolve-PolicyName -PolicyDefinitionId $p.PolicyDefinitionId -PolicyAssignmentId $p.PolicyAssignmentId -PolicySetDefinitionId $p.PolicySetDefinitionId -DisplayNameHint $pDisplayHint
-                $concise = Get-ConciseErrorMessage -RawMessage $kvToggleErrMsg
-                $detail = if ($polName) { "Blocked by Azure Policy: '$polName'." } else { "Failed: $concise" }
-                Add-Result -Category "Deployability" -Check "Key Vault temporary public access (install step)" -Result "Fail" -Detail $detail -PolicyName $polName -Message $concise -RawMessage $kvToggleErrMsg
-            }
+        elseif ($kvToggle.IsParamBind) {
+            Add-Result -Category "Deployability" -Check "Key Vault temporary public access (install step)" -Result "Warn" -Detail "Could not simulate - Update-AzKeyVault -PublicNetworkAccess not available in this Az version."
         }
-        # Revert to the hardened end-state (best-effort/cosmetic; the KV is deleted at cleanup anyway).
-        try { Update-AzKeyVault -VaultName $kvName -ResourceGroupName $ResourceGroupName -PublicNetworkAccess "Disabled" -ErrorAction Stop | Out-Null } catch {}
+        else {
+            $p = Get-PolicyFromError -ExceptionMessage $kvToggle.Error
+            $pDisplayHint = if ($p.PolicyAssignmentDisplayName) { $p.PolicyAssignmentDisplayName } elseif ($p.PolicyDefinitionDisplayName) { $p.PolicyDefinitionDisplayName } else { $null }
+            $polName = Resolve-PolicyName -PolicyDefinitionId $p.PolicyDefinitionId -PolicyAssignmentId $p.PolicyAssignmentId -PolicySetDefinitionId $p.PolicySetDefinitionId -DisplayNameHint $pDisplayHint
+            $concise = Get-ConciseErrorMessage -RawMessage $kvToggle.Error
+            $detail = if ($polName) { "Blocked by Azure Policy: '$polName'." } else { "Failed: $concise" }
+            Add-Result -Category "Deployability" -Check "Key Vault temporary public access (install step)" -Result "Fail" -Detail $detail -PolicyName $polName -Message $concise -RawMessage $kvToggle.Error
+        }
     }
 
     # SQL database (depends on SQL server having been created).
     $sqlOk = ($jobResults | Where-Object { $_.Kind -eq "sqlserver" -and $_.Ok })
     if ($sqlOk) {
-        try {
-            New-AzSqlDatabase -ResourceGroupName $ResourceGroupName -ServerName $sqlName -DatabaseName $dbName `
-                -Edition "Standard" -RequestedServiceObjectiveName "S1" -CollationName "SQL_Latin1_General_CP1_CI_AS" -Tag $Tags -ErrorAction Stop | Out-Null
+        # SQL database provisioning is the slowest single step here (can take 30-60s) - run it under a
+        # spinner and print the Add-Result line afterwards so console writes don't clobber the spinner.
+        $sqlResult = Invoke-WithSpinner -Activity "Creating SQL database (Standard S1)" -ScriptBlock {
+            try {
+                New-AzSqlDatabase -ResourceGroupName $ResourceGroupName -ServerName $sqlName -DatabaseName $dbName `
+                    -Edition "Standard" -RequestedServiceObjectiveName "S1" -CollationName "SQL_Latin1_General_CP1_CI_AS" -Tag $Tags -ErrorAction Stop | Out-Null
+                @{ Ok = $true }
+            }
+            catch {
+                $sqlErrMsg = $_.Exception.Message
+                try { if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $sqlErrMsg = "$sqlErrMsg`n$($_.ErrorDetails.Message)" } } catch {}
+                try { if ($_.Exception.Response -and $_.Exception.Response.Content) { $sqlErrMsg = "$sqlErrMsg`n$($_.Exception.Response.Content)" } } catch {}
+                try { if ($_.Exception.Body) { $sqlErrMsg = "$sqlErrMsg`n$($_.Exception.Body | ConvertTo-Json -Depth 10 -Compress)" } } catch {}
+                @{ Ok = $false; Error = $sqlErrMsg }
+            }
+        }
+        if ($sqlResult.Ok) {
             Add-Result -Category "Deployability" -Check "SQL Database (Standard S1, DTU)" -Result "Pass" -Detail "Created successfully."
             Add-TrackedResource -Type "sqldatabase" -ResourceGroupName $ResourceGroupName -Name $dbName -Note $sqlName
             New-PreflightLock -ResourceId "/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.Sql/servers/$sqlName/databases/$dbName" -LockName "$dbName-lock" -Label "SQL Database"
         }
-        catch {
-            $sqlErrMsg = $_.Exception.Message
-            try { if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $sqlErrMsg = "$sqlErrMsg`n$($_.ErrorDetails.Message)" } } catch {}
-            try { if ($_.Exception.Response -and $_.Exception.Response.Content) { $sqlErrMsg = "$sqlErrMsg`n$($_.Exception.Response.Content)" } } catch {}
-            try { if ($_.Exception.Body) { $sqlErrMsg = "$sqlErrMsg`n$($_.Exception.Body | ConvertTo-Json -Depth 10 -Compress)" } } catch {}
-            $p = Get-PolicyFromError -ExceptionMessage $sqlErrMsg
+        else {
+            $p = Get-PolicyFromError -ExceptionMessage $sqlResult.Error
             $pDisplayHint = if ($p.PolicyAssignmentDisplayName) { $p.PolicyAssignmentDisplayName } elseif ($p.PolicyDefinitionDisplayName) { $p.PolicyDefinitionDisplayName } else { $null }
             $polName = Resolve-PolicyName -PolicyDefinitionId $p.PolicyDefinitionId -PolicyAssignmentId $p.PolicyAssignmentId -PolicySetDefinitionId $p.PolicySetDefinitionId -DisplayNameHint $pDisplayHint
-            $concise = Get-ConciseErrorMessage -RawMessage $sqlErrMsg
+            $concise = Get-ConciseErrorMessage -RawMessage $sqlResult.Error
             $detail = if ($polName) { "Blocked by Azure Policy: '$polName'." } else { "Failed: $concise" }
-            Add-Result -Category "Deployability" -Check "SQL Database (Standard S1, DTU)" -Result "Fail" -Detail $detail -PolicyName $polName -Message $concise -RawMessage $sqlErrMsg
+            Add-Result -Category "Deployability" -Check "SQL Database (Standard S1, DTU)" -Result "Fail" -Detail $detail -PolicyName $polName -Message $concise -RawMessage $sqlResult.Error
         }
     }
     else {
