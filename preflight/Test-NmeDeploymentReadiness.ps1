@@ -204,18 +204,19 @@ function New-ReadinessHtmlReport {
     [void]$sb.AppendLine('<!DOCTYPE html>')
     [void]$sb.AppendLine('<html lang="en"><head><meta charset="utf-8">')
     [void]$sb.AppendLine('<meta name="viewport" content="width=device-width, initial-scale=1">')
-    [void]$sb.AppendLine('<title>NME Deployment Readiness Report</title>')
+    [void]$sb.AppendLine('<title>Nerdio Manager for Enterprise deployment readiness report</title>')
     [void]$sb.AppendLine('<style>')
     [void]$sb.AppendLine(@"
-:root{color-scheme:light dark;--bg:#ffffff;--fg:#1f2328;--muted:#656d76;--card:#f6f8fa;--border:#d0d7de;
+:root{color-scheme:light dark;--bg:#ffffff;--fg:#042838;--muted:#4b6672;--card:#f2f8fa;--border:#cfe3e8;--accent:#1e9db8;--link:#0f6b7e;
 --pass:$($script:StatusStyle.Pass.Hex);--fail:$($script:StatusStyle.Fail.Hex);--warn:$($script:StatusStyle.Warn.Hex);--info:$($script:StatusStyle.Info.Hex);}
-@media (prefers-color-scheme:dark){:root{--bg:#0d1117;--fg:#e6edf3;--muted:#8b949e;--card:#161b22;--border:#30363d;}}
+@media (prefers-color-scheme:dark){:root{--bg:#042838;--fg:#eef6f8;--muted:#9db3ba;--card:#0b3446;--border:#1c4a5c;--accent:#3fc2dd;--link:#6fd3e8;}}
 *{box-sizing:border-box;-webkit-print-color-adjust:exact;print-color-adjust:exact;color-adjust:exact;}
-body{margin:0;padding:24px;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+body{margin:0;padding:24px;font-family:"Poppins",-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
 background:var(--bg);color:var(--fg);line-height:1.45;}
 @media print{*{-webkit-print-color-adjust:exact!important;print-color-adjust:exact!important;color-adjust:exact!important;}}
 .wrap{max-width:1100px;margin:0 auto;}
-h1{font-size:22px;margin:0 0 4px;}
+.brand{font-weight:600;font-size:12px;letter-spacing:.22em;text-transform:uppercase;color:var(--accent);margin-bottom:8px;}
+h1{font-size:22px;font-weight:600;margin:0 0 4px;}
 .sub{color:var(--muted);font-size:13px;margin-bottom:20px;}
 .banner{border-radius:10px;padding:16px 20px;margin:18px 0;color:#fff;font-size:18px;font-weight:700;
 display:flex;align-items:center;gap:12px;}
@@ -225,7 +226,7 @@ display:flex;align-items:center;gap:12px;}
 .meta,.cfg{width:100%;border-collapse:collapse;margin:8px 0 22px;font-size:13px;}
 .meta td,.cfg td{padding:6px 10px;border-bottom:1px solid var(--border);vertical-align:top;}
 .meta td:first-child,.cfg td:first-child{color:var(--muted);width:34%;white-space:nowrap;}
-h2{font-size:15px;margin:26px 0 8px;padding-bottom:6px;border-bottom:1px solid var(--border);}
+h2{font-size:15px;font-weight:600;margin:26px 0 8px;padding-bottom:6px;border-bottom:2px solid var(--accent);}
 table.res{width:100%;border-collapse:collapse;font-size:13px;}
 table.res th{text-align:left;color:var(--muted);font-weight:600;padding:6px 10px;border-bottom:2px solid var(--border);}
 table.res td{padding:8px 10px;border-bottom:1px solid var(--border);vertical-align:top;}
@@ -240,11 +241,12 @@ pre{background:var(--card);border:1px solid var(--border);border-radius:8px;padd
 font-family:ui-monospace,SFMono-Regular,Menlo,monospace;}
 "@)
     [void]$sb.AppendLine('</style></head><body><div class="wrap">')
-    [void]$sb.AppendLine('<h1>Nerdio Manager for Enterprise &ndash; Deployment Readiness Report</h1>')
+    [void]$sb.AppendLine('<div class="brand">Nerdio</div>')
+    [void]$sb.AppendLine('<h1>Nerdio Manager for Enterprise deployment readiness report</h1>')
     [void]$sb.AppendLine("<div class=`"sub`">Generated $(ConvertTo-HtmlText $Meta.TimestampUtc)</div>")
 
     $vColor = @{ Pass = "var(--pass)"; Fail = "var(--fail)"; Warn = "var(--warn)" }[$verdict]
-    $vText = @{ Pass = "READY &ndash; all checks passed"; Fail = "NOT READY &ndash; one or more checks failed"; Warn = "READY WITH WARNINGS &ndash; review the items below" }[$verdict]
+    $vText = @{ Pass = "READY: all checks passed"; Fail = "NOT READY: one or more checks failed"; Warn = "READY WITH WARNINGS: review the items below" }[$verdict]
     [void]$sb.AppendLine("<div class=`"banner`" style=`"background:$vColor`"><span>$($vStyle.Symbol)</span><span>$vText</span></div>")
 
     [void]$sb.AppendLine('<div class="chips">')
