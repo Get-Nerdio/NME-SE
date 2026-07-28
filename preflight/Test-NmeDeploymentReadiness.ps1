@@ -1676,7 +1676,22 @@ try {
                 }
             } while ([string]::IsNullOrWhiteSpace($Location))
         }
-        $ResourceGroupName = "rg-nme-preflight-$(New-RandomString -Length 6)"
+        # Prompt for the new RG's name rather than generating one silently - and refuse a name that
+        # already exists, since this script deletes the entire resource group (everything in it,
+        # not just what it created) at the end of the run.
+        $suggestedRgName = "rg-nme-preflight-$(New-RandomString -Length 6)"
+        $ResourceGroupName = $null
+        do {
+            $rgNameInput = Read-Host -Prompt "Name for the temporary resource group this script will create [default: $suggestedRgName]"
+            $candidateRgName = if ([string]::IsNullOrWhiteSpace($rgNameInput)) { $suggestedRgName } else { $rgNameInput.Trim() }
+            try {
+                Get-AzResourceGroup -Name $candidateRgName -ErrorAction Stop | Out-Null
+                Write-Host -ForegroundColor "Yellow" "  Resource group '$candidateRgName' already exists. This script creates a NEW resource group and deletes it - and everything in it - at the end of the run, so choose a name that doesn't already exist."
+            }
+            catch {
+                $ResourceGroupName = $candidateRgName
+            }
+        } while (-not $ResourceGroupName)
         $PendingRgCreate = $true
         $CreatedResourceGroup = $true
     }
