@@ -1435,8 +1435,11 @@ try {
         } -ArgumentList $rp
     }
     # Wait-Job blocks silently until every job finishes, which can take a while - poll instead so a
-    # dot can be printed every couple seconds to show the check is still alive.
-    while ($rpJobs | Where-Object { $_.State -eq "Running" }) {
+    # dot can be printed every couple seconds to show the check is still alive. Wait for every job to
+    # reach a terminal state, not just to leave Running: ThreadJob's default throttle (5) leaves the
+    # remaining providers queued in NotStarted, and right after creation none may be Running yet - so
+    # a "while any Running" loop would exit immediately and Receive-Job would return nothing.
+    while ($rpJobs | Where-Object { $_.State -notin @("Completed", "Failed", "Stopped") }) {
         Start-Sleep -Seconds 2
         Write-Host -ForegroundColor "Cyan" -NoNewline "."
     }
