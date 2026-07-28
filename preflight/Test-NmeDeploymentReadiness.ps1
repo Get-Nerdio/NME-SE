@@ -870,17 +870,33 @@ function Write-KeyValueTable {
 }
 
 function Wait-JobsWithDots {
-    # Wait-Job blocks silently until every job finishes, which can take a while - poll instead so a
-    # dot can be printed every couple seconds to show the check is still alive. Wait for every job to
-    # reach a terminal state, not just to leave Running: ThreadJob's default throttle leaves excess
-    # jobs queued in NotStarted, and right after creation none may be Running yet - so a "while any
-    # Running" loop would exit immediately and Receive-Job would return nothing.
-    param([Parameter(Mandatory)] $Jobs)
-    while ($Jobs | Where-Object { $_.State -notin @("Completed", "Failed", "Stopped") }) {
-        Start-Sleep -Seconds 2
-        Write-Host -ForegroundColor "Cyan" -NoNewline "."
+    # Wait-Job blocks silently until every job finishes, which can take a while - show the same
+    # in-place spinner (frame + elapsed seconds) as Invoke-WithSpinner instead of accumulating dots,
+    # so a barrier wait on a batch of parallel ThreadJobs looks the same as a single spinner-wrapped
+    # step. Wait for every job to reach a terminal state, not just to leave Running: ThreadJob's
+    # default throttle leaves excess jobs queued in NotStarted, and right after creation none may be
+    # Running yet - so a "while any Running" loop would exit immediately and Receive-Job would
+    # return nothing.
+    param(
+        [Parameter(Mandatory)] $Jobs,
+        [string] $Activity = "Waiting for jobs"
+    )
+    if ([Console]::IsOutputRedirected) {
+        Write-Host -ForegroundColor "Cyan" -NoNewline "$Activity..."
+        while ($Jobs | Where-Object { $_.State -notin @("Completed", "Failed", "Stopped") }) {
+            Start-Sleep -Seconds 2
+        }
+        Write-Host -ForegroundColor "Cyan" " done."
+        return $Jobs | Receive-Job
     }
-    Write-Host ""
+    $frames = '|', '/', '-', '\'; $i = 0; $start = [DateTime]::Now
+    while ($Jobs | Where-Object { $_.State -notin @("Completed", "Failed", "Stopped") }) {
+        $secs = [int]([DateTime]::Now - $start).TotalSeconds
+        [Console]::Write("`r$($frames[$i % 4]) $Activity ($secs" + "s)   ")
+        Start-Sleep -Milliseconds 150
+        $i++
+    }
+    [Console]::Write("`r" + (' ' * ($Activity.Length + 24)) + "`r")
     return $Jobs | Receive-Job
 }
 
@@ -1144,7 +1160,7 @@ function Test-PrivateDnsZones {
                 }
             } -ArgumentList $ResourceGroupName, $rz.Zone, $rz.Purpose -InitializationScript $script:ErrorHelperInitScript
         }
-        $zoneJobResults = Wait-JobsWithDots -Jobs $zoneJobs
+        $zoneJobResults = Wait-JobsWithDots -Jobs $zoneJobs -Activity "Test-creating private DNS zones"
         $zoneJobs | Remove-Job -Force -ErrorAction SilentlyContinue
 
         # Process results on the main thread, in the original zone order, so console output
@@ -1249,7 +1265,7 @@ function Test-PrivateEndpoints {
                 }
             } -ArgumentList $ResourceGroupName, $svc.PeName, $svc.TargetId, $svc.GroupId, $subnet, $Location, $Tags, $svc.Service, $svc.Port -InitializationScript $script:ErrorHelperInitScript
         }
-        $peJobResults = Wait-JobsWithDots -Jobs $peJobs
+        $peJobResults = Wait-JobsWithDots -Jobs $peJobs -Activity "Creating private endpoints"
         $peJobs | Remove-Job -Force -ErrorAction SilentlyContinue
 
         # Process results on the main thread, in service order, so console output stays stable.
@@ -2127,7 +2143,6 @@ try {
     # Resource providers.
     # Providers the installer template deploys, plus the ones NME needs to operate post-install
     # (Compute = session-host VMs, DesktopVirtualization = AVD host pools, RecoveryServices = backup).
-    Write-Host -ForegroundColor "Cyan" -NoNewline "Running resource provider check..."
     $ResourceProviders = @("Microsoft.KeyVault", "Microsoft.Automation", "Microsoft.Compute",
         "Microsoft.DesktopVirtualization", "Microsoft.Insights",
         "Microsoft.Network", "Microsoft.OperationalInsights", "Microsoft.RecoveryServices",
@@ -2147,7 +2162,7 @@ try {
             }
         } -ArgumentList $rp
     }
-    $rpJobResults = Wait-JobsWithDots -Jobs $rpJobs
+    $rpJobResults = Wait-JobsWithDots -Jobs $rpJobs -Activity "Running resource provider check"
     $rpJobs | Remove-Job -Force -ErrorAction SilentlyContinue
     foreach ($rp in $ResourceProviders) {
         $rr = $rpJobResults | Where-Object { $_.Rp -eq $rp } | Select-Object -First 1
@@ -2169,8 +2184,6 @@ try {
     #endregion
 
     #region Deployability tests (parallel) -------------------------------------------------------
-    Write-Host -ForegroundColor "Cyan" -NoNewline "Testing resource deployability. This will take several minutes..."
-
     # -PrivateEndpointOnly forces the resources that support a create-time public-access flag (Storage,
     # SQL, Key Vault) to deploy with public network access disabled from the start, for environments
     # that reject public-endpoint creation outright.
@@ -2281,7 +2294,7 @@ try {
         }
     } -ArgumentList $ResourceGroupName, $aaScriptedActionsName, $Location, $Tags -InitializationScript $script:ErrorHelperInitScript
 
-    $jobResults = Wait-JobsWithDots -Jobs $jobs
+    $jobResults = Wait-JobsWithDots -Jobs $jobs -Activity "Testing resource deployability. This will take several minutes"
     $jobs | Remove-Job -Force -ErrorAction SilentlyContinue
 
     foreach ($jr in $jobResults) {
