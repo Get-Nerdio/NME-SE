@@ -2165,6 +2165,9 @@ try {
     # Resource providers.
     # Providers the installer template deploys, plus the ones NME needs to operate post-install
     # (Compute = session-host VMs, DesktopVirtualization = AVD host pools, RecoveryServices = backup).
+    # Print the section header as its own persistent line - the spinner below erases itself when the
+    # jobs finish, so without this the console would show no delineation from the checks above.
+    Write-Host -ForegroundColor "Cyan" "Running resource provider check..."
     $ResourceProviders = @("Microsoft.KeyVault", "Microsoft.Automation", "Microsoft.Compute",
         "Microsoft.DesktopVirtualization", "Microsoft.Insights",
         "Microsoft.Network", "Microsoft.OperationalInsights", "Microsoft.RecoveryServices",
@@ -2184,7 +2187,7 @@ try {
             }
         } -ArgumentList $rp
     }
-    $rpJobResults = Wait-JobsWithDots -Jobs $rpJobs -Activity "Running resource provider check"
+    $rpJobResults = Wait-JobsWithDots -Jobs $rpJobs -Activity "Checking resource providers"
     $rpJobs | Remove-Job -Force -ErrorAction SilentlyContinue
     foreach ($rp in $ResourceProviders) {
         $rr = $rpJobResults | Where-Object { $_.Rp -eq $rp } | Select-Object -First 1
@@ -2206,6 +2209,10 @@ try {
     #endregion
 
     #region Deployability tests (parallel) -------------------------------------------------------
+    # Print the section header as its own persistent line - the spinner below erases itself when the
+    # jobs finish, so without this the console would show no delineation from the checks above.
+    Write-Host -ForegroundColor "Cyan" "Testing resource deployability. This will take several minutes..."
+
     # -PrivateEndpointOnly forces the resources that support a create-time public-access flag (Storage,
     # SQL, Key Vault) to deploy with public network access disabled from the start, for environments
     # that reject public-endpoint creation outright.
@@ -2316,7 +2323,7 @@ try {
         }
     } -ArgumentList $ResourceGroupName, $aaScriptedActionsName, $Location, $Tags -InitializationScript $script:ErrorHelperInitScript
 
-    $jobResults = Wait-JobsWithDots -Jobs $jobs -Activity "Testing resource deployability. This will take several minutes"
+    $jobResults = Wait-JobsWithDots -Jobs $jobs -Activity "Testing resource deployability"
     $jobs | Remove-Job -Force -ErrorAction SilentlyContinue
 
     foreach ($jr in $jobResults) {
