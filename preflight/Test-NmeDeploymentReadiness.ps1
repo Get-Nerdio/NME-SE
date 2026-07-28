@@ -210,9 +210,10 @@ function New-ReadinessHtmlReport {
 :root{color-scheme:light dark;--bg:#ffffff;--fg:#1f2328;--muted:#656d76;--card:#f6f8fa;--border:#d0d7de;
 --pass:$($script:StatusStyle.Pass.Hex);--fail:$($script:StatusStyle.Fail.Hex);--warn:$($script:StatusStyle.Warn.Hex);--info:$($script:StatusStyle.Info.Hex);}
 @media (prefers-color-scheme:dark){:root{--bg:#0d1117;--fg:#e6edf3;--muted:#8b949e;--card:#161b22;--border:#30363d;}}
-*{box-sizing:border-box;}
+*{box-sizing:border-box;-webkit-print-color-adjust:exact;print-color-adjust:exact;color-adjust:exact;}
 body{margin:0;padding:24px;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
 background:var(--bg);color:var(--fg);line-height:1.45;}
+@media print{*{-webkit-print-color-adjust:exact!important;print-color-adjust:exact!important;color-adjust:exact!important;}}
 .wrap{max-width:1100px;margin:0 auto;}
 h1{font-size:22px;margin:0 0 4px;}
 .sub{color:var(--muted);font-size:13px;margin-bottom:20px;}
