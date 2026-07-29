@@ -2611,13 +2611,13 @@ try {
                 @{ Ra = $ra; Error = $raErr }
             }
             if ($raResult.Ra) {
-                Add-Result -Category "Deployability" -Check "Role assignment (Contributor to managed identity)" -Result "Pass" -Detail "Assigned and will be removed at cleanup."
+                Add-Result -Category "Deployability" -Check "Role assignment (Contributor to Automation account identity)" -Result "Pass" -Detail "Granted Contributor at resource-group scope to the updater Automation account's managed identity; removed at cleanup."
                 Add-TrackedResource -Type "roleassignment" -ResourceGroupName $ResourceGroupName -Name $raResult.Ra.RoleAssignmentId -Id $raScope -Note $aaPrincipalId
             }
-            else { Add-PolicyFailureResult -Category "Deployability" -Check "Role assignment (Contributor to managed identity)" -RawMessage $raResult.Error }
+            else { Add-PolicyFailureResult -Category "Deployability" -Check "Role assignment (Contributor to Automation account identity)" -RawMessage $raResult.Error }
         }
         else {
-            Add-Result -Category "Deployability" -Check "Role assignment (Contributor to managed identity)" -Result "Warn" -Detail "Skipped - could not resolve the updater Automation account's managed identity principal id."
+            Add-Result -Category "Deployability" -Check "Role assignment (Contributor to Automation account identity)" -Result "Warn" -Detail "Skipped - could not resolve the updater Automation account's managed identity principal id."
         }
     }
 
