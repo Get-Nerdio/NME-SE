@@ -824,6 +824,26 @@ function Add-PolicyFailureResult {
     Add-Result -Category $Category -Check $Check -Result "Fail" -Detail $detail -PolicyName $polName -Message $concise -RawMessage $RawMessage
 }
 
+# PUT an ARM resource via the shared Az token and report ok/error. A policy denial comes back as a
+# 4xx whose Content carries the policy JSON (parsed downstream by Get-PolicyFromError). Used for the
+# resources that need exact installer properties (Web App siteConfig, App Insights, DCE/DCR) which
+# the typed cmdlets don't cleanly express. Runs on the main thread only.
+function Invoke-PreflightArmPut {
+    param(
+        [Parameter(Mandatory = $true)][string] $RmUrl,
+        [Parameter(Mandatory = $true)][string] $ResourceId,
+        [Parameter(Mandatory = $true)][string] $ApiVersion,
+        [Parameter(Mandatory = $true)][string] $Body
+    )
+    $uri = "$($RmUrl.TrimEnd('/'))$ResourceId`?api-version=$ApiVersion"
+    try {
+        $resp = Invoke-AzRestMethod -Method PUT -Uri $uri -Payload $Body -ErrorAction Stop
+        if ($resp.StatusCode -ge 200 -and $resp.StatusCode -lt 300) { return @{ Ok = $true; Content = $resp.Content } }
+        return @{ Ok = $false; Error = $resp.Content }
+    }
+    catch { return @{ Ok = $false; Error = (Get-DetailedErrorMessage -ErrorRecord $_) } }
+}
+
 function Get-RoleAssignmentSafe {
     # Get-AzRoleAssignment, tried both directly and with -ExpandPrincipalGroups (to catch role
     # assignments via group membership) - each call is independently non-fatal so a partial failure
@@ -1312,12 +1332,7 @@ function Test-OutboundConnectivityViaKudu {
     )
 
     # Give the VNet integration a moment to finish propagating before the live test below.
-    Write-Host -ForegroundColor "Cyan" -NoNewline "Waiting for VNet integration to propagate..."
-    for ($i = 0; $i -lt 10; $i++) {
-        Start-Sleep -Seconds 2
-        Write-Host -ForegroundColor "Cyan" -NoNewline "."
-    }
-    Write-Host ""
+    Invoke-WithSpinner -Activity "Waiting for VNet integration to propagate" -ScriptBlock { Start-Sleep -Seconds 20 } | Out-Null
 
     # Build the standard outbound endpoint list (environment-aware), mirroring
     # NmeNetworkTest.ps1 EXACTLY.
@@ -1408,7 +1423,9 @@ function Test-OutboundConnectivityViaKudu {
     $dnsProbeCount = 0
     $dnsConfirmedCount = 0
     try {
-        $kresp = Invoke-RestMethod -Method POST -Uri "https://$scmHost/api/command" -Headers $headers -Body $kbody -TimeoutSec 120 -ErrorAction Stop
+        $kresp = Invoke-WithSpinner -Activity "Running in-worker connectivity test via Kudu" -ScriptBlock {
+            Invoke-RestMethod -Method POST -Uri "https://$scmHost/api/command" -Headers $headers -Body $kbody -TimeoutSec 120 -ErrorAction Stop
+        }
         $outLines = @()
         if ($kresp.Output) { $outLines = $kresp.Output -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -match "\|(OK|BLOCKED)\|" } }
         foreach ($t in $targets) {
@@ -1509,7 +1526,8 @@ Write-Host "  1. Check your Entra directory roles and Azure subscription role (r
 Write-Host "  2. Check required resource providers are registered (read-only)."
 Write-Host "  3. Show you the exact resource names (and tags) it will use and let you customize them."
 Write-Host "  4. Create a temporary resource group (or use an existing empty one you provide) and attempt to deploy"
-Write-Host "     throwaway copies of the resources Nerdio Manager needs."
+Write-Host "     throwaway copies of the resources Nerdio Manager needs (Log Analytics, Storage, SQL server/database/firewall rule,"
+Write-Host "     App Service, Web App, Key Vault + key/secret, Automation, App Insights, a role assignment, and data collection rules)."
 Write-Host "  5. Optionally test private endpoints, DNS resolution, and App Service VNet integration"
 Write-Host "     outbound connectivity, in an existing VNet you name or a new one this script creates"
 Write-Host "  6. DELETE everything it created, then provide a report you can send to your Nerdio sales team."
@@ -1894,6 +1912,8 @@ try {
     # NME deploys two Automation Accounts (an updater account and a scripted-actions account) - test both.
     $NamePlan["AutomationUpdater"] = [pscustomobject]@{ Label = "Automation Account (updater)"; Value = "aa-nmepf-updater-$rand"; Editable = $true }
     $NamePlan["AutomationScriptedActions"] = [pscustomobject]@{ Label = "Automation Account (scripted actions)"; Value = "aa-nmepf-actions-$rand"; Editable = $true }
+    $NamePlan["WebApp"] = [pscustomobject]@{ Label = "Web App (portal site)"; Value = "app-nmepf-$rand"; Editable = $true }
+    $NamePlan["AppInsights"] = [pscustomobject]@{ Label = "Application Insights"; Value = "appi-nmepf-$rand"; Editable = $true }
     if ($CreateNewVnet) {
         $NamePlan["Vnet"] = [pscustomobject]@{ Label = "Virtual Network"; Value = "vnet-nmepf-$rand"; Editable = $true }
         $NamePlan["PeSubnet"] = [pscustomobject]@{ Label = "Subnet (private endpoints)"; Value = $PeSubnetName; Editable = $true }
@@ -1941,6 +1961,11 @@ try {
     $kvName = $NamePlan["KeyVault"].Value
     $aaUpdaterName = $NamePlan["AutomationUpdater"].Value
     $aaScriptedActionsName = $NamePlan["AutomationScriptedActions"].Value
+    $portalWebName = $NamePlan["WebApp"].Value
+    $appInsightsName = $NamePlan["AppInsights"].Value
+    $dceName = "dce-nmepf-$rand"
+    $dcrName = "dcr-nmepf-$rand"
+    $dpContainerName = "nmepf-dp"
     if ($TestPrivate) { $peName = $NamePlan["PrivateEndpoint"].Value }
     if ($TestVnetIntegration) { $connAspName = $NamePlan["ConnAsp"].Value; $connWebName = $NamePlan["ConnWebApp"].Value }
     if ($CreateNewVnet) { $NewVnetName = $NamePlan["Vnet"].Value; $PeSubnetName = $NamePlan["PeSubnet"].Value; $AppSubnetName = $NamePlan["AppSubnet"].Value }
@@ -2349,20 +2374,56 @@ try {
     # does this toggle, and the check is cheap (two control-plane updates).
     $kvOk = ($jobResults | Where-Object { $_.Kind -eq "kv" -and $_.Ok })
     if ($kvOk) {
-        # Run the toggle (harden -> enable -> harden) under a spinner; return a plain result and print
-        # the Add-Result line afterwards so console writes don't collide with the spinner line.
-        $kvToggle = Invoke-WithSpinner -Activity "Testing Key Vault public-access toggle" -ScriptBlock {
+        # Run the toggle (harden -> enable -> data-plane writes -> harden) under a spinner; return a
+        # plain result and print the Add-Result lines afterwards so console writes don't collide.
+        $kvToggle = Invoke-WithSpinner -Activity "Testing Key Vault public-access toggle and data-plane writes" -ScriptBlock {
             # Put the KV in its hardened end-state first (best-effort; not the check we care about).
             try { Update-AzKeyVault -VaultName $kvName -ResourceGroupName $ResourceGroupName -PublicNetworkAccess "Disabled" -ErrorAction Stop | Out-Null } catch {}
+            $result = @{}
             try {
                 # The actual check: can the install's "briefly enable public access" step succeed.
                 Update-AzKeyVault -VaultName $kvName -ResourceGroupName $ResourceGroupName -PublicNetworkAccess "Enabled" -ErrorAction Stop | Out-Null
-                $result = @{ Ok = $true }
+                $result.Ok = $true
             }
             catch {
                 $kvToggleErrMsg = Get-DetailedErrorMessage -ErrorRecord $_
-                $isParamBind = ($_.Exception -is [System.Management.Automation.ParameterBindingException] -or $kvToggleErrMsg -match "A parameter cannot be found")
-                $result = @{ Ok = $false; Error = $kvToggleErrMsg; IsParamBind = $isParamBind }
+                $result.Ok = $false
+                $result.Error = $kvToggleErrMsg
+                $result.IsParamBind = ($_.Exception -is [System.Management.Automation.ParameterBindingException] -or $kvToggleErrMsg -match "A parameter cannot be found")
+            }
+            # With public access enabled, exercise the data-plane writes the installer performs: create
+            # the RSA data-protection key (no expiration, as the installer does - catches "keys must
+            # expire" Deny policies) and write a secret. Retry briefly for data-plane/access-policy
+            # propagation after enabling public access; a real policy denial won't match the retry
+            # regex and falls through quickly to be reported as a Fail.
+            if ($result.Ok) {
+                # The vault uses the access-policy model (RBAC disabled) to match the installer, so the
+                # running user has NO data-plane rights by default - the real installer instead grants
+                # the app's managed identity an access policy. Grant one for the running user here so
+                # the key/secret writes below aren't refused by the vault itself (a data-plane 403,
+                # unrelated to Azure Policy). Best-effort; a failure here is surfaced by the writes below.
+                try {
+                    if ($meObjectId) { Set-AzKeyVaultAccessPolicy -VaultName $kvName -ResourceGroupName $ResourceGroupName -ObjectId $meObjectId -PermissionsToKeys create, get, delete -PermissionsToSecrets set, get, delete -ErrorAction Stop | Out-Null }
+                    elseif ($SignedInAccount) { Set-AzKeyVaultAccessPolicy -VaultName $kvName -ResourceGroupName $ResourceGroupName -UserPrincipalName $SignedInAccount -PermissionsToKeys create, get, delete -PermissionsToSecrets set, get, delete -ErrorAction Stop | Out-Null }
+                    $result.AccessPolicySet = $true
+                }
+                catch { $result.AccessPolicySet = $false; $result.AccessPolicyError = Get-DetailedErrorMessage -ErrorRecord $_ }
+                for ($a = 1; $a -le 4; $a++) {
+                    try {
+                        Add-AzKeyVaultKey -VaultName $kvName -Name "nmepf-dp-key" -Destination "Software" -KeyType "RSA" -ErrorAction Stop | Out-Null
+                        $result.KeyOk = $true; break
+                    }
+                    catch {
+                        $result.KeyError = Get-DetailedErrorMessage -ErrorRecord $_
+                        if ($a -lt 4 -and "$($_.Exception.Message)" -match "Forbidden|not authorized|network|throttl|429|503|being provisioned") { Start-Sleep -Seconds ($a * 5); continue }
+                        $result.KeyOk = $false; break
+                    }
+                }
+                try {
+                    Set-AzKeyVaultSecret -VaultName $kvName -Name "nmepf-test-secret" -SecretValue (ConvertTo-SecureString -String "PreflightTest!$(Get-Random)" -AsPlainText -Force) -ErrorAction Stop | Out-Null
+                    $result.SecretOk = $true
+                }
+                catch { $result.SecretError = Get-DetailedErrorMessage -ErrorRecord $_; $result.SecretOk = $false }
             }
             # Revert to the hardened end-state (best-effort/cosmetic; the KV is deleted at cleanup anyway).
             try { Update-AzKeyVault -VaultName $kvName -ResourceGroupName $ResourceGroupName -PublicNetworkAccess "Disabled" -ErrorAction Stop | Out-Null } catch {}
@@ -2376,6 +2437,22 @@ try {
         }
         else {
             Add-PolicyFailureResult -Category "Deployability" -Check "Key Vault temporary public access (install step)" -RawMessage $kvToggle.Error
+        }
+        # Report the data-plane key/secret writes (only attempted if the enable succeeded). Key and
+        # secret are children of the vault - removed when the vault is purged at cleanup.
+        if ($kvToggle.Ok) {
+            # A vault data-plane permission refusal ("does not have keys/secrets ... permission",
+            # Forbidden from the access policy) means this test couldn't grant itself data-plane
+            # access - it is NOT an Azure Policy block, so report it as a WARN test limitation rather
+            # than a misleading policy Fail. A genuine Azure Policy denial (RequestDisallowedByPolicy)
+            # falls through to Add-PolicyFailureResult, which names the blocking policy.
+            $isDataPlanePermErr = { param($m) $m -and ($m -match "does not have (keys|secrets|certificates).*permission" -or $m -match "ForbiddenByPolicy" -or $m -match "AccessDenied") }
+            if ($kvToggle.KeyOk) { Add-Result -Category "Deployability" -Check "Key Vault key creation (RSA data-protection key)" -Result "Pass" -Detail "Created successfully." }
+            elseif (& $isDataPlanePermErr $kvToggle.KeyError) { Add-Result -Category "Deployability" -Check "Key Vault key creation (RSA data-protection key)" -Result "Warn" -Detail "Not tested - could not grant the running user data-plane access to the throwaway vault (access-policy model). This is a test limitation, not an Azure Policy block." -Message $kvToggle.KeyError }
+            else { Add-PolicyFailureResult -Category "Deployability" -Check "Key Vault key creation (RSA data-protection key)" -RawMessage $kvToggle.KeyError }
+            if ($kvToggle.SecretOk) { Add-Result -Category "Deployability" -Check "Key Vault secret creation" -Result "Pass" -Detail "Created successfully." }
+            elseif (& $isDataPlanePermErr $kvToggle.SecretError) { Add-Result -Category "Deployability" -Check "Key Vault secret creation" -Result "Warn" -Detail "Not tested - could not grant the running user data-plane access to the throwaway vault (access-policy model). This is a test limitation, not an Azure Policy block." -Message $kvToggle.SecretError }
+            else { Add-PolicyFailureResult -Category "Deployability" -Check "Key Vault secret creation" -RawMessage $kvToggle.SecretError }
         }
     }
 
@@ -2406,6 +2483,174 @@ try {
     }
     else {
         Add-Result -Category "Deployability" -Check "SQL Database (Standard S1, DTU)" -Result "Warn" -Detail "Skipped - SQL Server was not created."
+    }
+
+    # SQL "Allow Azure services" firewall rule (AllowAllWindowsAzureIps, 0.0.0.0-0.0.0.0). The installer
+    # creates this ONLY in a public (non-private-endpoint) deployment - ARM condition
+    # [not(configurePrivateEndpoints)]. A policy denying open/Azure-services SQL firewall rules is a
+    # real, common block (this is the exact rule that failed a recent real deployment). Mirror the
+    # template: test it when the SQL server has public access, skip it under -PrivateEndpointOnly.
+    if ($sqlOk) {
+        if ($PrivateEndpointOnly) {
+            Add-Result -Category "Deployability" -Check "SQL firewall rule (AllowAllWindowsAzureIps)" -Result "Info" -Detail "Not applicable - private-endpoint deployments do not create this rule (template condition not(configurePrivateEndpoints))."
+        }
+        else {
+            try {
+                New-AzSqlServerFirewallRule -ResourceGroupName $ResourceGroupName -ServerName $sqlName -FirewallRuleName "AllowAllWindowsAzureIps" -StartIpAddress "0.0.0.0" -EndIpAddress "0.0.0.0" -ErrorAction Stop | Out-Null
+                Add-Result -Category "Deployability" -Check "SQL firewall rule (AllowAllWindowsAzureIps)" -Result "Pass" -Detail "Created successfully (0.0.0.0-0.0.0.0, 'Allow Azure services and resources')."
+                # Child of the SQL server - removed when the server is removed at cleanup.
+            }
+            catch {
+                $fwErrMsg = Get-DetailedErrorMessage -ErrorRecord $_
+                Add-PolicyFailureResult -Category "Deployability" -Check "SQL firewall rule (AllowAllWindowsAzureIps)" -RawMessage $fwErrMsg
+            }
+        }
+        # The throwaway server uses SQL auth; the real installer uses Entra-only auth. Flag the gap.
+        Add-Result -Category "Deployability" -Check "SQL Entra-only authentication" -Result "Info" -Detail "Not exercised - this test uses SQL authentication for the throwaway server, but the real installer configures Entra-only authentication (azureADOnlyAuthentication=true) with the app's managed identity as SQL admin. A policy requiring or forbidding AAD-only SQL auth is not validated here."
+    }
+
+    # --- Dependent deployment steps the installer performs that also get policy-blocked ---
+    # Web App (Microsoft.Web/sites) with the installer's exact site config. Created via REST PUT so the
+    # exact properties (httpsOnly, TLS 1.3, FTPS disabled, http2, system identity) are what policy
+    # evaluates - these are prime denial targets and the site is otherwise only created in the optional
+    # VNet path. Depends on the B3 App Service Plan from the parallel wave above.
+    $aspOk = ($jobResults | Where-Object { $_.Kind -eq "asp" -and $_.Ok })
+    if ($aspOk) {
+        $webBody = @{
+            location   = $Location
+            identity   = @{ type = "SystemAssigned" }
+            tags       = $Tags
+            properties = @{
+                serverFarmId = "/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.Web/serverfarms/$aspName"
+                httpsOnly    = $true
+                siteConfig   = @{
+                    alwaysOn              = $true
+                    http20Enabled         = $true
+                    use32BitWorkerProcess = $false
+                    ftpsState             = "Disabled"
+                    minTlsVersion         = "1.3"
+                    netFrameworkVersion   = "v8.0"
+                }
+            }
+        } | ConvertTo-Json -Depth 6
+        $webRes = Invoke-WithSpinner -Activity "Creating Web App (portal site config)" -ScriptBlock {
+            Invoke-PreflightArmPut -RmUrl $AzEnv.ResourceManagerUrl -ResourceId "/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.Web/sites/$portalWebName" -ApiVersion "2023-01-01" -Body $webBody
+        }
+        if ($webRes.Ok) {
+            Add-Result -Category "Deployability" -Check "Web App (httpsOnly, TLS 1.3, FTPS disabled)" -Result "Pass" -Detail "Created successfully."
+            Add-TrackedResource -Type "webapp" -ResourceGroupName $ResourceGroupName -Name $portalWebName
+        }
+        else { Add-PolicyFailureResult -Category "Deployability" -Check "Web App (httpsOnly, TLS 1.3, FTPS disabled)" -RawMessage $webRes.Error }
+    }
+    else {
+        Add-Result -Category "Deployability" -Check "Web App (httpsOnly, TLS 1.3, FTPS disabled)" -Result "Warn" -Detail "Skipped - App Service Plan was not created."
+    }
+
+    # Application Insights (workspace-based, linked to the Log Analytics workspace above).
+    $lawOk = ($jobResults | Where-Object { $_.Kind -eq "law" -and $_.Ok })
+    if ($lawOk) {
+        $aiBody = @{
+            location   = $Location
+            kind       = "web"
+            tags       = $Tags
+            properties = @{
+                Application_Type    = "web"
+                WorkspaceResourceId = "/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.OperationalInsights/workspaces/$lawName"
+            }
+        } | ConvertTo-Json -Depth 6
+        $aiResId = "/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.Insights/components/$appInsightsName"
+        $aiRes = Invoke-PreflightArmPut -RmUrl $AzEnv.ResourceManagerUrl -ResourceId $aiResId -ApiVersion "2020-02-02" -Body $aiBody
+        if ($aiRes.Ok) {
+            Add-Result -Category "Deployability" -Check "Application Insights (workspace-based)" -Result "Pass" -Detail "Created successfully."
+            Add-TrackedResource -Type "appinsights" -ResourceGroupName $ResourceGroupName -Name $appInsightsName -Id $aiResId
+        }
+        else { Add-PolicyFailureResult -Category "Deployability" -Check "Application Insights (workspace-based)" -RawMessage $aiRes.Error }
+    }
+    else {
+        Add-Result -Category "Deployability" -Check "Application Insights (workspace-based)" -Result "Warn" -Detail "Skipped - Log Analytics workspace was not created."
+    }
+
+    # Storage blob container. The installer creates it as an ARM child (control plane), so use the
+    # control-plane cmdlet - it works even under -PrivateEndpointOnly (no data-plane needed).
+    $storageOk = ($jobResults | Where-Object { $_.Kind -eq "storage" -and $_.Ok })
+    if ($storageOk) {
+        try {
+            New-AzRmStorageContainer -ResourceGroupName $ResourceGroupName -StorageAccountName $stName -ContainerName $dpContainerName -PublicAccess None -ErrorAction Stop | Out-Null
+            Add-Result -Category "Deployability" -Check "Storage blob container" -Result "Pass" -Detail "Created successfully (control-plane, publicAccess None)."
+            # Child of the storage account - removed when the account is removed at cleanup.
+        }
+        catch {
+            $ctErr = Get-DetailedErrorMessage -ErrorRecord $_
+            Add-PolicyFailureResult -Category "Deployability" -Check "Storage blob container" -RawMessage $ctErr
+        }
+    }
+
+    # Role assignment: the installer grants Contributor at RG scope to the updater Automation account's
+    # system-assigned managed identity (a User Access Administrator / roleAssignment write). Test it
+    # concretely - surfaces a missing UAA right AND any policy restricting privileged role assignments,
+    # which the read-only permission check can only infer. Removed at cleanup.
+    $aaUpdaterOk = ($jobResults | Where-Object { $_.Kind -eq "automation" -and $_.Ok -and $_.Name -eq $aaUpdaterName })
+    if ($aaUpdaterOk) {
+        $aaPrincipalId = $null
+        try { $aaPrincipalId = (Get-AzResource -ResourceGroupName $ResourceGroupName -Name $aaUpdaterName -ResourceType "Microsoft.Automation/automationAccounts" -ExpandProperties -ErrorAction Stop).Identity.PrincipalId } catch {}
+        if (-not $aaPrincipalId) { try { $aaPrincipalId = (Get-AzAutomationAccount -ResourceGroupName $ResourceGroupName -Name $aaUpdaterName -ErrorAction Stop).Identity.PrincipalId } catch {} }
+        if ($aaPrincipalId) {
+            $raScope = "/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName"
+            $raResult = Invoke-WithSpinner -Activity "Testing role assignment (Contributor to managed identity)" -ScriptBlock {
+                $ra = $null; $raErr = $null
+                # A freshly created MI principal can lag replication to Entra - retry the "principal
+                # not found" transient; a policy denial won't match and falls through to be reported.
+                for ($a = 1; $a -le 5; $a++) {
+                    try { $ra = New-AzRoleAssignment -ObjectId $aaPrincipalId -RoleDefinitionName "Contributor" -Scope $raScope -ErrorAction Stop; $raErr = $null; break }
+                    catch {
+                        $raErr = Get-DetailedErrorMessage -ErrorRecord $_
+                        if ($a -lt 5 -and "$($_.Exception.Message)" -match "does not exist|cannot find|PrincipalNotFound|principal|replicat") { Start-Sleep -Seconds ($a * 5); continue }
+                        break
+                    }
+                }
+                @{ Ra = $ra; Error = $raErr }
+            }
+            if ($raResult.Ra) {
+                Add-Result -Category "Deployability" -Check "Role assignment (Contributor to Automation account identity)" -Result "Pass" -Detail "Granted Contributor at resource-group scope to the updater Automation account's managed identity; removed at cleanup."
+                Add-TrackedResource -Type "roleassignment" -ResourceGroupName $ResourceGroupName -Name $raResult.Ra.RoleAssignmentId -Id $raScope -Note $aaPrincipalId
+            }
+            else { Add-PolicyFailureResult -Category "Deployability" -Check "Role assignment (Contributor to Automation account identity)" -RawMessage $raResult.Error }
+        }
+        else {
+            Add-Result -Category "Deployability" -Check "Role assignment (Contributor to Automation account identity)" -Result "Warn" -Detail "Skipped - could not resolve the updater Automation account's managed identity principal id."
+        }
+    }
+
+    # Azure Monitor data collection endpoint + rule (deployed for session-host telemetry). The DCE is
+    # created with public network access enabled - a policy denying public DCEs would block install.
+    $dceBody = @{ location = $Location; tags = $Tags; properties = @{ networkAcls = @{ publicNetworkAccess = "Enabled" } } } | ConvertTo-Json -Depth 6
+    $dceId = "/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.Insights/dataCollectionEndpoints/$dceName"
+    $dceRes = Invoke-PreflightArmPut -RmUrl $AzEnv.ResourceManagerUrl -ResourceId $dceId -ApiVersion "2022-06-01" -Body $dceBody
+    if ($dceRes.Ok) {
+        Add-Result -Category "Deployability" -Check "Data Collection Endpoint (public access enabled)" -Result "Pass" -Detail "Created successfully."
+        Add-TrackedResource -Type "dce" -ResourceGroupName $ResourceGroupName -Name $dceName -Id $dceId
+    }
+    else { Add-PolicyFailureResult -Category "Deployability" -Check "Data Collection Endpoint (public access enabled)" -RawMessage $dceRes.Error }
+
+    if ($dceRes.Ok -and $lawOk) {
+        $dcrBody = @{
+            location   = $Location
+            kind       = "Windows"
+            tags       = $Tags
+            properties = @{
+                dataCollectionEndpointId = $dceId
+                dataSources              = @{ performanceCounters = @(@{ streams = @("Microsoft-Perf"); samplingFrequencyInSeconds = 60; counterSpecifiers = @("\Processor(_Total)\% Processor Time"); name = "perf" }) }
+                destinations             = @{ logAnalytics = @(@{ workspaceResourceId = "/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.OperationalInsights/workspaces/$lawName"; name = "la-dest" }) }
+                dataFlows                = @(@{ streams = @("Microsoft-Perf"); destinations = @("la-dest") })
+            }
+        } | ConvertTo-Json -Depth 8
+        $dcrId = "/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.Insights/dataCollectionRules/$dcrName"
+        $dcrRes = Invoke-PreflightArmPut -RmUrl $AzEnv.ResourceManagerUrl -ResourceId $dcrId -ApiVersion "2022-06-01" -Body $dcrBody
+        if ($dcrRes.Ok) {
+            Add-Result -Category "Deployability" -Check "Data Collection Rule" -Result "Pass" -Detail "Created successfully."
+            Add-TrackedResource -Type "dcr" -ResourceGroupName $ResourceGroupName -Name $dcrName -Id $dcrId
+        }
+        else { Add-PolicyFailureResult -Category "Deployability" -Check "Data Collection Rule" -RawMessage $dcrRes.Error }
     }
     Write-Host ""
     #endregion
@@ -2598,6 +2843,10 @@ finally {
                     "law" { Remove-AzOperationalInsightsWorkspace -ResourceGroupName $t.ResourceGroupName -Name $t.Name -Force -ForceDelete -ErrorAction Continue | Out-Null }
                     "vnet" { Remove-AzVirtualNetwork -ResourceGroupName $t.ResourceGroupName -Name $t.Name -Force -ErrorAction Continue | Out-Null }
                     "privatednszone" { Remove-AzPrivateDnsZone -ResourceGroupName $t.ResourceGroupName -Name $t.Name -Confirm:$false -ErrorAction Continue | Out-Null }
+                    "appinsights" { Remove-AzResource -ResourceId $t.Id -Force -ErrorAction Continue | Out-Null }
+                    "dcr" { Remove-AzResource -ResourceId $t.Id -Force -ErrorAction Continue | Out-Null }
+                    "dce" { Remove-AzResource -ResourceId $t.Id -Force -ErrorAction Continue | Out-Null }
+                    "roleassignment" { Remove-AzRoleAssignment -ObjectId $t.Note -RoleDefinitionName "Contributor" -Scope $t.Id -ErrorAction Continue | Out-Null }
                     default { }
                 }
                 Write-Host "  removed $($t.Type): $($t.Name)"
