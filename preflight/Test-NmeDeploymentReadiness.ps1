@@ -1332,12 +1332,7 @@ function Test-OutboundConnectivityViaKudu {
     )
 
     # Give the VNet integration a moment to finish propagating before the live test below.
-    Write-Host -ForegroundColor "Cyan" -NoNewline "Waiting for VNet integration to propagate..."
-    for ($i = 0; $i -lt 10; $i++) {
-        Start-Sleep -Seconds 2
-        Write-Host -ForegroundColor "Cyan" -NoNewline "."
-    }
-    Write-Host ""
+    Invoke-WithSpinner -Activity "Waiting for VNet integration to propagate" -ScriptBlock { Start-Sleep -Seconds 20 } | Out-Null
 
     # Build the standard outbound endpoint list (environment-aware), mirroring
     # NmeNetworkTest.ps1 EXACTLY.
@@ -1428,7 +1423,9 @@ function Test-OutboundConnectivityViaKudu {
     $dnsProbeCount = 0
     $dnsConfirmedCount = 0
     try {
-        $kresp = Invoke-RestMethod -Method POST -Uri "https://$scmHost/api/command" -Headers $headers -Body $kbody -TimeoutSec 120 -ErrorAction Stop
+        $kresp = Invoke-WithSpinner -Activity "Running in-worker connectivity test via Kudu" -ScriptBlock {
+            Invoke-RestMethod -Method POST -Uri "https://$scmHost/api/command" -Headers $headers -Body $kbody -TimeoutSec 120 -ErrorAction Stop
+        }
         $outLines = @()
         if ($kresp.Output) { $outLines = $kresp.Output -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -match "\|(OK|BLOCKED)\|" } }
         foreach ($t in $targets) {
