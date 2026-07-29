@@ -2400,6 +2400,17 @@ try {
             # propagation after enabling public access; a real policy denial won't match the retry
             # regex and falls through quickly to be reported as a Fail.
             if ($result.Ok) {
+                # The vault uses the access-policy model (RBAC disabled) to match the installer, so the
+                # running user has NO data-plane rights by default - the real installer instead grants
+                # the app's managed identity an access policy. Grant one for the running user here so
+                # the key/secret writes below aren't refused by the vault itself (a data-plane 403,
+                # unrelated to Azure Policy). Best-effort; a failure here is surfaced by the writes below.
+                try {
+                    if ($meObjectId) { Set-AzKeyVaultAccessPolicy -VaultName $kvName -ResourceGroupName $ResourceGroupName -ObjectId $meObjectId -PermissionsToKeys create, get, delete -PermissionsToSecrets set, get, delete -ErrorAction Stop | Out-Null }
+                    elseif ($SignedInAccount) { Set-AzKeyVaultAccessPolicy -VaultName $kvName -ResourceGroupName $ResourceGroupName -UserPrincipalName $SignedInAccount -PermissionsToKeys create, get, delete -PermissionsToSecrets set, get, delete -ErrorAction Stop | Out-Null }
+                    $result.AccessPolicySet = $true
+                }
+                catch { $result.AccessPolicySet = $false; $result.AccessPolicyError = Get-DetailedErrorMessage -ErrorRecord $_ }
                 for ($a = 1; $a -le 4; $a++) {
                     try {
                         Add-AzKeyVaultKey -VaultName $kvName -Name "nmepf-dp-key" -Destination "Software" -KeyType "RSA" -ErrorAction Stop | Out-Null
@@ -2433,9 +2444,17 @@ try {
         # Report the data-plane key/secret writes (only attempted if the enable succeeded). Key and
         # secret are children of the vault - removed when the vault is purged at cleanup.
         if ($kvToggle.Ok) {
+            # A vault data-plane permission refusal ("does not have keys/secrets ... permission",
+            # Forbidden from the access policy) means this test couldn't grant itself data-plane
+            # access - it is NOT an Azure Policy block, so report it as a WARN test limitation rather
+            # than a misleading policy Fail. A genuine Azure Policy denial (RequestDisallowedByPolicy)
+            # falls through to Add-PolicyFailureResult, which names the blocking policy.
+            $isDataPlanePermErr = { param($m) $m -and ($m -match "does not have (keys|secrets|certificates).*permission" -or $m -match "ForbiddenByPolicy" -or $m -match "AccessDenied") }
             if ($kvToggle.KeyOk) { Add-Result -Category "Deployability" -Check "Key Vault key creation (RSA data-protection key)" -Result "Pass" -Detail "Created successfully." }
+            elseif (& $isDataPlanePermErr $kvToggle.KeyError) { Add-Result -Category "Deployability" -Check "Key Vault key creation (RSA data-protection key)" -Result "Warn" -Detail "Not tested - could not grant the running user data-plane access to the throwaway vault (access-policy model). This is a test limitation, not an Azure Policy block." -Message $kvToggle.KeyError }
             else { Add-PolicyFailureResult -Category "Deployability" -Check "Key Vault key creation (RSA data-protection key)" -RawMessage $kvToggle.KeyError }
             if ($kvToggle.SecretOk) { Add-Result -Category "Deployability" -Check "Key Vault secret creation" -Result "Pass" -Detail "Created successfully." }
+            elseif (& $isDataPlanePermErr $kvToggle.SecretError) { Add-Result -Category "Deployability" -Check "Key Vault secret creation" -Result "Warn" -Detail "Not tested - could not grant the running user data-plane access to the throwaway vault (access-policy model). This is a test limitation, not an Azure Policy block." -Message $kvToggle.SecretError }
             else { Add-PolicyFailureResult -Category "Deployability" -Check "Key Vault secret creation" -RawMessage $kvToggle.SecretError }
         }
     }
