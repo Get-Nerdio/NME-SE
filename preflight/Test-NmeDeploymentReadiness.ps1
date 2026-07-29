@@ -2809,49 +2809,65 @@ finally {
     #region Cleanup ------------------------------------------------------------------------------
     $removeAll = Read-YesNo -Prompt "Remove all resources created by this test? [Y/n]" -Default "y"
     if ($removeAll) {
-        Write-Host -ForegroundColor "Cyan" "Removing created resources (reverse order)..."
-        # Locks first, in their own pass: a lock can be created (during the parallel checks)
-        # before the resource that later depends on it being gone (e.g. the private endpoint,
-        # whose removal deletes a privateEndpointConnectionProxies sub-resource on the storage
-        # account) is even created, so strict reverse-creation order can hit a locked scope.
-        for ($i = $Tracker.Count - 1; $i -ge 0; $i--) {
-            $t = $Tracker[$i]
-            if ($t.Type -ne "lock") { continue }
-            try {
-                Remove-AzResourceLock -LockId $t.Id -Force -ErrorAction Continue | Out-Null
-                Write-Host "  removed $($t.Type): $($t.Name)"
-            }
-            catch { Write-Host -ForegroundColor "Yellow" "  could not remove $($t.Type) '$($t.Name)': $($_.Exception.Message)" }
-        }
-        # Reverse the tracker so dependents are removed before dependencies.
-        for ($i = $Tracker.Count - 1; $i -ge 0; $i--) {
-            $t = $Tracker[$i]
-            if ($t.Type -eq "lock") { continue }
+        Write-Host -ForegroundColor "Cyan" "Removing created resources in parallel waves..."
+        # Per-resource removal as a scriptblock so each can run in its own ThreadJob (which shares the
+        # Az context in-process, like the deployability jobs). Only direct Az cmdlet calls - no script
+        # functions - so no InitializationScript is needed. Returns a plain result the main thread
+        # prints after the wave completes.
+        $removeOne = {
+            param($t, $Location)
             try {
                 switch ($t.Type) {
-                    "privateendpoint" { Remove-AzPrivateEndpoint -ResourceGroupName $t.ResourceGroupName -Name $t.Name -Force -ErrorAction Continue | Out-Null }
-                    "webapp" { Remove-AzWebApp -ResourceGroupName $t.ResourceGroupName -Name $t.Name -Force -ErrorAction Continue | Out-Null }
-                    "asp" { Remove-AzAppServicePlan -ResourceGroupName $t.ResourceGroupName -Name $t.Name -Force -ErrorAction Continue | Out-Null }
-                    "automation" { Remove-AzAutomationAccount -ResourceGroupName $t.ResourceGroupName -Name $t.Name -Force -ErrorAction Continue | Out-Null }
+                    "lock" { Remove-AzResourceLock -LockId $t.Id -Force -ErrorAction Stop | Out-Null }
+                    "privateendpoint" { Remove-AzPrivateEndpoint -ResourceGroupName $t.ResourceGroupName -Name $t.Name -Force -ErrorAction Stop | Out-Null }
+                    "webapp" { Remove-AzWebApp -ResourceGroupName $t.ResourceGroupName -Name $t.Name -Force -ErrorAction Stop | Out-Null }
+                    "asp" { Remove-AzAppServicePlan -ResourceGroupName $t.ResourceGroupName -Name $t.Name -Force -ErrorAction Stop | Out-Null }
+                    "automation" { Remove-AzAutomationAccount -ResourceGroupName $t.ResourceGroupName -Name $t.Name -Force -ErrorAction Stop | Out-Null }
                     "kv" {
-                        Remove-AzKeyVault -ResourceGroupName $t.ResourceGroupName -VaultName $t.Name -Force -ErrorAction Continue | Out-Null
-                        try { Remove-AzKeyVault -VaultName $t.Name -Location $Location -InRemovedState -Force -ErrorAction Continue | Out-Null } catch {}
+                        Remove-AzKeyVault -ResourceGroupName $t.ResourceGroupName -VaultName $t.Name -Force -ErrorAction Stop | Out-Null
+                        try { Remove-AzKeyVault -VaultName $t.Name -Location $Location -InRemovedState -Force -ErrorAction Stop | Out-Null } catch {}
                     }
-                    "sqldatabase" { Remove-AzSqlDatabase -ResourceGroupName $t.ResourceGroupName -ServerName $t.Note -DatabaseName $t.Name -Force -ErrorAction Continue | Out-Null }
-                    "sqlserver" { Remove-AzSqlServer -ResourceGroupName $t.ResourceGroupName -ServerName $t.Name -Force -ErrorAction Continue | Out-Null }
-                    "storage" { Remove-AzStorageAccount -ResourceGroupName $t.ResourceGroupName -Name $t.Name -Force -ErrorAction Continue | Out-Null }
-                    "law" { Remove-AzOperationalInsightsWorkspace -ResourceGroupName $t.ResourceGroupName -Name $t.Name -Force -ForceDelete -ErrorAction Continue | Out-Null }
-                    "vnet" { Remove-AzVirtualNetwork -ResourceGroupName $t.ResourceGroupName -Name $t.Name -Force -ErrorAction Continue | Out-Null }
-                    "privatednszone" { Remove-AzPrivateDnsZone -ResourceGroupName $t.ResourceGroupName -Name $t.Name -Confirm:$false -ErrorAction Continue | Out-Null }
-                    "appinsights" { Remove-AzResource -ResourceId $t.Id -Force -ErrorAction Continue | Out-Null }
-                    "dcr" { Remove-AzResource -ResourceId $t.Id -Force -ErrorAction Continue | Out-Null }
-                    "dce" { Remove-AzResource -ResourceId $t.Id -Force -ErrorAction Continue | Out-Null }
-                    "roleassignment" { Remove-AzRoleAssignment -ObjectId $t.Note -RoleDefinitionName "Contributor" -Scope $t.Id -ErrorAction Continue | Out-Null }
+                    "sqldatabase" { Remove-AzSqlDatabase -ResourceGroupName $t.ResourceGroupName -ServerName $t.Note -DatabaseName $t.Name -Force -ErrorAction Stop | Out-Null }
+                    "sqlserver" { Remove-AzSqlServer -ResourceGroupName $t.ResourceGroupName -ServerName $t.Name -Force -ErrorAction Stop | Out-Null }
+                    "storage" { Remove-AzStorageAccount -ResourceGroupName $t.ResourceGroupName -Name $t.Name -Force -ErrorAction Stop | Out-Null }
+                    "law" { Remove-AzOperationalInsightsWorkspace -ResourceGroupName $t.ResourceGroupName -Name $t.Name -Force -ForceDelete -ErrorAction Stop | Out-Null }
+                    "vnet" { Remove-AzVirtualNetwork -ResourceGroupName $t.ResourceGroupName -Name $t.Name -Force -ErrorAction Stop | Out-Null }
+                    "privatednszone" { Remove-AzPrivateDnsZone -ResourceGroupName $t.ResourceGroupName -Name $t.Name -Confirm:$false -ErrorAction Stop | Out-Null }
+                    "appinsights" { Remove-AzResource -ResourceId $t.Id -Force -ErrorAction Stop | Out-Null }
+                    "dcr" { Remove-AzResource -ResourceId $t.Id -Force -ErrorAction Stop | Out-Null }
+                    "dce" { Remove-AzResource -ResourceId $t.Id -Force -ErrorAction Stop | Out-Null }
+                    "roleassignment" { Remove-AzRoleAssignment -ObjectId $t.Note -RoleDefinitionName "Contributor" -Scope $t.Id -ErrorAction Stop | Out-Null }
                     default { }
                 }
-                Write-Host "  removed $($t.Type): $($t.Name)"
+                @{ Type = $t.Type; Name = $t.Name; Ok = $true }
             }
-            catch { Write-Host -ForegroundColor "Yellow" "  could not remove $($t.Type) '$($t.Name)': $($_.Exception.Message)" }
+            catch { @{ Type = $t.Type; Name = $t.Name; Ok = $false; Error = $_.Exception.Message } }
+        }
+
+        # Remove in dependency-ordered waves; everything WITHIN a wave runs in parallel, and the waves
+        # run one after another (Wait-JobsWithDots is a barrier). Locks first (they guard the SQL
+        # database / Key Vault / storage account from deletion), then dependent resources (each removed
+        # before its parent - private endpoints before the VNet and their target resources, SQL database
+        # before its server, DCR before its DCE, web apps before their plans), then the primary
+        # resources. A type not present this run just yields an empty wave that's skipped.
+        $removalWaves = @(
+            @{ Label = "locks"; Types = @("lock") },
+            @{ Label = "dependent resources"; Types = @("privateendpoint", "webapp", "sqldatabase", "dcr", "appinsights", "roleassignment") },
+            @{ Label = "primary resources"; Types = @("asp", "automation", "kv", "sqlserver", "storage", "law", "vnet", "dce", "privatednszone") }
+        )
+        foreach ($wave in $removalWaves) {
+            $waveItems = @($Tracker | Where-Object { $_.Type -in $wave.Types })
+            if ($waveItems.Count -eq 0) { continue }
+            $rmJobs = @()
+            foreach ($t in $waveItems) {
+                $rmJobs += Start-ThreadJob -Name "Remove-$($t.Type)-$($t.Name)" -ScriptBlock $removeOne -ArgumentList $t, $Location
+            }
+            $rmResults = Wait-JobsWithDots -Jobs $rmJobs -Activity "Removing $($wave.Label)"
+            $rmJobs | Remove-Job -Force -ErrorAction SilentlyContinue
+            foreach ($rr in $rmResults) {
+                if ($rr.Ok) { Write-Host "  removed $($rr.Type): $($rr.Name)" }
+                else { Write-Host -ForegroundColor "Yellow" "  could not remove $($rr.Type) '$($rr.Name)': $($rr.Error)" }
+            }
         }
         if ($CreatedResourceGroup) {
             if (Read-YesNo -Prompt "Also remove the temporary resource group '$ResourceGroupName'? [Y/n]" -Default "y") {
