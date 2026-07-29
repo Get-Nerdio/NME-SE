@@ -1313,10 +1313,11 @@ function Test-PrivateEndpoints {
     return $PeTargets
 }
 
-function Test-OutboundConnectivityViaKudu {
+# Builds the per-service DNS descriptor list (FQDN -> expected private IP -> owning privatelink zone)
+# from the created private endpoints. Single source of truth for both the DNS-resolution probe and
+# the rigging guidance. Automation is skipped - it has no cleanly-derivable FQDN here.
+function Get-PeDnsTarget {
     param(
-        [Parameter(Mandatory = $true)] $Vnet,
-        [Parameter(Mandatory = $true)] $AzEnv,
         [Parameter(Mandatory = $true)] $PeTargets,
         [Parameter(Mandatory = $true)][string] $sqlName,
         [Parameter(Mandatory = $true)][string] $SqlSuffix,
@@ -1324,6 +1325,153 @@ function Test-OutboundConnectivityViaKudu {
         [Parameter(Mandatory = $true)][string] $KeyVaultSuffix,
         [Parameter(Mandatory = $true)][string] $stName,
         [Parameter(Mandatory = $true)][string] $StorageSuffix,
+        [Parameter(Mandatory = $true)] $AzEnv
+    )
+    $out = @()
+    foreach ($pt in $PeTargets) {
+        $fqdn = $null; $zone = $null
+        switch ($pt.Service) {
+            "SQL Server" { $fqdn = "$sqlName.$SqlSuffix"; $zone = "privatelink.$SqlSuffix" }
+            "Key Vault" { $fqdn = "$kvName.$KeyVaultSuffix"; $zone = (Get-EnvSuffix -AzEnvName $AzEnv.Name -Kind PrivateDnsKeyVault) }
+            "Storage" { $fqdn = "$stName.blob.$StorageSuffix"; $zone = "privatelink.blob.$StorageSuffix" }
+            default { }
+        }
+        if ($fqdn) {
+            $out += [pscustomobject]@{ Service = $pt.Service; Fqdn = $fqdn; ExpectedIp = $pt.PrivateIp; Port = $pt.Port; Zone = $zone }
+        }
+    }
+    return $out
+}
+
+# Re-runnable DNS-resolution probe: resolves each private-endpoint FQDN from inside the VNet
+# (via the integrated worker's Kudu command API) and reports whether it resolves to that endpoint's
+# private IP. Runs standalone against already-created PEs + web app so it can be repeated after the
+# customer changes DNS, without recreating anything. Returns a rollup so the caller can loop.
+function Invoke-DnsResolutionProbe {
+    param(
+        [Parameter(Mandatory = $true)] $Vnet,
+        [Parameter(Mandatory = $true)] $AzEnv,
+        [Parameter(Mandatory = $true)] $DnsTargets,
+        [Parameter(Mandatory = $true)] $Web,
+        [Parameter(Mandatory = $true)][string] $webName
+    )
+    $usesCustomDns = $Vnet.DhcpOptions.DnsServers -and $Vnet.DhcpOptions.DnsServers.Count -gt 0
+    $probed = 0; $confirmed = 0
+
+    if (-not $DnsTargets -or @($DnsTargets).Count -eq 0) {
+        return [pscustomobject]@{ Probed = 0; Confirmed = 0; UsesCustomDns = $usesCustomDns }
+    }
+
+    $scmHost = ($Web.EnabledHostNames | Where-Object { $_ -match "\.scm\." } | Select-Object -First 1)
+    if (-not $scmHost) { $scmHost = "$webName.scm.$(Get-EnvSuffix -AzEnvName $AzEnv.Name -Kind AzureWebsitesHost)" }
+    $rawTok = (Get-AzAccessToken -ResourceUrl $AzEnv.ResourceManagerUrl -ErrorAction Stop).Token
+    $kuduToken = if ($rawTok -is [System.Security.SecureString]) { [System.Net.NetworkCredential]::new("", $rawTok).Password } else { $rawTok }
+    $headers = @{ Authorization = "Bearer $kuduToken"; "Content-Type" = "application/json" }
+
+    # Resolve-only remote command: emit "<fqdn>|<ipv4-or-empty>" per target. No TCP connect - PE
+    # reachability by IP is already proven by Test-OutboundConnectivityViaKudu.
+    $fqList = ($DnsTargets | ForEach-Object { "'$($_.Fqdn)'" }) -join ","
+    $remoteCmd = "`$ProgressPreference='SilentlyContinue';foreach(`$u in @($fqList)){`$ip='';try{`$ip=(([System.Net.Dns]::GetHostAddresses(`$u))|Where-Object{`$_.AddressFamily -eq 'InterNetwork'}|Select-Object -First 1).IPAddressToString}catch{};Write-Output (`$u+'|'+`$ip)}"
+    $kbody = @{ command = "powershell -NoProfile -Command `"$remoteCmd`""; dir = "site\wwwroot" } | ConvertTo-Json
+
+    try {
+        $kresp = Invoke-WithSpinner -Activity "Testing private DNS resolution via the VNet-integrated worker" -ScriptBlock {
+            Invoke-RestMethod -Method POST -Uri "https://$scmHost/api/command" -Headers $headers -Body $kbody -TimeoutSec 120 -ErrorAction Stop
+        }
+        $outLines = @()
+        if ($kresp.Output) { $outLines = $kresp.Output -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -match "\|" } }
+        foreach ($t in $DnsTargets) {
+            $probed++
+            $line = $outLines | Where-Object { ($_ -split "\|")[0] -eq $t.Fqdn } | Select-Object -First 1
+            $resolvedIp = if ($line) { ($line -split "\|")[1] } else { $null }
+            if ($resolvedIp -and $resolvedIp -eq $t.ExpectedIp) {
+                $confirmed++
+                Add-Result -Category "Connectivity" -Check "Private DNS resolution: $($t.Service)" -Result "Pass" -Detail "$($t.Fqdn) resolves to the private endpoint IP ($resolvedIp)."
+            }
+            elseif ($resolvedIp) {
+                Add-Result -Category "Connectivity" -Check "Private DNS resolution: $($t.Service)" -Result "Warn" -Detail "$($t.Fqdn) resolves to $resolvedIp, not the private endpoint IP ($($t.ExpectedIp)). DNS is still returning a public/other address."
+            }
+            else {
+                Add-Result -Category "Connectivity" -Check "Private DNS resolution: $($t.Service)" -Result "Warn" -Detail "$($t.Fqdn) did not resolve from the VNet. The private endpoint IP is $($t.ExpectedIp)."
+            }
+        }
+    }
+    catch {
+        Add-Result -Category "Connectivity" -Check "Private DNS resolution" -Result "Warn" -Detail "Could not run the in-worker DNS resolution test via Kudu." -Message $_.Exception.Message
+        return [pscustomobject]@{ Probed = 0; Confirmed = 0; UsesCustomDns = $usesCustomDns }
+    }
+
+    if ($probed -gt 0 -and $confirmed -eq $probed) {
+        Add-Result -Category "Connectivity" -Check "Private endpoint DNS resolution (overall)" -Result "Pass" -Detail "All $probed private-endpoint FQDNs resolve to their private IPs from the VNet."
+    }
+    elseif ($confirmed -gt 0) {
+        Add-Result -Category "Connectivity" -Check "Private endpoint DNS resolution (overall)" -Result "Warn" -Detail "$confirmed of $probed private-endpoint FQDNs resolve privately; the rest still need DNS configured (see guidance)."
+    }
+    else {
+        Add-Result -Category "Connectivity" -Check "Private endpoint DNS resolution (overall)" -Result "Warn" -Detail "None of the $probed private-endpoint FQDNs resolve to their private IPs from the VNet yet (see guidance to configure DNS)."
+    }
+
+    return [pscustomobject]@{ Probed = $probed; Confirmed = $confirmed; UsesCustomDns = $usesCustomDns }
+}
+
+# Prints the exact steps + Microsoft-docs links to make the privatelink FQDNs resolve to the private
+# endpoints. Two branches: Azure Private DNS zones vs. custom/on-prem DNS.
+function Show-DnsResolutionGuidance {
+    param(
+        [Parameter(Mandatory = $true)][bool] $UsesCustomDns,
+        [Parameter(Mandatory = $true)] $DnsTargets,
+        [Parameter(Mandatory = $true)][string] $VnetName
+    )
+    Write-Host ""
+    Write-Host -ForegroundColor "Cyan" "  The private-endpoint FQDNs are not yet resolving to their private IPs from VNet '$VnetName'."
+    Write-Host -ForegroundColor "Cyan" "  Each of these names must resolve, from inside the VNet, to the listed private endpoint IP:"
+    foreach ($t in $DnsTargets) {
+        Write-Host ("    - {0,-38} -> {1}   (zone: {2})" -f $t.Fqdn, $t.ExpectedIp, $t.Zone)
+    }
+    if ($UsesCustomDns) {
+        Write-HelpText -Text @"
+VNet '$VnetName' uses CUSTOM DNS servers, so Azure will not resolve the privatelink names for you - your custom DNS must do it.
+
+To make the FQDNs above resolve to the private endpoint IPs, do ONE of:
+
+1) Recommended - forward to Azure DNS: create the required Azure Private DNS zones (listed above), link each one to a VNet that a DNS forwarder / Azure Private Resolver sits in, then configure your custom DNS servers to conditionally forward the PUBLIC zone names (e.g. database.windows.net, vault.azure.net, blob.core.windows.net) to that forwarder / resolver (which forwards to Azure DNS at 168.63.129.16). Conditional-forward the PUBLIC name, not the 'privatelink.' name.
+
+2) Manual A records: add an A record on your custom DNS for each FQDN above pointing at the listed private endpoint IP. Simplest to stand up, but you must maintain the IPs by hand if a private endpoint is recreated.
+
+Microsoft docs:
+  - Private Endpoint DNS integration (custom DNS / on-prem forwarder / Private Resolver scenarios):
+    https://learn.microsoft.com/en-us/azure/private-link/private-endpoint-dns-integration
+  - Private Endpoint private DNS zone values (the exact zone name per Azure service):
+    https://learn.microsoft.com/en-us/azure/private-link/private-endpoint-dns
+"@
+    }
+    else {
+        Write-HelpText -Text @"
+VNet '$VnetName' uses Azure-provided DNS, so Azure Private DNS zones are how these names resolve to the private endpoints.
+
+Steps:
+
+1) Create the required Azure Private DNS zones (one per service, listed above), if they don't already exist.
+
+2) Link each zone to VNet '$VnetName' with a virtual network link (a 'resolution' link is sufficient; auto-registration is not needed). After linking, the link status can take a few minutes to reach Completed.
+
+3) Ensure each private endpoint has an A record in its zone pointing to the endpoint's private IP. The clean way is to add a Private DNS zone GROUP to each private endpoint - Azure then creates and maintains the A records automatically (and updates them if the endpoint changes). Otherwise add the A records manually to the zones.
+
+Microsoft docs:
+  - Private Endpoint DNS configuration & private DNS zone group:
+    https://learn.microsoft.com/en-us/azure/private-link/private-endpoint-dns-integration
+  - Link a virtual network to a private DNS zone:
+    https://learn.microsoft.com/en-us/azure/dns/private-dns-virtual-network-links
+  - Private Endpoint private DNS zone values (the exact zone name per Azure service):
+    https://learn.microsoft.com/en-us/azure/private-link/private-endpoint-dns
+"@
+    }
+}
+
+function Test-OutboundConnectivityViaKudu {
+    param(
+        [Parameter(Mandatory = $true)] $AzEnv,
+        [Parameter(Mandatory = $true)] $PeTargets,
         [Parameter(Mandatory = $true)] $Web,
         [Parameter(Mandatory = $true)][string] $webName,
         [Parameter(Mandatory = $true)][string] $AppSubnetName,
@@ -1371,41 +1519,14 @@ function Test-OutboundConnectivityViaKudu {
     # PLUS each Part (b) private endpoint's private IP (tested by IP, TCP only - PE
     # privatelink FQDNs won't resolve without registering DNS records, which this
     # script must not do). Kept as an ordered list so results can be attributed back
-    # per-target after the worker run.
+    # per-target after the worker run. PE-FQDN DNS resolution is probed separately by
+    # Invoke-DnsResolutionProbe so it can be re-run after the customer changes DNS.
     $targets = @()
     foreach ($ep in $endpoints) {
-        $targets += [pscustomobject]@{ Key = $ep.Uri; Port = $ep.Port; Label = "Outbound: $($ep.Uri)"; Purpose = $ep.Purpose; IsPe = $false; IsDns = $false; Service = $null; ExpectedIp = $null }
+        $targets += [pscustomobject]@{ Key = $ep.Uri; Port = $ep.Port; Label = "Outbound: $($ep.Uri)"; Purpose = $ep.Purpose; IsPe = $false; Service = $null }
     }
     foreach ($pt in $PeTargets) {
-        $targets += [pscustomobject]@{ Key = $pt.PrivateIp; Port = $pt.Port; Label = "Private endpoint reachability: $($pt.Service)"; Purpose = $null; IsPe = $true; IsDns = $false; Service = $pt.Service; ExpectedIp = $null }
-    }
-
-    # Part (d): whether the existing VNet resolves via Azure DNS or custom DNS
-    # servers - same detection the verification region above uses. This gates
-    # whether PE-FQDN DNS resolution can be meaningfully tested (Azure DNS only)
-    # and always drives the DNS-unconfirmed summary flag emitted below.
-    $usesCustomDns = $Vnet.DhcpOptions.DnsServers -and $Vnet.DhcpOptions.DnsServers.Count -gt 0
-
-    # Part (d): only on Azure-DNS VNets, additionally probe whether each created
-    # PE's resource FQDN already resolves to that PE's private IP from inside the
-    # VNet - this only happens if private DNS auto-registration (an Azure Policy DINE
-    # assignment, or a pre-linked zone with a zone group) is already active. It is
-    # NOT expected out of the box and is purely informational - reachability above
-    # was already proven by private IP regardless of this result. Automation has no
-    # cleanly-derivable FQDN here, so it is skipped (it still gets reachability-by-IP
-    # from Part c).
-    if (-not $usesCustomDns) {
-        foreach ($pt in $PeTargets) {
-            $peFqdn = switch ($pt.Service) {
-                "SQL Server" { "$sqlName.$SqlSuffix" }
-                "Key Vault" { "$kvName.$KeyVaultSuffix" }
-                "Storage" { "$stName.blob.$StorageSuffix" }
-                default { $null }
-            }
-            if ($peFqdn) {
-                $targets += [pscustomobject]@{ Key = $peFqdn; Port = $pt.Port; Label = "Private DNS resolution: $($pt.Service)"; Purpose = $null; IsPe = $false; IsDns = $true; Service = $pt.Service; ExpectedIp = $pt.PrivateIp }
-            }
-        }
+        $targets += [pscustomobject]@{ Key = $pt.PrivateIp; Port = $pt.Port; Label = "Private endpoint reachability: $($pt.Service)"; Purpose = $null; IsPe = $true; Service = $pt.Service }
     }
 
     # Run the outbound/PE reachability test FROM the worker via the Kudu/SCM command
@@ -1420,8 +1541,6 @@ function Test-OutboundConnectivityViaKudu {
     $remoteCmd = "`$ProgressPreference='SilentlyContinue';foreach(`$e in @($epList)){`$pp=`$e -split '\|';`$u=`$pp[0];`$p=[int]`$pp[1];`$ip='';try{`$ip=(([System.Net.Dns]::GetHostAddresses(`$u))|Where-Object{`$_.AddressFamily -eq 'InterNetwork'}|Select-Object -First 1).IPAddressToString}catch{};`$ok=`$false;try{`$c=New-Object System.Net.Sockets.TcpClient;`$ar=`$c.BeginConnect(`$u,`$p,`$null,`$null);if(`$ar.AsyncWaitHandle.WaitOne(10000)){try{`$c.EndConnect(`$ar);`$ok=`$c.Connected}catch{}};`$c.Close()}catch{};`$sub='';if(`$p -eq 443 -and `$ok){try{`$sp=[System.Net.ServicePointManager]::FindServicePoint('https://'+`$u);`$null=Invoke-RestMethod -Uri ('https://'+`$u) -TimeoutSec 15 -ErrorAction SilentlyContinue;`$sub=`$sp.Certificate.Subject}catch{}};`$st=if(`$ok){'OK'}else{'BLOCKED'};Write-Output (`$u+'|'+`$st+'|'+`$ip+'|'+`$sub)}"
     $kbody = @{ command = "powershell -NoProfile -Command `"$remoteCmd`""; dir = "site\wwwroot" } | ConvertTo-Json
     $headers = @{ Authorization = "Bearer $kuduToken"; "Content-Type" = "application/json" }
-    $dnsProbeCount = 0
-    $dnsConfirmedCount = 0
     try {
         $kresp = Invoke-WithSpinner -Activity "Running in-worker connectivity test via Kudu" -ScriptBlock {
             Invoke-RestMethod -Method POST -Uri "https://$scmHost/api/command" -Headers $headers -Body $kbody -TimeoutSec 120 -ErrorAction Stop
@@ -1441,25 +1560,6 @@ function Test-OutboundConnectivityViaKudu {
                     Add-Result -Category "Connectivity" -Check $t.Label -Result "Warn" -Detail "No result returned from the worker for this target."
                 }
             }
-            elseif ($t.IsDns) {
-                # Part (d): does the resource FQDN resolve to the PE's private IP from
-                # inside the VNet? A match proves private DNS auto-registration is
-                # active; anything else is informational only - Part (c) already
-                # proved reachability by private IP regardless of this outcome.
-                $dnsProbeCount++
-                $resolvedIp = $null
-                if ($line) { $resolvedIp = ($line -split "\|")[2] }
-                if ($resolvedIp -and $resolvedIp -eq $t.ExpectedIp) {
-                    $dnsConfirmedCount++
-                    Add-Result -Category "Connectivity" -Check $t.Label -Result "Pass" -Detail "Resolves to private IP (auto-registered)."
-                }
-                elseif ($resolvedIp) {
-                    Add-Result -Category "Connectivity" -Check $t.Label -Result "Warn" -Detail "Resolves to public IP"
-                }
-                else {
-                    Add-Result -Category "Connectivity" -Check $t.Label -Result "Info" -Detail "Did not resolve - private DNS zone required at install."
-                }
-            }
             else {
                 if ($line -and $line -match "\|OK\|") {
                     Add-Result -Category "Connectivity" -Check $t.Label -Result "Pass" -Detail "$($t.Purpose)."
@@ -1477,20 +1577,6 @@ function Test-OutboundConnectivityViaKudu {
     }
     catch {
         Add-Result -Category "Connectivity" -Check "Kudu outbound test" -Result "Warn" -Detail "Could not run the in-worker connectivity test via Kudu. From the App Service Kudu console for '$webName': $NmeNetworkTestHint Endpoints to test: $(($endpoints | ForEach-Object { $_.Uri }) -join ', ')." -Message $_.Exception.Message
-    }
-
-    # Part (d): ALWAYS emit a summary flag (both custom-DNS and Azure-DNS
-    # existing-VNet paths) so the report never implies production DNS resolution of
-    # the privatelink FQDNs is proven when it isn't - reachability above is proven by
-    # private IP only unless private DNS auto-registration was just confirmed.
-    if ($usesCustomDns) {
-        Add-Result -Category "Connectivity" -Check "Private endpoint DNS resolution (overall)" -Result "Info" -Detail "Custom DNS - not tested; reachability confirmed by private IP only."
-    }
-    elseif ($dnsConfirmedCount -eq 0) {
-        Add-Result -Category "Connectivity" -Check "Private endpoint DNS resolution (overall)" -Result "Info" -Detail "All public - private DNS zones required at install."
-    }
-    else {
-        Add-Result -Category "Connectivity" -Check "Private endpoint DNS resolution (overall)" -Result "Info" -Detail "$dnsConfirmedCount of $dnsProbeCount resolve privately; rest require private DNS zone config at install."
     }
 }
 #endregion
@@ -2722,7 +2808,25 @@ try {
                         Add-Result -Category "Connectivity" -Check "Outbound connectivity test" -Result "Info" -Detail "Skipped - VNet '$ExistingVnetName' is brand-new with no customer-configured routing/firewall/DNS yet. VNet integration, subnet delegation, and the test App Service were created and confirmed configured correctly. Once the customer's real egress controls (firewall, UDRs, custom DNS) are in place, run NmeNetworkTest.ps1 against the real NME App Service to validate outbound connectivity."
                     }
                     else {
-                        Test-OutboundConnectivityViaKudu -Vnet $vnet -AzEnv $AzEnv -PeTargets $PeTargets -sqlName $sqlName -SqlSuffix $SqlSuffix -kvName $kvName -KeyVaultSuffix $KeyVaultSuffix -stName $stName -StorageSuffix $StorageSuffix -Web $web -webName $webName -AppSubnetName $AppSubnetName -PeSubnetName $PeSubnetName -NmeNetworkTestHint $NmeNetworkTestHint
+                        Test-OutboundConnectivityViaKudu -AzEnv $AzEnv -PeTargets $PeTargets -Web $web -webName $webName -AppSubnetName $AppSubnetName -PeSubnetName $PeSubnetName -NmeNetworkTestHint $NmeNetworkTestHint
+
+                        # DNS-resolution probe + same-run retry loop (existing-VNet only; PEs must exist).
+                        # When the privatelink FQDNs don't resolve to their private IPs, print the exact
+                        # DNS-rigging steps and offer to re-test after the customer fixes DNS - nothing is
+                        # torn down between attempts, so a retry is just another in-worker DNS lookup.
+                        $dnsTargets = Get-PeDnsTarget -PeTargets $PeTargets -sqlName $sqlName -SqlSuffix $SqlSuffix -kvName $kvName -KeyVaultSuffix $KeyVaultSuffix -stName $stName -StorageSuffix $StorageSuffix -AzEnv $AzEnv
+                        if (@($dnsTargets).Count -gt 0) {
+                            $dnsRollup = Invoke-DnsResolutionProbe -Vnet $vnet -AzEnv $AzEnv -DnsTargets $dnsTargets -Web $web -webName $webName
+                            while ($dnsRollup.Probed -gt 0 -and $dnsRollup.Confirmed -lt $dnsRollup.Probed) {
+                                Show-DnsResolutionGuidance -UsesCustomDns ([bool]$dnsRollup.UsesCustomDns) -DnsTargets $dnsTargets -VnetName $ExistingVnetName
+                                if (-not (Read-YesNo -Prompt "Re-run the DNS resolution test now? Make your DNS changes first, then choose Y. [y/N]" -Default "n")) { break }
+                                # Drop the prior DNS rows so the report shows only the latest attempt.
+                                [void]$Results.RemoveAll({ param($r) $r.Category -eq "Connectivity" -and ($r.Check -like "Private DNS resolution:*" -or $r.Check -eq "Private endpoint DNS resolution (overall)") })
+                                # Re-read the VNet in case the customer just linked a zone / changed DNS servers.
+                                try { $vnet = Get-AzVirtualNetwork -ResourceGroupName $ExistingVnetRg -Name $ExistingVnetName -ErrorAction Stop } catch {}
+                                $dnsRollup = Invoke-DnsResolutionProbe -Vnet $vnet -AzEnv $AzEnv -DnsTargets $dnsTargets -Web $web -webName $webName
+                            }
+                        }
                     }
                     }
                     else {
