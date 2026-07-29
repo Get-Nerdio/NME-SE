@@ -1313,10 +1313,11 @@ function Test-PrivateEndpoints {
     return $PeTargets
 }
 
-function Test-OutboundConnectivityViaKudu {
+# Builds the per-service DNS descriptor list (FQDN -> expected private IP -> owning privatelink zone)
+# from the created private endpoints. Single source of truth for both the DNS-resolution probe and
+# the rigging guidance. Automation is skipped - it has no cleanly-derivable FQDN here.
+function Get-PeDnsTarget {
     param(
-        [Parameter(Mandatory = $true)] $Vnet,
-        [Parameter(Mandatory = $true)] $AzEnv,
         [Parameter(Mandatory = $true)] $PeTargets,
         [Parameter(Mandatory = $true)][string] $sqlName,
         [Parameter(Mandatory = $true)][string] $SqlSuffix,
@@ -1324,6 +1325,153 @@ function Test-OutboundConnectivityViaKudu {
         [Parameter(Mandatory = $true)][string] $KeyVaultSuffix,
         [Parameter(Mandatory = $true)][string] $stName,
         [Parameter(Mandatory = $true)][string] $StorageSuffix,
+        [Parameter(Mandatory = $true)] $AzEnv
+    )
+    $out = @()
+    foreach ($pt in $PeTargets) {
+        $fqdn = $null; $zone = $null
+        switch ($pt.Service) {
+            "SQL Server" { $fqdn = "$sqlName.$SqlSuffix"; $zone = "privatelink.$SqlSuffix" }
+            "Key Vault" { $fqdn = "$kvName.$KeyVaultSuffix"; $zone = (Get-EnvSuffix -AzEnvName $AzEnv.Name -Kind PrivateDnsKeyVault) }
+            "Storage" { $fqdn = "$stName.blob.$StorageSuffix"; $zone = "privatelink.blob.$StorageSuffix" }
+            default { }
+        }
+        if ($fqdn) {
+            $out += [pscustomobject]@{ Service = $pt.Service; Fqdn = $fqdn; ExpectedIp = $pt.PrivateIp; Port = $pt.Port; Zone = $zone }
+        }
+    }
+    return $out
+}
+
+# Re-runnable DNS-resolution probe: resolves each private-endpoint FQDN from inside the VNet
+# (via the integrated worker's Kudu command API) and reports whether it resolves to that endpoint's
+# private IP. Runs standalone against already-created PEs + web app so it can be repeated after the
+# customer changes DNS, without recreating anything. Returns a rollup so the caller can loop.
+function Invoke-DnsResolutionProbe {
+    param(
+        [Parameter(Mandatory = $true)] $Vnet,
+        [Parameter(Mandatory = $true)] $AzEnv,
+        [Parameter(Mandatory = $true)] $DnsTargets,
+        [Parameter(Mandatory = $true)] $Web,
+        [Parameter(Mandatory = $true)][string] $webName
+    )
+    $usesCustomDns = $Vnet.DhcpOptions.DnsServers -and $Vnet.DhcpOptions.DnsServers.Count -gt 0
+    $probed = 0; $confirmed = 0
+
+    if (-not $DnsTargets -or @($DnsTargets).Count -eq 0) {
+        return [pscustomobject]@{ Probed = 0; Confirmed = 0; UsesCustomDns = $usesCustomDns }
+    }
+
+    $scmHost = ($Web.EnabledHostNames | Where-Object { $_ -match "\.scm\." } | Select-Object -First 1)
+    if (-not $scmHost) { $scmHost = "$webName.scm.$(Get-EnvSuffix -AzEnvName $AzEnv.Name -Kind AzureWebsitesHost)" }
+    $rawTok = (Get-AzAccessToken -ResourceUrl $AzEnv.ResourceManagerUrl -ErrorAction Stop).Token
+    $kuduToken = if ($rawTok -is [System.Security.SecureString]) { [System.Net.NetworkCredential]::new("", $rawTok).Password } else { $rawTok }
+    $headers = @{ Authorization = "Bearer $kuduToken"; "Content-Type" = "application/json" }
+
+    # Resolve-only remote command: emit "<fqdn>|<ipv4-or-empty>" per target. No TCP connect - PE
+    # reachability by IP is already proven by Test-OutboundConnectivityViaKudu.
+    $fqList = ($DnsTargets | ForEach-Object { "'$($_.Fqdn)'" }) -join ","
+    $remoteCmd = "`$ProgressPreference='SilentlyContinue';foreach(`$u in @($fqList)){`$ip='';try{`$ip=(([System.Net.Dns]::GetHostAddresses(`$u))|Where-Object{`$_.AddressFamily -eq 'InterNetwork'}|Select-Object -First 1).IPAddressToString}catch{};Write-Output (`$u+'|'+`$ip)}"
+    $kbody = @{ command = "powershell -NoProfile -Command `"$remoteCmd`""; dir = "site\wwwroot" } | ConvertTo-Json
+
+    try {
+        $kresp = Invoke-WithSpinner -Activity "Testing private DNS resolution via the VNet-integrated worker" -ScriptBlock {
+            Invoke-RestMethod -Method POST -Uri "https://$scmHost/api/command" -Headers $headers -Body $kbody -TimeoutSec 120 -ErrorAction Stop
+        }
+        $outLines = @()
+        if ($kresp.Output) { $outLines = $kresp.Output -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -match "\|" } }
+        foreach ($t in $DnsTargets) {
+            $probed++
+            $line = $outLines | Where-Object { ($_ -split "\|")[0] -eq $t.Fqdn } | Select-Object -First 1
+            $resolvedIp = if ($line) { ($line -split "\|")[1] } else { $null }
+            if ($resolvedIp -and $resolvedIp -eq $t.ExpectedIp) {
+                $confirmed++
+                Add-Result -Category "Connectivity" -Check "Private DNS resolution: $($t.Service)" -Result "Pass" -Detail "$($t.Fqdn) resolves to the private endpoint IP ($resolvedIp)."
+            }
+            elseif ($resolvedIp) {
+                Add-Result -Category "Connectivity" -Check "Private DNS resolution: $($t.Service)" -Result "Warn" -Detail "$($t.Fqdn) resolves to $resolvedIp, not the private endpoint IP ($($t.ExpectedIp)). DNS is still returning a public/other address."
+            }
+            else {
+                Add-Result -Category "Connectivity" -Check "Private DNS resolution: $($t.Service)" -Result "Warn" -Detail "$($t.Fqdn) did not resolve from the VNet. The private endpoint IP is $($t.ExpectedIp)."
+            }
+        }
+    }
+    catch {
+        Add-Result -Category "Connectivity" -Check "Private DNS resolution" -Result "Warn" -Detail "Could not run the in-worker DNS resolution test via Kudu." -Message $_.Exception.Message
+        return [pscustomobject]@{ Probed = 0; Confirmed = 0; UsesCustomDns = $usesCustomDns }
+    }
+
+    if ($probed -gt 0 -and $confirmed -eq $probed) {
+        Add-Result -Category "Connectivity" -Check "Private endpoint DNS resolution (overall)" -Result "Pass" -Detail "All $probed private-endpoint FQDNs resolve to their private IPs from the VNet."
+    }
+    elseif ($confirmed -gt 0) {
+        Add-Result -Category "Connectivity" -Check "Private endpoint DNS resolution (overall)" -Result "Warn" -Detail "$confirmed of $probed private-endpoint FQDNs resolve privately; the rest still need DNS configured (see guidance)."
+    }
+    else {
+        Add-Result -Category "Connectivity" -Check "Private endpoint DNS resolution (overall)" -Result "Warn" -Detail "None of the $probed private-endpoint FQDNs resolve to their private IPs from the VNet yet (see guidance to configure DNS)."
+    }
+
+    return [pscustomobject]@{ Probed = $probed; Confirmed = $confirmed; UsesCustomDns = $usesCustomDns }
+}
+
+# Prints the exact steps + Microsoft-docs links to make the privatelink FQDNs resolve to the private
+# endpoints. Two branches: Azure Private DNS zones vs. custom/on-prem DNS.
+function Show-DnsResolutionGuidance {
+    param(
+        [Parameter(Mandatory = $true)][bool] $UsesCustomDns,
+        [Parameter(Mandatory = $true)] $DnsTargets,
+        [Parameter(Mandatory = $true)][string] $VnetName
+    )
+    Write-Host ""
+    Write-Host -ForegroundColor "Cyan" "  The private-endpoint FQDNs are not yet resolving to their private IPs from VNet '$VnetName'."
+    Write-Host -ForegroundColor "Cyan" "  Each of these names must resolve, from inside the VNet, to the listed private endpoint IP:"
+    foreach ($t in $DnsTargets) {
+        Write-Host ("    - {0,-38} -> {1}   (zone: {2})" -f $t.Fqdn, $t.ExpectedIp, $t.Zone)
+    }
+    if ($UsesCustomDns) {
+        Write-HelpText -Text @"
+VNet '$VnetName' uses CUSTOM DNS servers, so Azure will not resolve the privatelink names for you - your custom DNS must do it.
+
+To make the FQDNs above resolve to the private endpoint IPs, do ONE of:
+
+1) Recommended - forward to Azure DNS: create the required Azure Private DNS zones (listed above), link each one to a VNet that a DNS forwarder / Azure Private Resolver sits in, then configure your custom DNS servers to conditionally forward the PUBLIC zone names (e.g. database.windows.net, vault.azure.net, blob.core.windows.net) to that forwarder / resolver (which forwards to Azure DNS at 168.63.129.16). Conditional-forward the PUBLIC name, not the 'privatelink.' name.
+
+2) Manual A records: add an A record on your custom DNS for each FQDN above pointing at the listed private endpoint IP. Simplest to stand up, but you must maintain the IPs by hand if a private endpoint is recreated.
+
+Microsoft docs:
+  - Private Endpoint DNS integration (custom DNS / on-prem forwarder / Private Resolver scenarios):
+    https://learn.microsoft.com/en-us/azure/private-link/private-endpoint-dns-integration
+  - Private Endpoint private DNS zone values (the exact zone name per Azure service):
+    https://learn.microsoft.com/en-us/azure/private-link/private-endpoint-dns
+"@
+    }
+    else {
+        Write-HelpText -Text @"
+VNet '$VnetName' uses Azure-provided DNS, so Azure Private DNS zones are how these names resolve to the private endpoints.
+
+Steps:
+
+1) Create the required Azure Private DNS zones (one per service, listed above), if they don't already exist.
+
+2) Link each zone to VNet '$VnetName' with a virtual network link (a 'resolution' link is sufficient; auto-registration is not needed). After linking, the link status can take a few minutes to reach Completed.
+
+3) Ensure each private endpoint has an A record in its zone pointing to the endpoint's private IP. The clean way is to add a Private DNS zone GROUP to each private endpoint - Azure then creates and maintains the A records automatically (and updates them if the endpoint changes). Otherwise add the A records manually to the zones.
+
+Microsoft docs:
+  - Private Endpoint DNS configuration & private DNS zone group:
+    https://learn.microsoft.com/en-us/azure/private-link/private-endpoint-dns-integration
+  - Link a virtual network to a private DNS zone:
+    https://learn.microsoft.com/en-us/azure/dns/private-dns-virtual-network-links
+  - Private Endpoint private DNS zone values (the exact zone name per Azure service):
+    https://learn.microsoft.com/en-us/azure/private-link/private-endpoint-dns
+"@
+    }
+}
+
+function Test-OutboundConnectivityViaKudu {
+    param(
+        [Parameter(Mandatory = $true)] $AzEnv,
+        [Parameter(Mandatory = $true)] $PeTargets,
         [Parameter(Mandatory = $true)] $Web,
         [Parameter(Mandatory = $true)][string] $webName,
         [Parameter(Mandatory = $true)][string] $AppSubnetName,
@@ -1371,41 +1519,14 @@ function Test-OutboundConnectivityViaKudu {
     # PLUS each Part (b) private endpoint's private IP (tested by IP, TCP only - PE
     # privatelink FQDNs won't resolve without registering DNS records, which this
     # script must not do). Kept as an ordered list so results can be attributed back
-    # per-target after the worker run.
+    # per-target after the worker run. PE-FQDN DNS resolution is probed separately by
+    # Invoke-DnsResolutionProbe so it can be re-run after the customer changes DNS.
     $targets = @()
     foreach ($ep in $endpoints) {
-        $targets += [pscustomobject]@{ Key = $ep.Uri; Port = $ep.Port; Label = "Outbound: $($ep.Uri)"; Purpose = $ep.Purpose; IsPe = $false; IsDns = $false; Service = $null; ExpectedIp = $null }
+        $targets += [pscustomobject]@{ Key = $ep.Uri; Port = $ep.Port; Label = "Outbound: $($ep.Uri)"; Purpose = $ep.Purpose; IsPe = $false; Service = $null }
     }
     foreach ($pt in $PeTargets) {
-        $targets += [pscustomobject]@{ Key = $pt.PrivateIp; Port = $pt.Port; Label = "Private endpoint reachability: $($pt.Service)"; Purpose = $null; IsPe = $true; IsDns = $false; Service = $pt.Service; ExpectedIp = $null }
-    }
-
-    # Part (d): whether the existing VNet resolves via Azure DNS or custom DNS
-    # servers - same detection the verification region above uses. This gates
-    # whether PE-FQDN DNS resolution can be meaningfully tested (Azure DNS only)
-    # and always drives the DNS-unconfirmed summary flag emitted below.
-    $usesCustomDns = $Vnet.DhcpOptions.DnsServers -and $Vnet.DhcpOptions.DnsServers.Count -gt 0
-
-    # Part (d): only on Azure-DNS VNets, additionally probe whether each created
-    # PE's resource FQDN already resolves to that PE's private IP from inside the
-    # VNet - this only happens if private DNS auto-registration (an Azure Policy DINE
-    # assignment, or a pre-linked zone with a zone group) is already active. It is
-    # NOT expected out of the box and is purely informational - reachability above
-    # was already proven by private IP regardless of this result. Automation has no
-    # cleanly-derivable FQDN here, so it is skipped (it still gets reachability-by-IP
-    # from Part c).
-    if (-not $usesCustomDns) {
-        foreach ($pt in $PeTargets) {
-            $peFqdn = switch ($pt.Service) {
-                "SQL Server" { "$sqlName.$SqlSuffix" }
-                "Key Vault" { "$kvName.$KeyVaultSuffix" }
-                "Storage" { "$stName.blob.$StorageSuffix" }
-                default { $null }
-            }
-            if ($peFqdn) {
-                $targets += [pscustomobject]@{ Key = $peFqdn; Port = $pt.Port; Label = "Private DNS resolution: $($pt.Service)"; Purpose = $null; IsPe = $false; IsDns = $true; Service = $pt.Service; ExpectedIp = $pt.PrivateIp }
-            }
-        }
+        $targets += [pscustomobject]@{ Key = $pt.PrivateIp; Port = $pt.Port; Label = "Private endpoint reachability: $($pt.Service)"; Purpose = $null; IsPe = $true; Service = $pt.Service }
     }
 
     # Run the outbound/PE reachability test FROM the worker via the Kudu/SCM command
@@ -1420,8 +1541,6 @@ function Test-OutboundConnectivityViaKudu {
     $remoteCmd = "`$ProgressPreference='SilentlyContinue';foreach(`$e in @($epList)){`$pp=`$e -split '\|';`$u=`$pp[0];`$p=[int]`$pp[1];`$ip='';try{`$ip=(([System.Net.Dns]::GetHostAddresses(`$u))|Where-Object{`$_.AddressFamily -eq 'InterNetwork'}|Select-Object -First 1).IPAddressToString}catch{};`$ok=`$false;try{`$c=New-Object System.Net.Sockets.TcpClient;`$ar=`$c.BeginConnect(`$u,`$p,`$null,`$null);if(`$ar.AsyncWaitHandle.WaitOne(10000)){try{`$c.EndConnect(`$ar);`$ok=`$c.Connected}catch{}};`$c.Close()}catch{};`$sub='';if(`$p -eq 443 -and `$ok){try{`$sp=[System.Net.ServicePointManager]::FindServicePoint('https://'+`$u);`$null=Invoke-RestMethod -Uri ('https://'+`$u) -TimeoutSec 15 -ErrorAction SilentlyContinue;`$sub=`$sp.Certificate.Subject}catch{}};`$st=if(`$ok){'OK'}else{'BLOCKED'};Write-Output (`$u+'|'+`$st+'|'+`$ip+'|'+`$sub)}"
     $kbody = @{ command = "powershell -NoProfile -Command `"$remoteCmd`""; dir = "site\wwwroot" } | ConvertTo-Json
     $headers = @{ Authorization = "Bearer $kuduToken"; "Content-Type" = "application/json" }
-    $dnsProbeCount = 0
-    $dnsConfirmedCount = 0
     try {
         $kresp = Invoke-WithSpinner -Activity "Running in-worker connectivity test via Kudu" -ScriptBlock {
             Invoke-RestMethod -Method POST -Uri "https://$scmHost/api/command" -Headers $headers -Body $kbody -TimeoutSec 120 -ErrorAction Stop
@@ -1441,25 +1560,6 @@ function Test-OutboundConnectivityViaKudu {
                     Add-Result -Category "Connectivity" -Check $t.Label -Result "Warn" -Detail "No result returned from the worker for this target."
                 }
             }
-            elseif ($t.IsDns) {
-                # Part (d): does the resource FQDN resolve to the PE's private IP from
-                # inside the VNet? A match proves private DNS auto-registration is
-                # active; anything else is informational only - Part (c) already
-                # proved reachability by private IP regardless of this outcome.
-                $dnsProbeCount++
-                $resolvedIp = $null
-                if ($line) { $resolvedIp = ($line -split "\|")[2] }
-                if ($resolvedIp -and $resolvedIp -eq $t.ExpectedIp) {
-                    $dnsConfirmedCount++
-                    Add-Result -Category "Connectivity" -Check $t.Label -Result "Pass" -Detail "Resolves to private IP (auto-registered)."
-                }
-                elseif ($resolvedIp) {
-                    Add-Result -Category "Connectivity" -Check $t.Label -Result "Warn" -Detail "Resolves to public IP"
-                }
-                else {
-                    Add-Result -Category "Connectivity" -Check $t.Label -Result "Info" -Detail "Did not resolve - private DNS zone required at install."
-                }
-            }
             else {
                 if ($line -and $line -match "\|OK\|") {
                     Add-Result -Category "Connectivity" -Check $t.Label -Result "Pass" -Detail "$($t.Purpose)."
@@ -1477,20 +1577,6 @@ function Test-OutboundConnectivityViaKudu {
     }
     catch {
         Add-Result -Category "Connectivity" -Check "Kudu outbound test" -Result "Warn" -Detail "Could not run the in-worker connectivity test via Kudu. From the App Service Kudu console for '$webName': $NmeNetworkTestHint Endpoints to test: $(($endpoints | ForEach-Object { $_.Uri }) -join ', ')." -Message $_.Exception.Message
-    }
-
-    # Part (d): ALWAYS emit a summary flag (both custom-DNS and Azure-DNS
-    # existing-VNet paths) so the report never implies production DNS resolution of
-    # the privatelink FQDNs is proven when it isn't - reachability above is proven by
-    # private IP only unless private DNS auto-registration was just confirmed.
-    if ($usesCustomDns) {
-        Add-Result -Category "Connectivity" -Check "Private endpoint DNS resolution (overall)" -Result "Info" -Detail "Custom DNS - not tested; reachability confirmed by private IP only."
-    }
-    elseif ($dnsConfirmedCount -eq 0) {
-        Add-Result -Category "Connectivity" -Check "Private endpoint DNS resolution (overall)" -Result "Info" -Detail "All public - private DNS zones required at install."
-    }
-    else {
-        Add-Result -Category "Connectivity" -Check "Private endpoint DNS resolution (overall)" -Result "Info" -Detail "$dnsConfirmedCount of $dnsProbeCount resolve privately; rest require private DNS zone config at install."
     }
 }
 #endregion
@@ -1885,7 +1971,12 @@ try {
     #endregion
 
     #region Resource naming and tags --------------------------------------------------------------
-    $rand = New-RandomString -Length 8
+    # Mirrors the ARM template's default naming (e.g. "nmw-app-sql-{uniqueString}"), but with a
+    # fully random suffix (regenerated every run, rather than derived from subscription/RG) and a
+    # "pf" marker so these are recognizable as preflight-created resources. The random suffix is 10
+    # chars - 3 shorter than the template's 13-char uniqueString() - so total name lengths still
+    # line up once the "pf-" marker is added back in.
+    $rand = New-RandomString -Length 10
     $locSlug = ($Location -replace "[^a-z0-9]", "").ToLower()
     # ZRS is used by the installer in these unpaired regions; GRS everywhere else.
     $ZrsRegions = @("austriaeast", "belgiumcentral", "chilecentral", "indonesiacentral", "israelcentral",
@@ -1903,28 +1994,28 @@ try {
     # editable if we're about to create it - an existing, user-supplied RG name is not renameable.
     $NamePlan = [ordered]@{}
     $NamePlan["ResourceGroup"] = [pscustomobject]@{ Label = "Resource Group"; Value = $ResourceGroupName; Editable = $PendingRgCreate }
-    $NamePlan["LogAnalytics"] = [pscustomobject]@{ Label = "Log Analytics workspace"; Value = "log-nmepf-$locSlug-$rand"; Editable = $true }
-    $NamePlan["Storage"] = [pscustomobject]@{ Label = "Storage account ($StorageSku)"; Value = (Get-SanitizedResourceName -Kind Storage -Value "nmepf$rand"); Editable = $true }
-    $NamePlan["SqlServer"] = [pscustomobject]@{ Label = "SQL Server"; Value = "nmepf-sql-$rand"; Editable = $true }
-    $NamePlan["SqlDatabase"] = [pscustomobject]@{ Label = "SQL Database"; Value = "nmepfdb"; Editable = $true }
-    $NamePlan["AppServicePlan"] = [pscustomobject]@{ Label = "App Service Plan (B3, Windows)"; Value = "asp-nmepf-$rand"; Editable = $true }
-    $NamePlan["KeyVault"] = [pscustomobject]@{ Label = "Key Vault"; Value = (Get-SanitizedResourceName -Kind KeyVault -Value "kv-nmepf-$rand"); Editable = $true }
+    $NamePlan["LogAnalytics"] = [pscustomobject]@{ Label = "Log Analytics workspace"; Value = "nmw-app-law-pf-$rand"; Editable = $true }
+    $NamePlan["Storage"] = [pscustomobject]@{ Label = "Storage account ($StorageSku)"; Value = (Get-SanitizedResourceName -Kind Storage -Value "nmwapppf$rand"); Editable = $true }
+    $NamePlan["SqlServer"] = [pscustomobject]@{ Label = "SQL Server"; Value = "nmw-app-sql-pf-$rand"; Editable = $true }
+    $NamePlan["SqlDatabase"] = [pscustomobject]@{ Label = "SQL Database"; Value = "nmw-app-db-pf"; Editable = $true }
+    $NamePlan["AppServicePlan"] = [pscustomobject]@{ Label = "App Service Plan (B3, Windows)"; Value = "nmw-app-plan-pf-$rand"; Editable = $true }
+    $NamePlan["KeyVault"] = [pscustomobject]@{ Label = "Key Vault"; Value = (Get-SanitizedResourceName -Kind KeyVault -Value "nmw-app-kv-pf-$rand"); Editable = $true }
     # NME deploys two Automation Accounts (an updater account and a scripted-actions account) - test both.
-    $NamePlan["AutomationUpdater"] = [pscustomobject]@{ Label = "Automation Account (updater)"; Value = "aa-nmepf-updater-$rand"; Editable = $true }
-    $NamePlan["AutomationScriptedActions"] = [pscustomobject]@{ Label = "Automation Account (scripted actions)"; Value = "aa-nmepf-actions-$rand"; Editable = $true }
-    $NamePlan["WebApp"] = [pscustomobject]@{ Label = "Web App (portal site)"; Value = "app-nmepf-$rand"; Editable = $true }
-    $NamePlan["AppInsights"] = [pscustomobject]@{ Label = "Application Insights"; Value = "appi-nmepf-$rand"; Editable = $true }
+    $NamePlan["AutomationUpdater"] = [pscustomobject]@{ Label = "Automation Account (updater)"; Value = "nmw-app-automation-pf-$rand"; Editable = $true }
+    $NamePlan["AutomationScriptedActions"] = [pscustomobject]@{ Label = "Automation Account (scripted actions)"; Value = "nmw-app-scripted-actions-pf-$rand"; Editable = $true }
+    $NamePlan["WebApp"] = [pscustomobject]@{ Label = "Web App (portal site)"; Value = "nmw-app-pf-$rand"; Editable = $true }
+    $NamePlan["AppInsights"] = [pscustomobject]@{ Label = "Application Insights"; Value = "nmw-app-insights-pf-$rand"; Editable = $true }
     if ($CreateNewVnet) {
-        $NamePlan["Vnet"] = [pscustomobject]@{ Label = "Virtual Network"; Value = "vnet-nmepf-$rand"; Editable = $true }
-        $NamePlan["PeSubnet"] = [pscustomobject]@{ Label = "Subnet (private endpoints)"; Value = $PeSubnetName; Editable = $true }
-        $NamePlan["AppSubnet"] = [pscustomobject]@{ Label = "Subnet (App Service VNet integration)"; Value = $AppSubnetName; Editable = $true }
+        $NamePlan["Vnet"] = [pscustomobject]@{ Label = "Virtual Network"; Value = "nmw-app-vnet-pf-$rand"; Editable = $true }
+        $NamePlan["PeSubnet"] = [pscustomobject]@{ Label = "Subnet (private endpoints)"; Value = "nmw-app-pesubnet-pf-$rand"; Editable = $true }
+        $NamePlan["AppSubnet"] = [pscustomobject]@{ Label = "Subnet (App Service VNet integration)"; Value = "nmw-app-appsubnet-pf-$rand"; Editable = $true }
     }
     if ($TestPrivate) {
-        $NamePlan["PrivateEndpoint"] = [pscustomobject]@{ Label = "Private Endpoint"; Value = "pe-nmepf-$rand"; Editable = $true }
+        $NamePlan["PrivateEndpoint"] = [pscustomobject]@{ Label = "Private Endpoint"; Value = "nmw-app-pe-pf-$rand"; Editable = $true }
     }
     if ($TestVnetIntegration) {
-        $NamePlan["ConnAsp"] = [pscustomobject]@{ Label = "App Service Plan for connectivity test"; Value = "asp-nmepfconn-$rand"; Editable = $true }
-        $NamePlan["ConnWebApp"] = [pscustomobject]@{ Label = "Web App for connectivity test"; Value = "app-nmepfconn-$rand"; Editable = $true }
+        $NamePlan["ConnAsp"] = [pscustomobject]@{ Label = "App Service Plan for connectivity test"; Value = "nmw-app-connasp-pf-$rand"; Editable = $true }
+        $NamePlan["ConnWebApp"] = [pscustomobject]@{ Label = "Web App for connectivity test"; Value = "nmw-app-connapp-pf-$rand"; Editable = $true }
     }
 
     Write-Host -ForegroundColor "Cyan" "The following resource names will be used for this test run:"
@@ -2611,13 +2702,13 @@ try {
                 @{ Ra = $ra; Error = $raErr }
             }
             if ($raResult.Ra) {
-                Add-Result -Category "Deployability" -Check "Role assignment (Contributor to Automation account identity)" -Result "Pass" -Detail "Granted Contributor at resource-group scope to the updater Automation account's managed identity; removed at cleanup."
+                Add-Result -Category "Deployability" -Check "Role assignment" -Result "Pass" -Detail "Granted Contributor at resource-group scope to the updater Automation account's managed identity; removed at cleanup."
                 Add-TrackedResource -Type "roleassignment" -ResourceGroupName $ResourceGroupName -Name $raResult.Ra.RoleAssignmentId -Id $raScope -Note $aaPrincipalId
             }
-            else { Add-PolicyFailureResult -Category "Deployability" -Check "Role assignment (Contributor to Automation account identity)" -RawMessage $raResult.Error }
+            else { Add-PolicyFailureResult -Category "Deployability" -Check "Role assignment" -RawMessage $raResult.Error }
         }
         else {
-            Add-Result -Category "Deployability" -Check "Role assignment (Contributor to Automation account identity)" -Result "Warn" -Detail "Skipped - could not resolve the updater Automation account's managed identity principal id."
+            Add-Result -Category "Deployability" -Check "Role assignment" -Result "Warn" -Detail "Skipped - could not resolve the updater Automation account's managed identity principal id."
         }
     }
 
@@ -2722,7 +2813,25 @@ try {
                         Add-Result -Category "Connectivity" -Check "Outbound connectivity test" -Result "Info" -Detail "Skipped - VNet '$ExistingVnetName' is brand-new with no customer-configured routing/firewall/DNS yet. VNet integration, subnet delegation, and the test App Service were created and confirmed configured correctly. Once the customer's real egress controls (firewall, UDRs, custom DNS) are in place, run NmeNetworkTest.ps1 against the real NME App Service to validate outbound connectivity."
                     }
                     else {
-                        Test-OutboundConnectivityViaKudu -Vnet $vnet -AzEnv $AzEnv -PeTargets $PeTargets -sqlName $sqlName -SqlSuffix $SqlSuffix -kvName $kvName -KeyVaultSuffix $KeyVaultSuffix -stName $stName -StorageSuffix $StorageSuffix -Web $web -webName $webName -AppSubnetName $AppSubnetName -PeSubnetName $PeSubnetName -NmeNetworkTestHint $NmeNetworkTestHint
+                        Test-OutboundConnectivityViaKudu -AzEnv $AzEnv -PeTargets $PeTargets -Web $web -webName $webName -AppSubnetName $AppSubnetName -PeSubnetName $PeSubnetName -NmeNetworkTestHint $NmeNetworkTestHint
+
+                        # DNS-resolution probe + same-run retry loop (existing-VNet only; PEs must exist).
+                        # When the privatelink FQDNs don't resolve to their private IPs, print the exact
+                        # DNS-rigging steps and offer to re-test after the customer fixes DNS - nothing is
+                        # torn down between attempts, so a retry is just another in-worker DNS lookup.
+                        $dnsTargets = Get-PeDnsTarget -PeTargets $PeTargets -sqlName $sqlName -SqlSuffix $SqlSuffix -kvName $kvName -KeyVaultSuffix $KeyVaultSuffix -stName $stName -StorageSuffix $StorageSuffix -AzEnv $AzEnv
+                        if (@($dnsTargets).Count -gt 0) {
+                            $dnsRollup = Invoke-DnsResolutionProbe -Vnet $vnet -AzEnv $AzEnv -DnsTargets $dnsTargets -Web $web -webName $webName
+                            while ($dnsRollup.Probed -gt 0 -and $dnsRollup.Confirmed -lt $dnsRollup.Probed) {
+                                Show-DnsResolutionGuidance -UsesCustomDns ([bool]$dnsRollup.UsesCustomDns) -DnsTargets $dnsTargets -VnetName $ExistingVnetName
+                                if (-not (Read-YesNo -Prompt "Re-run the DNS resolution test now? Make your DNS changes first, then choose Y. [y/N]" -Default "n")) { break }
+                                # Drop the prior DNS rows so the report shows only the latest attempt.
+                                [void]$Results.RemoveAll({ param($r) $r.Category -eq "Connectivity" -and ($r.Check -like "Private DNS resolution:*" -or $r.Check -eq "Private endpoint DNS resolution (overall)") })
+                                # Re-read the VNet in case the customer just linked a zone / changed DNS servers.
+                                try { $vnet = Get-AzVirtualNetwork -ResourceGroupName $ExistingVnetRg -Name $ExistingVnetName -ErrorAction Stop } catch {}
+                                $dnsRollup = Invoke-DnsResolutionProbe -Vnet $vnet -AzEnv $AzEnv -DnsTargets $dnsTargets -Web $web -webName $webName
+                            }
+                        }
                     }
                     }
                     else {
@@ -2809,49 +2918,65 @@ finally {
     #region Cleanup ------------------------------------------------------------------------------
     $removeAll = Read-YesNo -Prompt "Remove all resources created by this test? [Y/n]" -Default "y"
     if ($removeAll) {
-        Write-Host -ForegroundColor "Cyan" "Removing created resources (reverse order)..."
-        # Locks first, in their own pass: a lock can be created (during the parallel checks)
-        # before the resource that later depends on it being gone (e.g. the private endpoint,
-        # whose removal deletes a privateEndpointConnectionProxies sub-resource on the storage
-        # account) is even created, so strict reverse-creation order can hit a locked scope.
-        for ($i = $Tracker.Count - 1; $i -ge 0; $i--) {
-            $t = $Tracker[$i]
-            if ($t.Type -ne "lock") { continue }
-            try {
-                Remove-AzResourceLock -LockId $t.Id -Force -ErrorAction Continue | Out-Null
-                Write-Host "  removed $($t.Type): $($t.Name)"
-            }
-            catch { Write-Host -ForegroundColor "Yellow" "  could not remove $($t.Type) '$($t.Name)': $($_.Exception.Message)" }
-        }
-        # Reverse the tracker so dependents are removed before dependencies.
-        for ($i = $Tracker.Count - 1; $i -ge 0; $i--) {
-            $t = $Tracker[$i]
-            if ($t.Type -eq "lock") { continue }
+        Write-Host -ForegroundColor "Cyan" "Removing created resources in parallel waves..."
+        # Per-resource removal as a scriptblock so each can run in its own ThreadJob (which shares the
+        # Az context in-process, like the deployability jobs). Only direct Az cmdlet calls - no script
+        # functions - so no InitializationScript is needed. Returns a plain result the main thread
+        # prints after the wave completes.
+        $removeOne = {
+            param($t, $Location)
             try {
                 switch ($t.Type) {
-                    "privateendpoint" { Remove-AzPrivateEndpoint -ResourceGroupName $t.ResourceGroupName -Name $t.Name -Force -ErrorAction Continue | Out-Null }
-                    "webapp" { Remove-AzWebApp -ResourceGroupName $t.ResourceGroupName -Name $t.Name -Force -ErrorAction Continue | Out-Null }
-                    "asp" { Remove-AzAppServicePlan -ResourceGroupName $t.ResourceGroupName -Name $t.Name -Force -ErrorAction Continue | Out-Null }
-                    "automation" { Remove-AzAutomationAccount -ResourceGroupName $t.ResourceGroupName -Name $t.Name -Force -ErrorAction Continue | Out-Null }
+                    "lock" { Remove-AzResourceLock -LockId $t.Id -Force -ErrorAction Stop | Out-Null }
+                    "privateendpoint" { Remove-AzPrivateEndpoint -ResourceGroupName $t.ResourceGroupName -Name $t.Name -Force -ErrorAction Stop | Out-Null }
+                    "webapp" { Remove-AzWebApp -ResourceGroupName $t.ResourceGroupName -Name $t.Name -Force -ErrorAction Stop | Out-Null }
+                    "asp" { Remove-AzAppServicePlan -ResourceGroupName $t.ResourceGroupName -Name $t.Name -Force -ErrorAction Stop | Out-Null }
+                    "automation" { Remove-AzAutomationAccount -ResourceGroupName $t.ResourceGroupName -Name $t.Name -Force -ErrorAction Stop | Out-Null }
                     "kv" {
-                        Remove-AzKeyVault -ResourceGroupName $t.ResourceGroupName -VaultName $t.Name -Force -ErrorAction Continue | Out-Null
-                        try { Remove-AzKeyVault -VaultName $t.Name -Location $Location -InRemovedState -Force -ErrorAction Continue | Out-Null } catch {}
+                        Remove-AzKeyVault -ResourceGroupName $t.ResourceGroupName -VaultName $t.Name -Force -ErrorAction Stop | Out-Null
+                        try { Remove-AzKeyVault -VaultName $t.Name -Location $Location -InRemovedState -Force -ErrorAction Stop | Out-Null } catch {}
                     }
-                    "sqldatabase" { Remove-AzSqlDatabase -ResourceGroupName $t.ResourceGroupName -ServerName $t.Note -DatabaseName $t.Name -Force -ErrorAction Continue | Out-Null }
-                    "sqlserver" { Remove-AzSqlServer -ResourceGroupName $t.ResourceGroupName -ServerName $t.Name -Force -ErrorAction Continue | Out-Null }
-                    "storage" { Remove-AzStorageAccount -ResourceGroupName $t.ResourceGroupName -Name $t.Name -Force -ErrorAction Continue | Out-Null }
-                    "law" { Remove-AzOperationalInsightsWorkspace -ResourceGroupName $t.ResourceGroupName -Name $t.Name -Force -ForceDelete -ErrorAction Continue | Out-Null }
-                    "vnet" { Remove-AzVirtualNetwork -ResourceGroupName $t.ResourceGroupName -Name $t.Name -Force -ErrorAction Continue | Out-Null }
-                    "privatednszone" { Remove-AzPrivateDnsZone -ResourceGroupName $t.ResourceGroupName -Name $t.Name -Confirm:$false -ErrorAction Continue | Out-Null }
-                    "appinsights" { Remove-AzResource -ResourceId $t.Id -Force -ErrorAction Continue | Out-Null }
-                    "dcr" { Remove-AzResource -ResourceId $t.Id -Force -ErrorAction Continue | Out-Null }
-                    "dce" { Remove-AzResource -ResourceId $t.Id -Force -ErrorAction Continue | Out-Null }
-                    "roleassignment" { Remove-AzRoleAssignment -ObjectId $t.Note -RoleDefinitionName "Contributor" -Scope $t.Id -ErrorAction Continue | Out-Null }
+                    "sqldatabase" { Remove-AzSqlDatabase -ResourceGroupName $t.ResourceGroupName -ServerName $t.Note -DatabaseName $t.Name -Force -ErrorAction Stop | Out-Null }
+                    "sqlserver" { Remove-AzSqlServer -ResourceGroupName $t.ResourceGroupName -ServerName $t.Name -Force -ErrorAction Stop | Out-Null }
+                    "storage" { Remove-AzStorageAccount -ResourceGroupName $t.ResourceGroupName -Name $t.Name -Force -ErrorAction Stop | Out-Null }
+                    "law" { Remove-AzOperationalInsightsWorkspace -ResourceGroupName $t.ResourceGroupName -Name $t.Name -Force -ForceDelete -ErrorAction Stop | Out-Null }
+                    "vnet" { Remove-AzVirtualNetwork -ResourceGroupName $t.ResourceGroupName -Name $t.Name -Force -ErrorAction Stop | Out-Null }
+                    "privatednszone" { Remove-AzPrivateDnsZone -ResourceGroupName $t.ResourceGroupName -Name $t.Name -Confirm:$false -ErrorAction Stop | Out-Null }
+                    "appinsights" { Remove-AzResource -ResourceId $t.Id -Force -ErrorAction Stop | Out-Null }
+                    "dcr" { Remove-AzResource -ResourceId $t.Id -Force -ErrorAction Stop | Out-Null }
+                    "dce" { Remove-AzResource -ResourceId $t.Id -Force -ErrorAction Stop | Out-Null }
+                    "roleassignment" { Remove-AzRoleAssignment -ObjectId $t.Note -RoleDefinitionName "Contributor" -Scope $t.Id -ErrorAction Stop | Out-Null }
                     default { }
                 }
-                Write-Host "  removed $($t.Type): $($t.Name)"
+                @{ Type = $t.Type; Name = $t.Name; Ok = $true }
             }
-            catch { Write-Host -ForegroundColor "Yellow" "  could not remove $($t.Type) '$($t.Name)': $($_.Exception.Message)" }
+            catch { @{ Type = $t.Type; Name = $t.Name; Ok = $false; Error = $_.Exception.Message } }
+        }
+
+        # Remove in dependency-ordered waves; everything WITHIN a wave runs in parallel, and the waves
+        # run one after another (Wait-JobsWithDots is a barrier). Locks first (they guard the SQL
+        # database / Key Vault / storage account from deletion), then dependent resources (each removed
+        # before its parent - private endpoints before the VNet and their target resources, SQL database
+        # before its server, DCR before its DCE, web apps before their plans), then the primary
+        # resources. A type not present this run just yields an empty wave that's skipped.
+        $removalWaves = @(
+            @{ Label = "locks"; Types = @("lock") },
+            @{ Label = "dependent resources"; Types = @("privateendpoint", "webapp", "sqldatabase", "dcr", "appinsights", "roleassignment") },
+            @{ Label = "primary resources"; Types = @("asp", "automation", "kv", "sqlserver", "storage", "law", "vnet", "dce", "privatednszone") }
+        )
+        foreach ($wave in $removalWaves) {
+            $waveItems = @($Tracker | Where-Object { $_.Type -in $wave.Types })
+            if ($waveItems.Count -eq 0) { continue }
+            $rmJobs = @()
+            foreach ($t in $waveItems) {
+                $rmJobs += Start-ThreadJob -Name "Remove-$($t.Type)-$($t.Name)" -ScriptBlock $removeOne -ArgumentList $t, $Location
+            }
+            $rmResults = Wait-JobsWithDots -Jobs $rmJobs -Activity "Removing $($wave.Label)"
+            $rmJobs | Remove-Job -Force -ErrorAction SilentlyContinue
+            foreach ($rr in $rmResults) {
+                if ($rr.Ok) { Write-Host "  removed $($rr.Type): $($rr.Name)" }
+                else { Write-Host -ForegroundColor "Yellow" "  could not remove $($rr.Type) '$($rr.Name)': $($rr.Error)" }
+            }
         }
         if ($CreatedResourceGroup) {
             if (Read-YesNo -Prompt "Also remove the temporary resource group '$ResourceGroupName'? [Y/n]" -Default "y") {
