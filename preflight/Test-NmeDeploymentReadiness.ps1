@@ -1971,7 +1971,12 @@ try {
     #endregion
 
     #region Resource naming and tags --------------------------------------------------------------
-    $rand = New-RandomString -Length 8
+    # Mirrors the ARM template's default naming (e.g. "nmw-app-sql-{uniqueString}"), but with a
+    # fully random suffix (regenerated every run, rather than derived from subscription/RG) and a
+    # "pf" marker so these are recognizable as preflight-created resources. The random suffix is 10
+    # chars - 3 shorter than the template's 13-char uniqueString() - so total name lengths still
+    # line up once the "pf-" marker is added back in.
+    $rand = New-RandomString -Length 10
     $locSlug = ($Location -replace "[^a-z0-9]", "").ToLower()
     # ZRS is used by the installer in these unpaired regions; GRS everywhere else.
     $ZrsRegions = @("austriaeast", "belgiumcentral", "chilecentral", "indonesiacentral", "israelcentral",
@@ -1989,28 +1994,28 @@ try {
     # editable if we're about to create it - an existing, user-supplied RG name is not renameable.
     $NamePlan = [ordered]@{}
     $NamePlan["ResourceGroup"] = [pscustomobject]@{ Label = "Resource Group"; Value = $ResourceGroupName; Editable = $PendingRgCreate }
-    $NamePlan["LogAnalytics"] = [pscustomobject]@{ Label = "Log Analytics workspace"; Value = "log-nmepf-$locSlug-$rand"; Editable = $true }
-    $NamePlan["Storage"] = [pscustomobject]@{ Label = "Storage account ($StorageSku)"; Value = (Get-SanitizedResourceName -Kind Storage -Value "nmepf$rand"); Editable = $true }
-    $NamePlan["SqlServer"] = [pscustomobject]@{ Label = "SQL Server"; Value = "nmepf-sql-$rand"; Editable = $true }
-    $NamePlan["SqlDatabase"] = [pscustomobject]@{ Label = "SQL Database"; Value = "nmepfdb"; Editable = $true }
-    $NamePlan["AppServicePlan"] = [pscustomobject]@{ Label = "App Service Plan (B3, Windows)"; Value = "asp-nmepf-$rand"; Editable = $true }
-    $NamePlan["KeyVault"] = [pscustomobject]@{ Label = "Key Vault"; Value = (Get-SanitizedResourceName -Kind KeyVault -Value "kv-nmepf-$rand"); Editable = $true }
+    $NamePlan["LogAnalytics"] = [pscustomobject]@{ Label = "Log Analytics workspace"; Value = "nmw-app-law-pf-$rand"; Editable = $true }
+    $NamePlan["Storage"] = [pscustomobject]@{ Label = "Storage account ($StorageSku)"; Value = (Get-SanitizedResourceName -Kind Storage -Value "nmwapppf$rand"); Editable = $true }
+    $NamePlan["SqlServer"] = [pscustomobject]@{ Label = "SQL Server"; Value = "nmw-app-sql-pf-$rand"; Editable = $true }
+    $NamePlan["SqlDatabase"] = [pscustomobject]@{ Label = "SQL Database"; Value = "nmw-app-db-pf"; Editable = $true }
+    $NamePlan["AppServicePlan"] = [pscustomobject]@{ Label = "App Service Plan (B3, Windows)"; Value = "nmw-app-plan-pf-$rand"; Editable = $true }
+    $NamePlan["KeyVault"] = [pscustomobject]@{ Label = "Key Vault"; Value = (Get-SanitizedResourceName -Kind KeyVault -Value "nmw-app-kv-pf-$rand"); Editable = $true }
     # NME deploys two Automation Accounts (an updater account and a scripted-actions account) - test both.
-    $NamePlan["AutomationUpdater"] = [pscustomobject]@{ Label = "Automation Account (updater)"; Value = "aa-nmepf-updater-$rand"; Editable = $true }
-    $NamePlan["AutomationScriptedActions"] = [pscustomobject]@{ Label = "Automation Account (scripted actions)"; Value = "aa-nmepf-actions-$rand"; Editable = $true }
-    $NamePlan["WebApp"] = [pscustomobject]@{ Label = "Web App (portal site)"; Value = "app-nmepf-$rand"; Editable = $true }
-    $NamePlan["AppInsights"] = [pscustomobject]@{ Label = "Application Insights"; Value = "appi-nmepf-$rand"; Editable = $true }
+    $NamePlan["AutomationUpdater"] = [pscustomobject]@{ Label = "Automation Account (updater)"; Value = "nmw-app-automation-pf-$rand"; Editable = $true }
+    $NamePlan["AutomationScriptedActions"] = [pscustomobject]@{ Label = "Automation Account (scripted actions)"; Value = "nmw-app-scripted-actions-pf-$rand"; Editable = $true }
+    $NamePlan["WebApp"] = [pscustomobject]@{ Label = "Web App (portal site)"; Value = "nmw-app-pf-$rand"; Editable = $true }
+    $NamePlan["AppInsights"] = [pscustomobject]@{ Label = "Application Insights"; Value = "nmw-app-insights-pf-$rand"; Editable = $true }
     if ($CreateNewVnet) {
-        $NamePlan["Vnet"] = [pscustomobject]@{ Label = "Virtual Network"; Value = "vnet-nmepf-$rand"; Editable = $true }
-        $NamePlan["PeSubnet"] = [pscustomobject]@{ Label = "Subnet (private endpoints)"; Value = $PeSubnetName; Editable = $true }
-        $NamePlan["AppSubnet"] = [pscustomobject]@{ Label = "Subnet (App Service VNet integration)"; Value = $AppSubnetName; Editable = $true }
+        $NamePlan["Vnet"] = [pscustomobject]@{ Label = "Virtual Network"; Value = "nmw-app-vnet-pf-$rand"; Editable = $true }
+        $NamePlan["PeSubnet"] = [pscustomobject]@{ Label = "Subnet (private endpoints)"; Value = "nmw-app-pesubnet-pf-$rand"; Editable = $true }
+        $NamePlan["AppSubnet"] = [pscustomobject]@{ Label = "Subnet (App Service VNet integration)"; Value = "nmw-app-appsubnet-pf-$rand"; Editable = $true }
     }
     if ($TestPrivate) {
-        $NamePlan["PrivateEndpoint"] = [pscustomobject]@{ Label = "Private Endpoint"; Value = "pe-nmepf-$rand"; Editable = $true }
+        $NamePlan["PrivateEndpoint"] = [pscustomobject]@{ Label = "Private Endpoint"; Value = "nmw-app-pe-pf-$rand"; Editable = $true }
     }
     if ($TestVnetIntegration) {
-        $NamePlan["ConnAsp"] = [pscustomobject]@{ Label = "App Service Plan for connectivity test"; Value = "asp-nmepfconn-$rand"; Editable = $true }
-        $NamePlan["ConnWebApp"] = [pscustomobject]@{ Label = "Web App for connectivity test"; Value = "app-nmepfconn-$rand"; Editable = $true }
+        $NamePlan["ConnAsp"] = [pscustomobject]@{ Label = "App Service Plan for connectivity test"; Value = "nmw-app-connasp-pf-$rand"; Editable = $true }
+        $NamePlan["ConnWebApp"] = [pscustomobject]@{ Label = "Web App for connectivity test"; Value = "nmw-app-connapp-pf-$rand"; Editable = $true }
     }
 
     Write-Host -ForegroundColor "Cyan" "The following resource names will be used for this test run:"
@@ -2697,13 +2702,13 @@ try {
                 @{ Ra = $ra; Error = $raErr }
             }
             if ($raResult.Ra) {
-                Add-Result -Category "Deployability" -Check "Role assignment (Contributor to Automation account identity)" -Result "Pass" -Detail "Granted Contributor at resource-group scope to the updater Automation account's managed identity; removed at cleanup."
+                Add-Result -Category "Deployability" -Check "Role assignment" -Result "Pass" -Detail "Granted Contributor at resource-group scope to the updater Automation account's managed identity; removed at cleanup."
                 Add-TrackedResource -Type "roleassignment" -ResourceGroupName $ResourceGroupName -Name $raResult.Ra.RoleAssignmentId -Id $raScope -Note $aaPrincipalId
             }
-            else { Add-PolicyFailureResult -Category "Deployability" -Check "Role assignment (Contributor to Automation account identity)" -RawMessage $raResult.Error }
+            else { Add-PolicyFailureResult -Category "Deployability" -Check "Role assignment" -RawMessage $raResult.Error }
         }
         else {
-            Add-Result -Category "Deployability" -Check "Role assignment (Contributor to Automation account identity)" -Result "Warn" -Detail "Skipped - could not resolve the updater Automation account's managed identity principal id."
+            Add-Result -Category "Deployability" -Check "Role assignment" -Result "Warn" -Detail "Skipped - could not resolve the updater Automation account's managed identity principal id."
         }
     }
 
