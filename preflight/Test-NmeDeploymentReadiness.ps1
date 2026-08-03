@@ -2642,9 +2642,15 @@ try {
 
                 $reauthOk = $false
                 try {
-                    Write-Host -ForegroundColor "Cyan" "Re-authenticating to tenant $TenantId..."
-                    if ($script:IsCloudShell) { Connect-AzAccount -Tenant $TenantId -ErrorAction Stop | Out-Null }
-                    else { Connect-AzAccount -Tenant $TenantId -UseDeviceAuthentication -ErrorAction Stop | Out-Null }
+                    # Always use device-code auth here, including in Cloud Shell. A plain
+                    # Connect-AzAccount in Cloud Shell silently reuses the ambient SSO/managed-identity
+                    # credential - the very identity that produced the wrong-tenant token - so it cannot
+                    # fix the issuer mismatch. Device auth forces a fresh interactive sign-in against the
+                    # target tenant's authority, which a guest/B2B account can complete to obtain a token
+                    # issued by that tenant (the correct issuer the vault expects).
+                    Write-Host -ForegroundColor "Cyan" "Re-authenticating to tenant $TenantId via device code."
+                    Write-Host -ForegroundColor "Cyan" "A sign-in URL and code will be shown below - complete it as the account that has access to the target tenant."
+                    Connect-AzAccount -Tenant $TenantId -UseDeviceAuthentication -ErrorAction Stop | Out-Null
                     Set-AzContext -Subscription $SubscriptionId -Tenant $TenantId -ErrorAction Stop | Out-Null
                     $reauthOk = $true
                 }
