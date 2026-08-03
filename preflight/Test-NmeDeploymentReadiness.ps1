@@ -1686,13 +1686,19 @@ try {
         return
     }
 
-    # The subscription's home tenant, as resolved by Set-AzContext above - a subscription has exactly
-    # one home tenant, so this is reliable (no need to prompt the user for it separately). Used to pin
-    # data-plane token acquisition (e.g. Key Vault) below: for an account signed in across multiple
-    # Entra tenants (guest/B2B access), Az PowerShell's token cache can otherwise silently hand back a
-    # token for a different tenant than the one Set-AzContext already resolved for ARM calls, which the
-    # target resource (e.g. Key Vault) then rejects with an "Invalid issuer" (AKV10032) error.
-    $TenantId = $Context.Tenant.Id
+    # The subscription's OWNING (home) tenant. Used to pin data-plane token acquisition (e.g. Key
+    # Vault): for an account signed in across multiple Entra tenants (guest/B2B access), Az PowerShell
+    # can otherwise hand back a token from the wrong tenant, which the target resource then rejects
+    # with "Invalid issuer" (AKV10032).
+    #
+    # NOTE: do NOT use (Get-AzContext).Tenant.Id here - in guest/B2B scenarios that reports the tenant
+    # the account AUTHENTICATED THROUGH (its home tenant), not the tenant that OWNS the subscription,
+    # and those differ. The subscription's HomeTenantId is the authoritative owning tenant (it is the
+    # issuer ARM/Key Vault actually expect). Fall back to the context tenant only if it is unavailable.
+    $TenantId = $null
+    try { if ($Context.Subscription -and $Context.Subscription.HomeTenantId) { $TenantId = $Context.Subscription.HomeTenantId } } catch {}
+    if (-not $TenantId) { try { $TenantId = (Get-AzSubscription -SubscriptionId $SubscriptionId -ErrorAction Stop).HomeTenantId } catch {} }
+    if (-not $TenantId) { $TenantId = $Context.Tenant.Id }
 
     # Cloud environment (Commercial / Gov / China) drives Graph endpoint and DNS suffixes.
     $AzEnv = (Get-AzContext).Environment
@@ -2590,24 +2596,53 @@ try {
         # rather than a misleading policy Fail. A genuine Azure Policy denial (RequestDisallowedByPolicy)
         # falls through to Add-PolicyFailureResult, which names the blocking policy.
         $isDataPlanePermErr = { param($m) $m -and ($m -match "does not have (keys|secrets|certificates).*permission" -or $m -match "ForbiddenByPolicy" -or $m -match "AccessDenied") }
-        # AKV10032 "Invalid issuer" means the token presented to the vault was minted by a tenant the
-        # vault doesn't trust - not an access/policy problem. Happens when the signed-in account has
-        # access to multiple Entra tenants (guest/B2B) and Az PowerShell's token cache hands back a
-        # token for the wrong tenant on this resource audience.
-        $isTenantIssuerErr = { param($m) $m -and ($m -match "AKV10032" -or $m -match "Invalid issuer") }
+        # A "wrong/invalid issuer" rejection (Key Vault AKV10032, or the ARM equivalent) means the token
+        # was minted by a tenant the resource doesn't trust - not an access/policy problem. Happens when
+        # the signed-in account has access to multiple Entra tenants (guest/B2B) and the token came from
+        # the account's own (home) tenant instead of the tenant that owns the subscription.
+        $isTenantIssuerErr = { param($m) $m -and ($m -match "AKV10032" -or $m -match "Invalid issuer" -or $m -match "wrong issuer") }
         $hasTenantIssuer = { param($kv) (& $isTenantIssuerErr $kv.KeyError) -or (& $isTenantIssuerErr $kv.SecretError) }
-        $tenantIssuerDetail = "Failed: the token presented to the vault was issued by the wrong Entra tenant - this account has access to more than one tenant (e.g. guest/B2B access), and the cached token for Key Vault did not match the subscription's tenant ($TenantId). Re-authenticate pinned to this tenant ('Connect-AzAccount -TenantId $TenantId') and retry."
+
+        # Parse the tenant GUIDs out of a wrong-issuer error. Both the Key Vault (AKV10032) and ARM
+        # variants name the token's (wrong) issuer AND the tenant(s) the resource actually trusts - the
+        # latter is the authoritative "correct" tenant to authenticate to (do NOT trust a value derived
+        # from the current context, which is what got us the wrong tenant in the first place). Returns
+        # @{ Expected = <trusted/owning tenant GUIDs>; Found = <wrong tenant GUID> }.
+        $guidPat = '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
+        $parseIssuerTenants = {
+            param($msg)
+            $out = [pscustomobject]@{ Expected = @(); Found = $null }
+            if ([string]::IsNullOrWhiteSpace($msg)) { return $out }
+            if ($msg -match "(?:found|wrong issuer)[^0-9a-fA-F]*sts\.windows\.net/($guidPat)") { $out.Found = $Matches[1] }
+            $all = [regex]::Matches($msg, "sts\.windows\.net/($guidPat)") | ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique
+            $out.Expected = @($all | Where-Object { $_ -ne $out.Found })
+            return $out
+        }
+
+        # Build the Fail detail for a tenant-issuer error from the specific message, naming the tenant
+        # the resource actually expects (parsed from the error) rather than any guessed value.
+        $tenantIssuerDetailFor = {
+            param($msg)
+            $info = & $parseIssuerTenants $msg
+            if (@($info.Expected).Count -gt 0) {
+                $correct = @($info.Expected) -join "' or '"
+                "Failed: Key Vault rejected the token as issued by the wrong Entra tenant (issued by '$($info.Found)'). This account has access to multiple tenants (e.g. guest/B2B); the subscription is owned by tenant '$correct'. Re-authenticate pinned to that tenant ('Connect-AzAccount -TenantId $correct -UseDeviceAuthentication') and retry."
+            }
+            else {
+                "Failed: Key Vault rejected the token as issued by the wrong Entra tenant - this account has access to more than one tenant (e.g. guest/B2B). Re-authenticate pinned to the subscription's owning tenant ('Connect-AzAccount -TenantId <owning tenant> -UseDeviceAuthentication') and retry."
+            }
+        }
 
         # (Re-)report the two data-plane write rows from a $kvToggle result. Used for the first attempt
         # and again after each re-auth retry, so the report always reflects the latest attempt.
         $reportKvDataPlane = {
             param($kv)
             if ($kv.KeyOk) { Add-Result -Category "Deployability" -Check "Key Vault key creation (RSA data-protection key)" -Result "Pass" -Detail "Created successfully." }
-            elseif (& $isTenantIssuerErr $kv.KeyError) { Add-Result -Category "Deployability" -Check "Key Vault key creation (RSA data-protection key)" -Result "Fail" -Detail $tenantIssuerDetail -Message $kv.KeyError }
+            elseif (& $isTenantIssuerErr $kv.KeyError) { Add-Result -Category "Deployability" -Check "Key Vault key creation (RSA data-protection key)" -Result "Fail" -Detail (& $tenantIssuerDetailFor $kv.KeyError) -Message $kv.KeyError }
             elseif (& $isDataPlanePermErr $kv.KeyError) { Add-Result -Category "Deployability" -Check "Key Vault key creation (RSA data-protection key)" -Result "Warn" -Detail "Not tested - could not grant the running user data-plane access to the throwaway vault (access-policy model). This is a test limitation, not an Azure Policy block." -Message $kv.KeyError }
             else { Add-PolicyFailureResult -Category "Deployability" -Check "Key Vault key creation (RSA data-protection key)" -RawMessage $kv.KeyError }
             if ($kv.SecretOk) { Add-Result -Category "Deployability" -Check "Key Vault secret creation" -Result "Pass" -Detail "Created successfully." }
-            elseif (& $isTenantIssuerErr $kv.SecretError) { Add-Result -Category "Deployability" -Check "Key Vault secret creation" -Result "Fail" -Detail $tenantIssuerDetail -Message $kv.SecretError }
+            elseif (& $isTenantIssuerErr $kv.SecretError) { Add-Result -Category "Deployability" -Check "Key Vault secret creation" -Result "Fail" -Detail (& $tenantIssuerDetailFor $kv.SecretError) -Message $kv.SecretError }
             elseif (& $isDataPlanePermErr $kv.SecretError) { Add-Result -Category "Deployability" -Check "Key Vault secret creation" -Result "Warn" -Detail "Not tested - could not grant the running user data-plane access to the throwaway vault (access-policy model). This is a test limitation, not an Azure Policy block." -Message $kv.SecretError }
             else { Add-PolicyFailureResult -Category "Deployability" -Check "Key Vault secret creation" -RawMessage $kv.SecretError }
         }
@@ -2617,33 +2652,72 @@ try {
         if ($kvToggle.Ok) {
             & $reportKvDataPlane $kvToggle
 
-            # Mid-run recovery for the multi-tenant "Invalid issuer" case: rather than make the user
-            # finish the whole run, clean up, re-authenticate, and start over, offer to re-authenticate
-            # pinned to the subscription's tenant right now and retry just the Key Vault data-plane
-            # writes (nothing is torn down between attempts). Loops until the writes succeed or the user
-            # declines. Skipped when input is redirected (non-interactive run).
+            # Mid-run recovery for the multi-tenant "wrong issuer" case. Rather than force a full
+            # restart, offer to re-authenticate to the subscription's OWNING tenant (parsed from the
+            # error, not guessed) via device code, then retry just the Key Vault data-plane writes.
+            # A global re-auth mutates the shared Az context that every later check + cleanup rely on,
+            # so this is done defensively: the context is snapshotted first, the result is VERIFIED to
+            # have landed on the intended tenant/subscription, and on any mismatch the original context
+            # is RESTORED and the user is re-prompted (never proceeding on a broken context). Skipped
+            # when input is redirected (non-interactive run).
             while ($kvToggle.Ok -and (& $hasTenantIssuer $kvToggle) -and -not [Console]::IsInputRedirected) {
-                Write-Host ""
-                Write-Host -ForegroundColor "Yellow" "The Key Vault data-plane calls were rejected because the signed-in account presented a token from the wrong Entra tenant (a multi-tenant / guest account)."
-                Write-Host -ForegroundColor "Yellow" "This can be fixed without restarting: re-authenticate pinned to the subscription's tenant ($TenantId), then retry just the Key Vault checks."
-                if (-not (Read-YesNo -Prompt "Re-authenticate now (pinned to tenant $TenantId) and retry the Key Vault checks? [Y/n]" -Default "y")) { break }
+                $issuer = & $parseIssuerTenants ("$($kvToggle.KeyError) `n $($kvToggle.SecretError)")
+                $expected = @($issuer.Expected)
+                if ($expected.Count -eq 0) {
+                    Write-Host -ForegroundColor "Yellow" "Could not determine the subscription's owning tenant from the error - skipping the in-run retry. See the end-of-run recap for how to finish this check."
+                    break
+                }
+                # If the error names more than one trusted tenant, let the user choose which to use.
+                if ($expected.Count -gt 1) {
+                    $idx = Read-Choice -Prompt "The subscription is associated with more than one tenant. Which should I authenticate to?" -Options $expected -Default 1
+                    $targetTenant = $expected[$idx - 1]
+                }
+                else { $targetTenant = $expected[0] }
 
-                $reauthOk = $false
+                Write-Host ""
+                Write-Host -ForegroundColor "Yellow" "Key Vault rejected the token as issued by the wrong Entra tenant (a multi-tenant / guest account)."
+                Write-Host -ForegroundColor "Yellow" "Token was issued by tenant '$($issuer.Found)'; the subscription is owned by tenant '$targetTenant'."
+                Write-Host -ForegroundColor "Yellow" "This can be fixed without restarting: re-authenticate (device code) to '$targetTenant', then retry just the Key Vault checks."
+                if (-not (Read-YesNo -Prompt "Re-authenticate to tenant $targetTenant and retry the Key Vault checks? [Y/n]" -Default "y")) { break }
+
+                # Snapshot the context so we can roll back if the re-auth lands somewhere unusable.
+                $savedContext = $null; try { $savedContext = Get-AzContext } catch {}
+
+                $reauthValid = $false
                 try {
-                    # Always use device-code auth here, including in Cloud Shell. A plain
-                    # Connect-AzAccount in Cloud Shell silently reuses the ambient SSO/managed-identity
-                    # credential - the very identity that produced the wrong-tenant token - so it cannot
-                    # fix the issuer mismatch. Device auth forces a fresh interactive sign-in against the
-                    # target tenant's authority, which a guest/B2B account can complete to obtain a token
-                    # issued by that tenant (the correct issuer the vault expects).
-                    Write-Host -ForegroundColor "Cyan" "Re-authenticating to tenant $TenantId via device code."
-                    Write-Host -ForegroundColor "Cyan" "A sign-in URL and code will be shown below - complete it as the account that has access to the target tenant."
-                    Connect-AzAccount -Tenant $TenantId -UseDeviceAuthentication -ErrorAction Stop | Out-Null
-                    Set-AzContext -Subscription $SubscriptionId -Tenant $TenantId -ErrorAction Stop | Out-Null
-                    $reauthOk = $true
+                    # Device-code auth (always, incl. Cloud Shell): a plain Connect-AzAccount in Cloud
+                    # Shell silently reuses the ambient SSO/managed-identity credential - the very
+                    # identity that produced the wrong-tenant token - so it cannot fix the mismatch.
+                    # Device auth forces a fresh interactive sign-in against the target tenant's
+                    # authority, yielding a token issued by that tenant (the issuer the resource expects).
+                    Write-Host -ForegroundColor "Cyan" "Re-authenticating to tenant $targetTenant via device code."
+                    Write-Host -ForegroundColor "Cyan" "A sign-in URL and code will be shown below - complete it as the account that has access to this tenant/subscription."
+                    Connect-AzAccount -Tenant $targetTenant -UseDeviceAuthentication -ErrorAction Stop | Out-Null
+                    Set-AzContext -Subscription $SubscriptionId -Tenant $targetTenant -ErrorAction Stop | Out-Null
+                    # Verify we actually landed on the intended tenant + subscription before touching
+                    # anything else - the check the user asked for.
+                    $nowCtx = Get-AzContext
+                    if ($nowCtx -and $nowCtx.Subscription -and $nowCtx.Subscription.Id -eq $SubscriptionId -and $nowCtx.Tenant.Id -eq $targetTenant) {
+                        $reauthValid = $true
+                        $TenantId = $targetTenant   # keep token-priming aligned with the tenant we landed on
+                        Write-Host -ForegroundColor "Green" "[$([char]0x2713)] Re-authenticated. Context is now tenant $targetTenant, subscription $SubscriptionId."
+                    }
+                    else {
+                        Write-Host -ForegroundColor "Yellow" "After re-auth the context did not match the target (tenant '$($nowCtx.Tenant.Id)', subscription '$($nowCtx.Subscription.Id)')."
+                    }
                 }
                 catch { Write-Host -ForegroundColor "Red" "Re-authentication failed: $($_.Exception.Message)" }
-                if (-not $reauthOk) { break }
+
+                if (-not $reauthValid) {
+                    # Roll back to the pre-retry context so the remaining checks and cleanup are not run
+                    # on a broken/half-set context, then let the user try again or give up.
+                    if ($savedContext) {
+                        try { Set-AzContext -Context $savedContext -ErrorAction Stop | Out-Null; Write-Host -ForegroundColor "Cyan" "Restored the original Azure context." }
+                        catch { Write-Host -ForegroundColor "Yellow" "Could not restore the original context: $($_.Exception.Message)" }
+                    }
+                    if (-not (Read-YesNo -Prompt "Re-authentication did not land on the correct tenant/subscription. Try again? [y/N]" -Default "n")) { break }
+                    continue
+                }
 
                 # Re-resolve the user's object id in the (now correct) tenant, since a B2B guest has a
                 # different object id per tenant and the access-policy grant is keyed on it.
@@ -2653,7 +2727,8 @@ try {
                 }
                 catch {}
 
-                # Drop the prior key/secret rows so the report shows only the latest attempt.
+                # Drop the prior key/secret rows so the report shows only the latest attempt, then retry.
+                # If it is still an issuer error, the loop re-prompts (e.g. to pick the other tenant).
                 [void]$Results.RemoveAll({ param($r) $r.Category -eq "Deployability" -and ($r.Check -eq "Key Vault key creation (RSA data-protection key)" -or $r.Check -eq "Key Vault secret creation") })
                 $kvToggle = & $kvSim
                 & $reportKvDataPlane $kvToggle
@@ -2662,7 +2737,9 @@ try {
             # If the issuer mismatch is still unresolved (retry declined, failed, or non-interactive),
             # record a next-step so the end-of-run recap tells the user how to finish the KV checks.
             if ($kvToggle.Ok -and (& $hasTenantIssuer $kvToggle)) {
-                $NextSteps.Add("Key Vault key/secret creation could not be verified: the signed-in account presented a token from the wrong Entra tenant (a multi-tenant / guest account). Re-authenticate pinned to the subscription's tenant with 'Connect-AzAccount -TenantId $TenantId -UseDeviceAuthentication', then re-run this script to confirm the Key Vault data-plane checks pass.")
+                $issuer = & $parseIssuerTenants ("$($kvToggle.KeyError) `n $($kvToggle.SecretError)")
+                $correct = if (@($issuer.Expected).Count -gt 0) { @($issuer.Expected) -join "' or '" } else { "the subscription's owning tenant" }
+                $NextSteps.Add("Key Vault key/secret creation could not be verified: the signed-in account presented a token from the wrong Entra tenant (a multi-tenant / guest account). Re-authenticate to tenant '$correct' with 'Connect-AzAccount -TenantId $correct -UseDeviceAuthentication', then re-run this script to confirm the Key Vault data-plane checks pass.")
             }
         }
     }
