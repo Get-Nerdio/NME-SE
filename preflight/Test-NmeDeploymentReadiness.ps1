@@ -1661,12 +1661,22 @@ try {
         return
     }
 
+    # The subscription's home tenant, as resolved by Set-AzContext above - a subscription has exactly
+    # one home tenant, so this is reliable (no need to prompt the user for it separately). Used to pin
+    # data-plane token acquisition (e.g. Key Vault) below: for an account signed in across multiple
+    # Entra tenants (guest/B2B access), Az PowerShell's token cache can otherwise silently hand back a
+    # token for a different tenant than the one Set-AzContext already resolved for ARM calls, which the
+    # target resource (e.g. Key Vault) then rejects with an "Invalid issuer" (AKV10032) error.
+    $TenantId = $Context.Tenant.Id
+
     # Cloud environment (Commercial / Gov / China) drives Graph endpoint and DNS suffixes.
     $AzEnv = (Get-AzContext).Environment
     $GraphBase = Get-EnvSuffix -AzEnvName $AzEnv.Name -Kind Graph
     $StorageSuffix = $AzEnv.StorageEndpointSuffix           # e.g. core.windows.net
     $SqlSuffix = $AzEnv.SqlDatabaseDnsSuffix                # e.g. .database.windows.net
     $KeyVaultSuffix = $AzEnv.AzureKeyVaultDnsSuffix         # e.g. vault.azure.net
+    $KeyVaultAudience = $AzEnv.AzureKeyVaultServiceEndpointResourceId
+    if ([string]::IsNullOrEmpty($KeyVaultAudience)) { $KeyVaultAudience = "https://vault.azure.net" }
     if ([string]::IsNullOrEmpty($StorageSuffix)) { $StorageSuffix = "core.windows.net" }
     if ([string]::IsNullOrEmpty($SqlSuffix)) { $SqlSuffix = ".database.windows.net" }
     if ([string]::IsNullOrEmpty($KeyVaultSuffix)) { $KeyVaultSuffix = "vault.azure.net" }
@@ -2499,6 +2509,13 @@ try {
                     $result.AccessPolicySet = $true
                 }
                 catch { $result.AccessPolicySet = $false; $result.AccessPolicyError = Get-DetailedErrorMessage -ErrorRecord $_ }
+                # Prime the token cache with a Key Vault (data-plane) token explicitly scoped to the
+                # subscription's home tenant before the writes below. For an account signed in across
+                # multiple Entra tenants (guest/B2B access), Az PowerShell can otherwise silently reuse a
+                # cached token for a different tenant on this resource audience than the one already
+                # resolved for the subscription, which the vault then rejects with "Invalid issuer"
+                # (AKV10032). Best-effort - if this fails, the writes below will surface the real error.
+                try { Get-AzAccessToken -ResourceUrl $KeyVaultAudience -TenantId $TenantId -ErrorAction Stop | Out-Null } catch {}
                 for ($a = 1; $a -le 4; $a++) {
                     try {
                         Add-AzKeyVaultKey -VaultName $kvName -Name "nmepf-dp-key" -Destination "Software" -KeyType "RSA" -ErrorAction Stop | Out-Null
@@ -2538,10 +2555,20 @@ try {
             # than a misleading policy Fail. A genuine Azure Policy denial (RequestDisallowedByPolicy)
             # falls through to Add-PolicyFailureResult, which names the blocking policy.
             $isDataPlanePermErr = { param($m) $m -and ($m -match "does not have (keys|secrets|certificates).*permission" -or $m -match "ForbiddenByPolicy" -or $m -match "AccessDenied") }
+            # AKV10032 "Invalid issuer" means the token presented to the vault was minted by a tenant
+            # the vault doesn't trust - not an access/policy problem. This happens when the signed-in
+            # account has access to multiple Entra tenants (guest/B2B) and Az PowerShell's token cache
+            # hands back a token for the wrong tenant on this resource audience. Report it distinctly,
+            # with the fix (re-authenticate pinned to the subscription's tenant), instead of a generic
+            # policy-shaped Fail.
+            $isTenantIssuerErr = { param($m) $m -and ($m -match "AKV10032" -or $m -match "Invalid issuer") }
+            $tenantIssuerDetail = "Failed: the token presented to the vault was issued by the wrong Entra tenant - this account has access to more than one tenant (e.g. guest/B2B access), and the cached token for Key Vault did not match the subscription's tenant ($TenantId). Fix: run 'Connect-AzAccount -TenantId $TenantId -UseDeviceAuthentication' (re-authenticating pinned to this tenant) and re-run this script."
             if ($kvToggle.KeyOk) { Add-Result -Category "Deployability" -Check "Key Vault key creation (RSA data-protection key)" -Result "Pass" -Detail "Created successfully." }
+            elseif (& $isTenantIssuerErr $kvToggle.KeyError) { Add-Result -Category "Deployability" -Check "Key Vault key creation (RSA data-protection key)" -Result "Fail" -Detail $tenantIssuerDetail -Message $kvToggle.KeyError }
             elseif (& $isDataPlanePermErr $kvToggle.KeyError) { Add-Result -Category "Deployability" -Check "Key Vault key creation (RSA data-protection key)" -Result "Warn" -Detail "Not tested - could not grant the running user data-plane access to the throwaway vault (access-policy model). This is a test limitation, not an Azure Policy block." -Message $kvToggle.KeyError }
             else { Add-PolicyFailureResult -Category "Deployability" -Check "Key Vault key creation (RSA data-protection key)" -RawMessage $kvToggle.KeyError }
             if ($kvToggle.SecretOk) { Add-Result -Category "Deployability" -Check "Key Vault secret creation" -Result "Pass" -Detail "Created successfully." }
+            elseif (& $isTenantIssuerErr $kvToggle.SecretError) { Add-Result -Category "Deployability" -Check "Key Vault secret creation" -Result "Fail" -Detail $tenantIssuerDetail -Message $kvToggle.SecretError }
             elseif (& $isDataPlanePermErr $kvToggle.SecretError) { Add-Result -Category "Deployability" -Check "Key Vault secret creation" -Result "Warn" -Detail "Not tested - could not grant the running user data-plane access to the throwaway vault (access-policy model). This is a test limitation, not an Azure Policy block." -Message $kvToggle.SecretError }
             else { Add-PolicyFailureResult -Category "Deployability" -Check "Key Vault secret creation" -RawMessage $kvToggle.SecretError }
         }
