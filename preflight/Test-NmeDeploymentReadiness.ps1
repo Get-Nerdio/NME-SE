@@ -193,6 +193,7 @@ function New-ReadinessHtmlReport {
         [System.Collections.Specialized.OrderedDictionary] $CustomResourceNames,
         [object] $Meta,
         [System.Collections.IEnumerable] $CreatedResources,
+        [System.Collections.IEnumerable] $NextSteps,
         [string] $RawJson
     )
     $verdict = Get-ReadinessVerdict -Results $Results
@@ -239,6 +240,9 @@ font-size:11px;font-weight:700;letter-spacing:.03em;}
 details{margin-top:26px;}summary{cursor:pointer;color:var(--muted);font-size:13px;}
 pre{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:12px;overflow:auto;font-size:12px;
 font-family:ui-monospace,SFMono-Regular,Menlo,monospace;}
+.actions{border:1px solid var(--warn);background:var(--card);border-radius:10px;padding:2px 18px 14px;margin:18px 0 22px;}
+.actions h2{color:var(--warn);border-bottom-color:var(--warn);}
+.actions ol{margin:8px 0 0;padding-left:22px;}.actions li{margin:6px 0;font-size:13px;}
 "@)
     [void]$sb.AppendLine('</style></head><body><div class="wrap">')
     [void]$sb.AppendLine('<div class="brand">Nerdio</div>')
@@ -255,6 +259,14 @@ font-family:ui-monospace,SFMono-Regular,Menlo,monospace;}
     [void]$sb.AppendLine("<span class=`"chip`" style=`"border-color:var(--fail)`">Fail <span class=`"n`">$($counts.Fail)</span></span>")
     [void]$sb.AppendLine("<span class=`"chip`" style=`"border-color:var(--info)`">Info <span class=`"n`">$($counts.Info)</span></span>")
     [void]$sb.AppendLine('</div>')
+
+    # Action-required recap: anything the run couldn't finish on its own (e.g. a Key Vault check that
+    # needs a re-auth to the right tenant), so an incomplete run isn't mistaken for a complete one.
+    if ($NextSteps -and @($NextSteps).Count -gt 0) {
+        [void]$sb.AppendLine('<div class="actions"><h2>Action required to complete testing</h2><ol>')
+        foreach ($s in $NextSteps) { [void]$sb.AppendLine("<li>$(ConvertTo-HtmlText ([string]$s))</li>") }
+        [void]$sb.AppendLine('</ol></div>')
+    }
 
     # Run metadata.
     [void]$sb.AppendLine('<table class="meta">')
@@ -1646,6 +1658,10 @@ if (-not (Read-YesNo -Prompt "Proceed? [Y/n]" -Default "y")) {
 $CreatedResourceGroup = $false
 $ConfigSummary = [ordered]@{}
 $CustomResourceNames = [ordered]@{}   # Label -> final custom Value, only for entries the user changed
+# Post-run "you still need to do something" items (e.g. a Key Vault check that could only be
+# completed after re-authenticating to the right tenant). Surfaced in the end-of-run recap, the
+# HTML report, and the JSON so an incomplete run never looks finished.
+$NextSteps = [System.Collections.Generic.List[string]]::new()
 try {
     #region Intake -------------------------------------------------------------------------------
     if ([string]::IsNullOrWhiteSpace($SubscriptionId)) {
@@ -2496,15 +2512,23 @@ try {
     # does this toggle, and the check is cheap (two control-plane updates).
     $kvOk = ($jobResults | Where-Object { $_.Kind -eq "kv" -and $_.Ok })
     if ($kvOk) {
-        # Run the toggle (harden -> enable -> data-plane writes -> harden) under a spinner; return a
-        # plain result and print the Add-Result lines afterwards so console writes don't collide.
-        $kvToggle = Invoke-WithSpinner -Activity "Testing Key Vault public-access toggle and data-plane writes" -ScriptBlock {
-            # Put the KV in its hardened end-state first (best-effort; not the check we care about).
-            try { Update-AzKeyVault -VaultName $kvName -ResourceGroupName $ResourceGroupName -PublicNetworkAccess "Disabled" -ErrorAction Stop | Out-Null } catch {}
+        # The installer's Key Vault sequence, mirrored end-to-end: harden -> briefly enable public
+        # access (the step a "deny KV public access" policy would block) -> grant the running user a
+        # data-plane access policy (the throwaway vault uses the access-policy model, like the
+        # installer, so the user has no data-plane rights by default) -> pin a correct-tenant token ->
+        # write the RSA data-protection key (no expiration, as the installer does) and a secret ->
+        # re-harden. Factored into a function so the exact same steps can be replayed after a mid-run
+        # re-authentication (the multi-tenant "Invalid issuer" retry below). No console writes, so it
+        # is safe to run under a spinner; returns a plain result the caller reports afterwards.
+        function Invoke-KvInstallSimulation {
+            param(
+                [string] $VaultName, [string] $ResourceGroupName, [string] $MeObjectId,
+                [string] $SignedInAccount, [string] $KeyVaultAudience, [string] $TenantId
+            )
+            try { Update-AzKeyVault -VaultName $VaultName -ResourceGroupName $ResourceGroupName -PublicNetworkAccess "Disabled" -ErrorAction Stop | Out-Null } catch {}
             $result = @{}
             try {
-                # The actual check: can the install's "briefly enable public access" step succeed.
-                Update-AzKeyVault -VaultName $kvName -ResourceGroupName $ResourceGroupName -PublicNetworkAccess "Enabled" -ErrorAction Stop | Out-Null
+                Update-AzKeyVault -VaultName $VaultName -ResourceGroupName $ResourceGroupName -PublicNetworkAccess "Enabled" -ErrorAction Stop | Out-Null
                 $result.Ok = $true
             }
             catch {
@@ -2513,20 +2537,13 @@ try {
                 $result.Error = $kvToggleErrMsg
                 $result.IsParamBind = ($_.Exception -is [System.Management.Automation.ParameterBindingException] -or $kvToggleErrMsg -match "A parameter cannot be found")
             }
-            # With public access enabled, exercise the data-plane writes the installer performs: create
-            # the RSA data-protection key (no expiration, as the installer does - catches "keys must
-            # expire" Deny policies) and write a secret. Retry briefly for data-plane/access-policy
-            # propagation after enabling public access; a real policy denial won't match the retry
-            # regex and falls through quickly to be reported as a Fail.
             if ($result.Ok) {
-                # The vault uses the access-policy model (RBAC disabled) to match the installer, so the
-                # running user has NO data-plane rights by default - the real installer instead grants
-                # the app's managed identity an access policy. Grant one for the running user here so
-                # the key/secret writes below aren't refused by the vault itself (a data-plane 403,
-                # unrelated to Azure Policy). Best-effort; a failure here is surfaced by the writes below.
+                # Grant the running user a data-plane access policy so the key/secret writes below aren't
+                # refused by the vault itself (a data-plane 403, unrelated to Azure Policy). Best-effort;
+                # a failure here is surfaced by the writes below.
                 try {
-                    if ($meObjectId) { Set-AzKeyVaultAccessPolicy -VaultName $kvName -ResourceGroupName $ResourceGroupName -ObjectId $meObjectId -PermissionsToKeys create, get, delete -PermissionsToSecrets set, get, delete -ErrorAction Stop | Out-Null }
-                    elseif ($SignedInAccount) { Set-AzKeyVaultAccessPolicy -VaultName $kvName -ResourceGroupName $ResourceGroupName -UserPrincipalName $SignedInAccount -PermissionsToKeys create, get, delete -PermissionsToSecrets set, get, delete -ErrorAction Stop | Out-Null }
+                    if ($MeObjectId) { Set-AzKeyVaultAccessPolicy -VaultName $VaultName -ResourceGroupName $ResourceGroupName -ObjectId $MeObjectId -PermissionsToKeys create, get, delete -PermissionsToSecrets set, get, delete -ErrorAction Stop | Out-Null }
+                    elseif ($SignedInAccount) { Set-AzKeyVaultAccessPolicy -VaultName $VaultName -ResourceGroupName $ResourceGroupName -UserPrincipalName $SignedInAccount -PermissionsToKeys create, get, delete -PermissionsToSecrets set, get, delete -ErrorAction Stop | Out-Null }
                     $result.AccessPolicySet = $true
                 }
                 catch { $result.AccessPolicySet = $false; $result.AccessPolicyError = Get-DetailedErrorMessage -ErrorRecord $_ }
@@ -2537,9 +2554,12 @@ try {
                 # resolved for the subscription, which the vault then rejects with "Invalid issuer"
                 # (AKV10032). Best-effort - if this fails, the writes below will surface the real error.
                 try { Get-AzAccessToken -ResourceUrl $KeyVaultAudience -TenantId $TenantId -ErrorAction Stop | Out-Null } catch {}
+                # Retry briefly for data-plane/access-policy propagation after enabling public access; a
+                # real policy denial or issuer mismatch won't match the retry regex and falls through
+                # quickly to be reported.
                 for ($a = 1; $a -le 4; $a++) {
                     try {
-                        Add-AzKeyVaultKey -VaultName $kvName -Name "nmepf-dp-key" -Destination "Software" -KeyType "RSA" -ErrorAction Stop | Out-Null
+                        Add-AzKeyVaultKey -VaultName $VaultName -Name "nmepf-dp-key" -Destination "Software" -KeyType "RSA" -ErrorAction Stop | Out-Null
                         $result.KeyOk = $true; break
                     }
                     catch {
@@ -2549,15 +2569,23 @@ try {
                     }
                 }
                 try {
-                    Set-AzKeyVaultSecret -VaultName $kvName -Name "nmepf-test-secret" -SecretValue (ConvertTo-SecureString -String "PreflightTest!$(Get-Random)" -AsPlainText -Force) -ErrorAction Stop | Out-Null
+                    Set-AzKeyVaultSecret -VaultName $VaultName -Name "nmepf-test-secret" -SecretValue (ConvertTo-SecureString -String "PreflightTest!$(Get-Random)" -AsPlainText -Force) -ErrorAction Stop | Out-Null
                     $result.SecretOk = $true
                 }
                 catch { $result.SecretError = Get-DetailedErrorMessage -ErrorRecord $_; $result.SecretOk = $false }
             }
             # Revert to the hardened end-state (best-effort/cosmetic; the KV is deleted at cleanup anyway).
-            try { Update-AzKeyVault -VaultName $kvName -ResourceGroupName $ResourceGroupName -PublicNetworkAccess "Disabled" -ErrorAction Stop | Out-Null } catch {}
-            $result
+            try { Update-AzKeyVault -VaultName $VaultName -ResourceGroupName $ResourceGroupName -PublicNetworkAccess "Disabled" -ErrorAction Stop | Out-Null } catch {}
+            return $result
         }
+
+        # Wrap the simulation in a spinner. Re-invoked (via & $kvSim) for each retry; it reads the
+        # current $meObjectId from this scope, so a re-resolved object id after re-auth is picked up.
+        $kvSim = { Invoke-WithSpinner -Activity "Testing Key Vault public-access toggle and data-plane writes" -ScriptBlock {
+                Invoke-KvInstallSimulation -VaultName $kvName -ResourceGroupName $ResourceGroupName -MeObjectId $meObjectId -SignedInAccount $SignedInAccount -KeyVaultAudience $KeyVaultAudience -TenantId $TenantId
+            } }
+        $kvToggle = & $kvSim
+
         if ($kvToggle.Ok) {
             Add-Result -Category "Deployability" -Check "Key Vault temporary public access (confirmed allowed)" -Result "Pass"
         }
@@ -2567,31 +2595,81 @@ try {
         else {
             Add-PolicyFailureResult -Category "Deployability" -Check "Key Vault temporary public access (install step)" -RawMessage $kvToggle.Error
         }
-        # Report the data-plane key/secret writes (only attempted if the enable succeeded). Key and
-        # secret are children of the vault - removed when the vault is purged at cleanup.
+
+        # Classifiers for the data-plane write outcomes.
+        # A vault data-plane permission refusal ("does not have keys/secrets ... permission", Forbidden
+        # from the access policy) is NOT an Azure Policy block - report it as a WARN test limitation
+        # rather than a misleading policy Fail. A genuine Azure Policy denial (RequestDisallowedByPolicy)
+        # falls through to Add-PolicyFailureResult, which names the blocking policy.
+        $isDataPlanePermErr = { param($m) $m -and ($m -match "does not have (keys|secrets|certificates).*permission" -or $m -match "ForbiddenByPolicy" -or $m -match "AccessDenied") }
+        # AKV10032 "Invalid issuer" means the token presented to the vault was minted by a tenant the
+        # vault doesn't trust - not an access/policy problem. Happens when the signed-in account has
+        # access to multiple Entra tenants (guest/B2B) and Az PowerShell's token cache hands back a
+        # token for the wrong tenant on this resource audience.
+        $isTenantIssuerErr = { param($m) $m -and ($m -match "AKV10032" -or $m -match "Invalid issuer") }
+        $hasTenantIssuer = { param($kv) (& $isTenantIssuerErr $kv.KeyError) -or (& $isTenantIssuerErr $kv.SecretError) }
+        $tenantIssuerDetail = "Failed: the token presented to the vault was issued by the wrong Entra tenant - this account has access to more than one tenant (e.g. guest/B2B access), and the cached token for Key Vault did not match the subscription's tenant ($TenantId). Re-authenticate pinned to this tenant ('Connect-AzAccount -TenantId $TenantId') and retry."
+
+        # (Re-)report the two data-plane write rows from a $kvToggle result. Used for the first attempt
+        # and again after each re-auth retry, so the report always reflects the latest attempt.
+        $reportKvDataPlane = {
+            param($kv)
+            if ($kv.KeyOk) { Add-Result -Category "Deployability" -Check "Key Vault key creation (RSA data-protection key)" -Result "Pass" -Detail "Created successfully." }
+            elseif (& $isTenantIssuerErr $kv.KeyError) { Add-Result -Category "Deployability" -Check "Key Vault key creation (RSA data-protection key)" -Result "Fail" -Detail $tenantIssuerDetail -Message $kv.KeyError }
+            elseif (& $isDataPlanePermErr $kv.KeyError) { Add-Result -Category "Deployability" -Check "Key Vault key creation (RSA data-protection key)" -Result "Warn" -Detail "Not tested - could not grant the running user data-plane access to the throwaway vault (access-policy model). This is a test limitation, not an Azure Policy block." -Message $kv.KeyError }
+            else { Add-PolicyFailureResult -Category "Deployability" -Check "Key Vault key creation (RSA data-protection key)" -RawMessage $kv.KeyError }
+            if ($kv.SecretOk) { Add-Result -Category "Deployability" -Check "Key Vault secret creation" -Result "Pass" -Detail "Created successfully." }
+            elseif (& $isTenantIssuerErr $kv.SecretError) { Add-Result -Category "Deployability" -Check "Key Vault secret creation" -Result "Fail" -Detail $tenantIssuerDetail -Message $kv.SecretError }
+            elseif (& $isDataPlanePermErr $kv.SecretError) { Add-Result -Category "Deployability" -Check "Key Vault secret creation" -Result "Warn" -Detail "Not tested - could not grant the running user data-plane access to the throwaway vault (access-policy model). This is a test limitation, not an Azure Policy block." -Message $kv.SecretError }
+            else { Add-PolicyFailureResult -Category "Deployability" -Check "Key Vault secret creation" -RawMessage $kv.SecretError }
+        }
+
+        # Report the data-plane key/secret writes (only attempted if the public-access enable succeeded).
+        # Key and secret are children of the vault - removed when the vault is purged at cleanup.
         if ($kvToggle.Ok) {
-            # A vault data-plane permission refusal ("does not have keys/secrets ... permission",
-            # Forbidden from the access policy) means this test couldn't grant itself data-plane
-            # access - it is NOT an Azure Policy block, so report it as a WARN test limitation rather
-            # than a misleading policy Fail. A genuine Azure Policy denial (RequestDisallowedByPolicy)
-            # falls through to Add-PolicyFailureResult, which names the blocking policy.
-            $isDataPlanePermErr = { param($m) $m -and ($m -match "does not have (keys|secrets|certificates).*permission" -or $m -match "ForbiddenByPolicy" -or $m -match "AccessDenied") }
-            # AKV10032 "Invalid issuer" means the token presented to the vault was minted by a tenant
-            # the vault doesn't trust - not an access/policy problem. This happens when the signed-in
-            # account has access to multiple Entra tenants (guest/B2B) and Az PowerShell's token cache
-            # hands back a token for the wrong tenant on this resource audience. Report it distinctly,
-            # with the fix (re-authenticate pinned to the subscription's tenant), instead of a generic
-            # policy-shaped Fail.
-            $isTenantIssuerErr = { param($m) $m -and ($m -match "AKV10032" -or $m -match "Invalid issuer") }
-            $tenantIssuerDetail = "Failed: the token presented to the vault was issued by the wrong Entra tenant - this account has access to more than one tenant (e.g. guest/B2B access), and the cached token for Key Vault did not match the subscription's tenant ($TenantId). Fix: run 'Connect-AzAccount -TenantId $TenantId -UseDeviceAuthentication' (re-authenticating pinned to this tenant) and re-run this script."
-            if ($kvToggle.KeyOk) { Add-Result -Category "Deployability" -Check "Key Vault key creation (RSA data-protection key)" -Result "Pass" -Detail "Created successfully." }
-            elseif (& $isTenantIssuerErr $kvToggle.KeyError) { Add-Result -Category "Deployability" -Check "Key Vault key creation (RSA data-protection key)" -Result "Fail" -Detail $tenantIssuerDetail -Message $kvToggle.KeyError }
-            elseif (& $isDataPlanePermErr $kvToggle.KeyError) { Add-Result -Category "Deployability" -Check "Key Vault key creation (RSA data-protection key)" -Result "Warn" -Detail "Not tested - could not grant the running user data-plane access to the throwaway vault (access-policy model). This is a test limitation, not an Azure Policy block." -Message $kvToggle.KeyError }
-            else { Add-PolicyFailureResult -Category "Deployability" -Check "Key Vault key creation (RSA data-protection key)" -RawMessage $kvToggle.KeyError }
-            if ($kvToggle.SecretOk) { Add-Result -Category "Deployability" -Check "Key Vault secret creation" -Result "Pass" -Detail "Created successfully." }
-            elseif (& $isTenantIssuerErr $kvToggle.SecretError) { Add-Result -Category "Deployability" -Check "Key Vault secret creation" -Result "Fail" -Detail $tenantIssuerDetail -Message $kvToggle.SecretError }
-            elseif (& $isDataPlanePermErr $kvToggle.SecretError) { Add-Result -Category "Deployability" -Check "Key Vault secret creation" -Result "Warn" -Detail "Not tested - could not grant the running user data-plane access to the throwaway vault (access-policy model). This is a test limitation, not an Azure Policy block." -Message $kvToggle.SecretError }
-            else { Add-PolicyFailureResult -Category "Deployability" -Check "Key Vault secret creation" -RawMessage $kvToggle.SecretError }
+            & $reportKvDataPlane $kvToggle
+
+            # Mid-run recovery for the multi-tenant "Invalid issuer" case: rather than make the user
+            # finish the whole run, clean up, re-authenticate, and start over, offer to re-authenticate
+            # pinned to the subscription's tenant right now and retry just the Key Vault data-plane
+            # writes (nothing is torn down between attempts). Loops until the writes succeed or the user
+            # declines. Skipped when input is redirected (non-interactive run).
+            while ($kvToggle.Ok -and (& $hasTenantIssuer $kvToggle) -and -not [Console]::IsInputRedirected) {
+                Write-Host ""
+                Write-Host -ForegroundColor "Yellow" "The Key Vault data-plane calls were rejected because the signed-in account presented a token from the wrong Entra tenant (a multi-tenant / guest account)."
+                Write-Host -ForegroundColor "Yellow" "This can be fixed without restarting: re-authenticate pinned to the subscription's tenant ($TenantId), then retry just the Key Vault checks."
+                if (-not (Read-YesNo -Prompt "Re-authenticate now (pinned to tenant $TenantId) and retry the Key Vault checks? [Y/n]" -Default "y")) { break }
+
+                $reauthOk = $false
+                try {
+                    Write-Host -ForegroundColor "Cyan" "Re-authenticating to tenant $TenantId..."
+                    if ($script:IsCloudShell) { Connect-AzAccount -Tenant $TenantId -ErrorAction Stop | Out-Null }
+                    else { Connect-AzAccount -Tenant $TenantId -UseDeviceAuthentication -ErrorAction Stop | Out-Null }
+                    Set-AzContext -Subscription $SubscriptionId -Tenant $TenantId -ErrorAction Stop | Out-Null
+                    $reauthOk = $true
+                }
+                catch { Write-Host -ForegroundColor "Red" "Re-authentication failed: $($_.Exception.Message)" }
+                if (-not $reauthOk) { break }
+
+                # Re-resolve the user's object id in the (now correct) tenant, since a B2B guest has a
+                # different object id per tenant and the access-policy grant is keyed on it.
+                try {
+                    $meResp2 = Invoke-AzRestMethod -Uri "$GraphBase/v1.0/me`?`$select=id" -Method GET -ErrorAction Stop
+                    if ($meResp2.StatusCode -eq 200) { $rid = ($meResp2.Content | ConvertFrom-Json).id; if ($rid) { $meObjectId = $rid } }
+                }
+                catch {}
+
+                # Drop the prior key/secret rows so the report shows only the latest attempt.
+                [void]$Results.RemoveAll({ param($r) $r.Category -eq "Deployability" -and ($r.Check -eq "Key Vault key creation (RSA data-protection key)" -or $r.Check -eq "Key Vault secret creation") })
+                $kvToggle = & $kvSim
+                & $reportKvDataPlane $kvToggle
+            }
+
+            # If the issuer mismatch is still unresolved (retry declined, failed, or non-interactive),
+            # record a next-step so the end-of-run recap tells the user how to finish the KV checks.
+            if ($kvToggle.Ok -and (& $hasTenantIssuer $kvToggle)) {
+                $NextSteps.Add("Key Vault key/secret creation could not be verified: the signed-in account presented a token from the wrong Entra tenant (a multi-tenant / guest account). Re-authenticate pinned to the subscription's tenant with 'Connect-AzAccount -TenantId $TenantId -UseDeviceAuthentication', then re-run this script to confirm the Key Vault data-plane checks pass.")
+            }
         }
     }
 
@@ -2906,7 +2984,7 @@ finally {
     }
     $rawJson = $null
     try {
-        $rawJson = [pscustomobject]@{ Metadata = $summaryMeta; Configuration = $ConfigSummary; Results = $Results; CreatedResources = $Tracker } |
+        $rawJson = [pscustomobject]@{ Metadata = $summaryMeta; Configuration = $ConfigSummary; Results = $Results; NextSteps = $NextSteps; CreatedResources = $Tracker } |
             ConvertTo-Json -Depth 8
         $rawJson | Out-File -FilePath $OutFile -Force
     }
@@ -2917,7 +2995,7 @@ finally {
     # (and Ctrl+P -> Save as PDF if they want a PDF, no extra tooling required).
     $HtmlOutFile = [System.IO.Path]::ChangeExtension($OutFile, ".html")
     try {
-        $html = New-ReadinessHtmlReport -Results $Results -ConfigSummary $ConfigSummary -CustomResourceNames $CustomResourceNames -Meta $summaryMeta -CreatedResources $Tracker -RawJson $rawJson
+        $html = New-ReadinessHtmlReport -Results $Results -ConfigSummary $ConfigSummary -CustomResourceNames $CustomResourceNames -Meta $summaryMeta -CreatedResources $Tracker -NextSteps $NextSteps -RawJson $rawJson
         $html | Out-File -FilePath $HtmlOutFile -Force -Encoding utf8
     }
     catch { Write-Host -ForegroundColor "Yellow" "Could not write HTML report: $($_.Exception.Message)"; $HtmlOutFile = $null }
@@ -2950,6 +3028,21 @@ finally {
     Write-Host ""
     Write-Host -ForegroundColor "Green" "====== END REPORT ======"
     Write-Host ""
+
+    # Action-required recap: anything the run couldn't finish on its own (e.g. a Key Vault check that
+    # needs a re-auth to the right tenant). Printed prominently so an incomplete run isn't mistaken
+    # for a complete one.
+    if ($NextSteps.Count -gt 0) {
+        Write-Host -ForegroundColor "Yellow" "====== ACTION REQUIRED TO COMPLETE TESTING ======"
+        Write-Host ""
+        for ($i = 0; $i -lt $NextSteps.Count; $i++) {
+            Write-Host -ForegroundColor "Yellow" ("  {0}. {1}" -f ($i + 1), $NextSteps[$i])
+        }
+        Write-Host ""
+        Write-Host -ForegroundColor "Yellow" "================================================="
+        Write-Host ""
+    }
+
     Write-Host -ForegroundColor "Cyan" "Detailed results written to: $OutFile"
     Write-Host -ForegroundColor "Cyan" "HTML report written to:      $HtmlOutFile"
     Write-Host ""
