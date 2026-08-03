@@ -2252,8 +2252,29 @@ try {
 
     $directOwner = $direct | Where-Object { $_.RoleDefinitionName -eq "Owner" }
     $viaGroupOwner = $viaGroup | Where-Object { $_.RoleDefinitionName -eq "Owner" }
+    $ownerViaUpnFallback = $false
 
-    if ($directOwner) {
+    # Guest/B2B fallback: the ObjectId lookup above uses $meObjectId, which Graph /me resolves in
+    # whatever tenant issued the cached token - for a guest, that can be the home tenant, not the
+    # subscription's resource tenant, so it silently misses a real Owner assignment recorded against
+    # the guest's object id in the resource tenant (same class of issue as the Key Vault
+    # "Invalid issuer" case documented near $TenantId above). If the ObjectId query found nothing at
+    # all, retry once by UPN (-SignInName), which Azure resolves against the resource tenant directly.
+    if (-not $directOwner -and -not $viaGroupOwner -and $meObjectId -and $SignedInAccount -and -not $directError -and -not $viaGroupError) {
+        $signInNameParam = @{ SignInName = $SignedInAccount }
+        $directByUpnSafe = Get-RoleAssignmentSafe -PrincipalParam $signInNameParam -Scope $subScope -RelevantRoles $relevantRoles
+        $viaGroupByUpnSafe = Get-RoleAssignmentSafe -PrincipalParam $signInNameParam -Scope $subScope -RelevantRoles $relevantRoles -ExpandGroups
+        $directOwner = $directByUpnSafe.Result | Where-Object { $_.RoleDefinitionName -eq "Owner" }
+        $viaGroupOwner = $viaGroupByUpnSafe.Result | Where-Object { $_.RoleDefinitionName -eq "Owner" }
+        if ($directOwner -or $viaGroupOwner) { $ownerViaUpnFallback = $true }
+        # If the UPN lookup also found nothing, $directOwner/$viaGroupOwner stay empty and the
+        # existing object-id-based Fail/Warn logic below runs unchanged.
+    }
+
+    if ($ownerViaUpnFallback) {
+        Add-Result -Category "Permissions" -Check "Azure Owner on subscription" -Result "Pass" -Detail "Owner detected by UPN lookup (object id lookup found nothing - likely a guest/B2B account whose cached Graph token was issued by a different tenant than the subscription)."
+    }
+    elseif ($directOwner) {
         Add-Result -Category "Permissions" -Check "Azure Owner on subscription" -Result "Pass" -Detail "Directly assigned Owner."
     }
     elseif ($viaGroupOwner) {
