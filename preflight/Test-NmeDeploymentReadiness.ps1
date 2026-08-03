@@ -1757,17 +1757,32 @@ try {
     # already a valid UPN/object id.
     $meObjectId = $null
     $meUpn = $null
+    $meUserType = $null
     try {
-        $meResp = Invoke-AzRestMethod -Uri "$GraphBase/v1.0/me`?`$select=id,userPrincipalName" -Method GET -ErrorAction Stop
+        $meResp = Invoke-AzRestMethod -Uri "$GraphBase/v1.0/me`?`$select=id,userPrincipalName,userType" -Method GET -ErrorAction Stop
         if ($meResp.StatusCode -eq 200) {
             $meJson = $meResp.Content | ConvertFrom-Json
             $meObjectId = $meJson.id
             $meUpn = $meJson.userPrincipalName
+            $meUserType = $meJson.userType
         }
     }
     catch { }
     $SignedInAccount = if ($meUpn) { $meUpn } else { (Get-AzContext).Account.Id }
     $SignedInAccountMasked = Get-MaskedAccount $SignedInAccount
+
+    # Is the signed-in account a guest / external (B2B) user in the subscription's owning tenant? The SE
+    # needs to know this: a guest's Entra roles are granted by B2B invitation, which is a common source
+    # of "works for a native admin but not for this account" install issues (and is why the tenant-pin
+    # step above matters). Two signals, either sufficient: Graph userType == "Guest" (authoritative,
+    # evaluated in the subscription's tenant since we pinned to it), or a UPN containing the B2B "#EXT#"
+    # marker (for when the directory query is unavailable).
+    $IsGuestAccount = ($meUserType -eq "Guest") -or ($SignedInAccount -match "#EXT#")
+    $AccountTypeSummary = if ($IsGuestAccount) {
+        "Guest / external (B2B) user - signed in to the tenant as a guest."
+    }
+    elseif ($meUserType -eq "Member") { "Member (native account in the subscription's tenant $TenantId)" }
+    else { "Member / home-tenant account (directory user type not confirmed)" }
     $SqlSuffix = $SqlSuffix.TrimStart(".")
 
     # Private DNS zones the installer creates/links for a private deployment (suffixes are
@@ -2209,6 +2224,7 @@ try {
             # We return before the ConfigSummary is normally populated, so record enough here that the
             # report still shows the SE what was attempted.
             $ConfigSummary["Run by (signed-in account)"] = $SignedInAccountMasked
+            $ConfigSummary["Signed-in account type"] = $AccountTypeSummary
             $ConfigSummary["Subscription"] = "$($Context.Subscription.Name) ($SubscriptionId)"
             $ConfigSummary["Cloud"] = $AzEnv.Name
             $ConfigSummary["Region"] = $Location
@@ -2241,6 +2257,7 @@ try {
     # Record every input/response so the SE has a confirmed-working configuration to refer back to
     # once it's time to actually install NME.
     $ConfigSummary["Run by (signed-in account)"] = $SignedInAccountMasked
+    $ConfigSummary["Signed-in account type"] = $AccountTypeSummary
     $ConfigSummary["Subscription"] = "$($Context.Subscription.Name) ($SubscriptionId)"
     $ConfigSummary["Cloud"] = $AzEnv.Name
     $ConfigSummary["Region"] = $Location
