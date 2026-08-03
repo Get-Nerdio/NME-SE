@@ -871,11 +871,20 @@ function Get-RoleAssignmentSafe {
     $result = $null
     $errorMessage = $null
     try {
-        $result = if ($ExpandGroups) {
-            Get-AzRoleAssignment @PrincipalParam -Scope $Scope -ExpandPrincipalGroups -ErrorAction Stop
+        if ($ExpandGroups) {
+            # -ExpandPrincipalGroups is incompatible with -Scope in some Az.Resources versions
+            # (e.g. 9.0.3 throws "Parameter set cannot be resolved using the specified named
+            # parameters"). Since group-based assignments are the ONLY thing this query exists to
+            # catch, that failure would silently miss an Owner held solely via a group. Query without
+            # -Scope and filter to the exact target scope client-side. Assignments inherited from a
+            # parent management group are not string-prefixes of the subscription scope and so are not
+            # matched here - direct MG-inherited assignments are still covered by the non-expand query,
+            # which keeps -Scope and lets ARM resolve ancestry server-side.
+            $result = Get-AzRoleAssignment @PrincipalParam -ExpandPrincipalGroups -ErrorAction Stop |
+                Where-Object { $_.Scope -eq $Scope }
         }
         else {
-            Get-AzRoleAssignment @PrincipalParam -Scope $Scope -ErrorAction Stop
+            $result = Get-AzRoleAssignment @PrincipalParam -Scope $Scope -ErrorAction Stop
         }
         if ($RelevantRoles) { $result = $result | Where-Object { $_.RoleDefinitionName -in $RelevantRoles } }
     }
@@ -2268,29 +2277,8 @@ try {
 
     $directOwner = $direct | Where-Object { $_.RoleDefinitionName -eq "Owner" }
     $viaGroupOwner = $viaGroup | Where-Object { $_.RoleDefinitionName -eq "Owner" }
-    $ownerViaUpnFallback = $false
 
-    # Guest/B2B fallback: the ObjectId lookup above uses $meObjectId, which Graph /me resolves in
-    # whatever tenant issued the cached token - for a guest, that can be the home tenant, not the
-    # subscription's resource tenant, so it silently misses a real Owner assignment recorded against
-    # the guest's object id in the resource tenant (same class of issue as the Key Vault
-    # "Invalid issuer" case documented near $TenantId above). If the ObjectId query found nothing at
-    # all, retry once by UPN (-SignInName), which Azure resolves against the resource tenant directly.
-    if (-not $directOwner -and -not $viaGroupOwner -and $meObjectId -and $SignedInAccount -and -not $directError -and -not $viaGroupError) {
-        $signInNameParam = @{ SignInName = $SignedInAccount }
-        $directByUpnSafe = Get-RoleAssignmentSafe -PrincipalParam $signInNameParam -Scope $subScope -RelevantRoles $relevantRoles
-        $viaGroupByUpnSafe = Get-RoleAssignmentSafe -PrincipalParam $signInNameParam -Scope $subScope -RelevantRoles $relevantRoles -ExpandGroups
-        $directOwner = $directByUpnSafe.Result | Where-Object { $_.RoleDefinitionName -eq "Owner" }
-        $viaGroupOwner = $viaGroupByUpnSafe.Result | Where-Object { $_.RoleDefinitionName -eq "Owner" }
-        if ($directOwner -or $viaGroupOwner) { $ownerViaUpnFallback = $true }
-        # If the UPN lookup also found nothing, $directOwner/$viaGroupOwner stay empty and the
-        # existing object-id-based Fail/Warn logic below runs unchanged.
-    }
-
-    if ($ownerViaUpnFallback) {
-        Add-Result -Category "Permissions" -Check "Azure Owner on subscription" -Result "Pass" -Detail "Owner detected by UPN lookup (object id lookup found nothing - likely a guest/B2B account whose cached Graph token was issued by a different tenant than the subscription)."
-    }
-    elseif ($directOwner) {
+    if ($directOwner) {
         Add-Result -Category "Permissions" -Check "Azure Owner on subscription" -Result "Pass" -Detail "Directly assigned Owner."
     }
     elseif ($viaGroupOwner) {
