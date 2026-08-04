@@ -1,6 +1,6 @@
-# Scaling Plan → NME Auto-Scale Sheet
+# Scaling Plan → NME Auto-Scale Profile
 
-Turns your Azure Virtual Desktop **scaling plans** into exact, line-by-line entries for Nerdio Manager's **Create Auto-Scale Profile** screen — one plain-text sheet per host pool, plus a review CSV of every number and where it came from.
+Turns your Azure Virtual Desktop **scaling plans** into exact entries for Nerdio Manager's **Create Auto-Scale Profile** screen — an HTML page with one profile card per host pool, laid out the way the NME screen is, plus a review CSV of every number and where it came from.
 
 One command in Azure Cloud Shell. Read-only. Nothing in your environment is changed.
 
@@ -17,8 +17,8 @@ Moving from native scaling plans to NME auto-scale shouldn't change how your env
    iex (irm 'https://raw.githubusercontent.com/dclawrence003/NME/main/autoscale/Get-NerdioAutoscaleSheet.ps1')
    ```
 
-3. A review table prints (one row per pool + schedule), and two files download automatically: `nme-autoscale-sheet-<timestamp>.txt` and `...-review.csv`.
-4. Open the `.txt`. For each host pool, open its Auto-scale settings in NME and enter the sheet top to bottom. Text in parentheses explains where a number came from — don't type it in.
+3. A review table prints (one row per pool + schedule), and two files download automatically: `nme-autoscale-profiles-<timestamp>.html` and `...-review.csv`.
+4. Open the HTML. For each host pool, open its Auto-scale settings in NME and enter the card top to bottom — toggles, pills, and day chips read exactly as the NME controls do.
 
 Prefer to read code before running it (you should):
 
@@ -33,7 +33,7 @@ irm 'https://raw.githubusercontent.com/dclawrence003/NME/main/autoscale/Get-Nerd
 | Parameter | Default | What it does |
 |---|---|---|
 | `-SubscriptionId` | all visible | Scope to specific subscription ID(s) |
-| `-OutFile` | timestamped | Output sheet file name (`-review.csv` follows it) |
+| `-OutFile` | timestamped | Output HTML file name (`-review.csv` follows it) |
 | `-SkipDownload` | off | Skip the Cloud Shell auto-downloads |
 
 Parameters require the two-step (download-then-run) form — `iex (irm ...)` runs with defaults.
@@ -42,17 +42,17 @@ Parameters require the two-step (download-then-run) form — `iex (irm ...)` run
 
 ## What you need
 
-**Reader** on the subscription(s) holding the scaling plans and host pools. That's all — no Log Analytics access, no NME API, nothing installed. Cloud Shell ships every module the script uses; Resource Graph is reached over REST.
+**Reader** on the subscription(s) holding the scaling plans and host pools. That's all — no Log Analytics access, no NME API, nothing installed. Cloud Shell ships every module the script uses. Inventory comes from Resource Graph; each plan's schedules and full properties are then read directly over ARM (Resource Graph doesn't carry pooled schedules).
 
 ---
 
 ## What it produces
 
-**The sheet file (.txt)** — one sheet per host pool with an enabled scaling plan, written in the same order as NME's Create Auto-Scale Profile screen. Weekend and other secondary schedules appear as additional pre-stage schedule blocks on the same sheet ("Use multiple schedules"). A NOTES section on each sheet calls out every place the two systems express things differently — nothing is translated silently.
+**The profile page (.html)** — one card per host pool with an enabled scaling plan, laid out in the same order and idiom as NME's Create Auto-Scale Profile screen: sections, toggles, aggressiveness pills, work-day chips. Just the values to enter — open it next to NME and copy down the card. Weekend and other secondary schedules appear as additional pre-stage schedule blocks on the same card ("Use multiple schedules"). A compact Notes list on each card calls out every place the two systems express things differently — nothing is translated silently. Plans that need no data entry (assigned-but-not-enabled, no schedules, unassigned, personal) are summarized below the cards, and the pools with no plan at all sit in a collapsible list at the end.
 
 **The review CSV** — one row per pool + schedule with the computed numbers (min active, pre-stage hosts, trigger thresholds, aggressiveness, scale-in delay) and a `Flags` column naming anything that needs a second look.
 
-**Console summary** — the same review table, plan counts, and the list of host pools that have **no** scaling plan today (nothing to mimic there — those get configured fresh in NME).
+**Console summary** — the same review table and plan counts.
 
 ---
 
@@ -79,7 +79,7 @@ Pooled host pools with power-management (GA) scaling plans. Personal plans are l
 
 ## No Cloud Shell? The fallback
 
-Some tenants block Cloud Shell. `fallback/nerdio-scalingplan-translator.kql` runs the same translation as a portal-paste query in **Azure Resource Graph Explorer** (portal search → "Resource Graph Explorer", paste, Run — full instructions in the file header). Differences from the script: results come as one row per pool + schedule instead of a combined sheet (read the `Sheet` column, combine schedules by hand per the header's rules), and there's no auto-download.
+Some tenants block Cloud Shell. `fallback/nerdio-scalingplan-translator.kql` runs a best-effort version as a portal-paste query in **Azure Resource Graph Explorer** (portal search → "Resource Graph Explorer", paste, Run — full instructions in the file header). Know its limits: Resource Graph does not index pooled schedules in all tenants, so the fallback can come back empty where the script succeeds — the script's direct ARM reads are the reliable path. When it does return rows, they come one per pool + schedule (read the `Sheet` column, combine schedules by hand per the header's rules), with no auto-download.
 
 ---
 
@@ -91,8 +91,9 @@ Some tenants block Cloud Shell. `fallback/nerdio-scalingplan-translator.kql` run
 | A pool shows `POOL NOT VISIBLE` | The plan references a pool in a subscription outside the current scope — re-run with `-SubscriptionId` covering it |
 | A plan shows `NO HOST POOLS ASSIGNED` | The plan isn't attached to any pool, so Azure isn't scaling with it — nothing to enter in NME |
 | A sheet shows 0 session hosts | The pool has no registered hosts, so every host-count number is 0 — register hosts and re-run |
-| `no session limit` flag | The pool has no max session limit; Available-sessions math needs one — the sheet's NOTES explain how to size the trigger once you set it |
-| `dynamic plan - manual review` | The plan creates/deletes hosts (preview); review the sheet by hand before trusting base/burst |
+| `no session limit` flag | The pool has no max session limit; Available-sessions math needs one — the card's Notes explain how to size the trigger once you set it |
+| `session limit looks like a placeholder` | The pool's limit is implausibly large (e.g. 999999); trigger numbers use it verbatim — set the real per-host capacity and re-run |
+| `dynamic plan - manual review` | The plan creates/deletes hosts (preview); review the card by hand before trusting base/burst |
 | Auto-download didn't fire | Use Cloud Shell's **Manage files → Download** and enter the printed filename |
 
 ---

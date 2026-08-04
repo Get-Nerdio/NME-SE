@@ -14,14 +14,15 @@
          capacity thresholds, minimum host percentages, force-logoff settings).
       3. Reads each assigned host pool's facts: registered session hosts,
          max session limit, load balancing, Start VM on connect.
-      4. Produces ONE plain-text sheet per host pool, written in the same order
-         as NME's Create Auto-Scale Profile screen - copy it line by line.
-         Weekend/secondary schedules become additional pre-stage schedules on
-         the same profile ("Use multiple schedules"). Anything Azure did that
-         NME expresses differently is called out in a NOTES section on the
-         sheet - nothing is translated silently.
-      5. Writes the sheets to a .txt, a per-schedule review table to a .csv,
-         and triggers Cloud Shell browser downloads of both.
+      4. Produces ONE profile card per host pool, laid out like NME's
+         Create Auto-Scale Profile screen, in a single self-contained HTML
+         page - just the values to enter, in screen order. Weekend/secondary
+         schedules become additional pre-stage schedules on the same card
+         ("Use multiple schedules"). Anything Azure did that NME expresses
+         differently is called out in a compact Notes list on the card -
+         nothing is translated silently.
+      5. Writes the HTML page plus a per-schedule review .csv, and triggers
+         Cloud Shell browser downloads of both.
 
     The philosophy is day-one mimicry: transfer the scaling behavior as-is,
     then optimize with Nerdio's telemetry once it has data. The sheet never
@@ -33,7 +34,7 @@
 .PARAMETER SubscriptionId
     Optional subscription ID(s) to scope to. Default: every subscription you can see.
 .PARAMETER OutFile
-    Output sheet file name. Default nme-autoscale-sheet-<timestamp>.txt.
+    Output HTML file name. Default nme-autoscale-profiles-<timestamp>.html.
     The review CSV takes the same name with -review.csv.
 .PARAMETER SkipDownload
     Skip the Cloud Shell auto-download (files still written to the session).
@@ -47,6 +48,13 @@
     ./autoscale.ps1 -SubscriptionId 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'
 
 .NOTES
+    v0.2 (2026-08-04). Output is now a self-contained HTML page styled like
+    NME's Create Auto-Scale Profile screen (plus the review CSV). Schedules
+    and plan properties are read DIRECTLY from each plan over ARM
+    (api 2024-11-01-preview): Azure Resource Graph's child-resource table
+    does not carry pooled schedules, which left v0.1 output empty on live
+    tenants; direct reads also surface scalingMethod, so dynamic-autoscaling
+    plans are detected reliably.
     v0.1.1 (2026-08-04). Pooled plans with no host pool references are now
     listed and flagged (previously they were invisible in the output).
     v0.1 (2026-08-04). First release. Sibling of modeler/Get-NerdioModelerJson.ps1
@@ -89,8 +97,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:Version = 'v0.1.1'
-if ([string]::IsNullOrEmpty($OutFile)) { $OutFile = "nme-autoscale-sheet-$(Get-Date -Format 'yyyyMMdd-HHmm').txt" }
+$script:Version = 'v0.2'
+if ([string]::IsNullOrEmpty($OutFile)) { $OutFile = "nme-autoscale-profiles-$(Get-Date -Format 'yyyyMMdd-HHmm').html" }
 $csvDir  = [IO.Path]::GetDirectoryName($OutFile)
 $csvBase = [IO.Path]::GetFileNameWithoutExtension($OutFile) + '-review.csv'
 $csvFile = if ([string]::IsNullOrEmpty($csvDir)) { $csvBase } else { [IO.Path]::Combine($csvDir, $csvBase) }
@@ -169,25 +177,20 @@ if ($planRows.Count -eq 0) {
     Write-Warn2 "No scaling plans found. Nothing to translate - if plans exist, check -SubscriptionId scope and Reader access."
 }
 
-# ------------------------------------------------------------------- 2. schedules
-Write-Info "[2/5] Reading pooled schedules..."
-$schedRows = Invoke-ArgQuery -Query @"
-desktopvirtualizationresources
-| where type =~ 'microsoft.desktopvirtualization/scalingplans/pooledschedules'
-| project id, name, props = properties
-"@
-# planId = schedule id up to /pooledschedules
+# ------------------------------------------------------------------- 2. schedules (direct ARM reads)
+# Resource Graph's child-resource table does NOT carry pooled schedules, and its
+# plan projection can miss preview-only properties (scalingMethod). So each plan
+# is read directly - plans are few, so this stays fast at any tenant size.
+Write-Info "[2/5] Reading each plan's schedules and full properties (direct ARM)..."
+$SpApi = '2024-11-01-preview'
 $schedByPlan = @{}
-foreach ($s in $schedRows) {
-    $idL = "$($s.id)".ToLowerInvariant()
-    $cut = $idL.IndexOf('/pooledschedules')
-    if ($cut -lt 0) { continue }
-    $planIdL = $idL.Substring(0, $cut)
-    if (-not $schedByPlan.ContainsKey($planIdL)) { $schedByPlan[$planIdL] = New-Object System.Collections.Generic.List[object] }
-    $p = $s.props
+$schedTotal = 0
+function Add-ScheduleRow {
+    param([string]$PlanIdL, [string]$Name, $p)
+    if (-not $schedByPlan.ContainsKey($PlanIdL)) { $schedByPlan[$PlanIdL] = New-Object System.Collections.Generic.List[object] }
     $days = @($p.daysOfWeek)
-    $schedByPlan[$planIdL].Add([pscustomobject]@{
-        Name        = $s.name
+    $schedByPlan[$PlanIdL].Add([pscustomobject]@{
+        Name        = $Name
         Days        = $days
         DayCount    = $days.Count
         RuH = [int]$p.rampUpStartTime.hour;   RuM = [int]$p.rampUpStartTime.minute
@@ -205,8 +208,36 @@ foreach ($s in $schedRows) {
         WaitMins    = [int]$p.rampDownWaitTimeMinutes
         Notify      = "$($p.rampDownNotificationMessage)"
     })
+    $script:schedTotal++
 }
-Write-Ok "Found $($schedRows.Count) pooled schedule(s) across $($schedByPlan.Keys.Count) plan(s)."
+foreach ($p in $planRows) {
+    $idL = "$($p.id)".ToLowerInvariant()
+    # refresh plan-level properties from the authoritative (preview) surface
+    $resp = Invoke-AzRestMethod -Method GET -Path "$($p.id)?api-version=$SpApi"
+    $det = $null
+    if ($resp.StatusCode -eq 200) {
+        $det = ($resp.Content | ConvertFrom-Json).properties
+        if ($det.timeZone) { $p.timeZone = "$($det.timeZone)" }
+        $p.exclusionTag = "$($det.exclusionTag)"
+        if ($det.PSObject.Properties['scalingMethod']) { $p.scalingMethod = "$($det.scalingMethod)" }
+        if ($null -ne $det.hostPoolReferences) { $p.refs = @($det.hostPoolReferences) }
+    } else {
+        Write-Warn2 "Could not read plan '$($p.name)' directly (HTTP $($resp.StatusCode)) - using Resource Graph values."
+    }
+    if ($p.poolType -notmatch '^(?i)Pooled$') { continue }
+    $sResp = Invoke-AzRestMethod -Method GET -Path "$($p.id)/pooledSchedules?api-version=$SpApi"
+    if ($sResp.StatusCode -eq 200) {
+        foreach ($s in @((($sResp.Content | ConvertFrom-Json).value))) {
+            if ($null -ne $s.properties) { Add-ScheduleRow -PlanIdL $idL -Name "$($s.name)" -p $s.properties }
+        }
+    } elseif ($null -ne $det -and $null -ne $det.schedules -and @($det.schedules).Count -gt 0) {
+        # fallback: embedded schedules array on the plan resource
+        foreach ($s in @($det.schedules)) { Add-ScheduleRow -PlanIdL $idL -Name "$($s.name)" -p $s }
+    } else {
+        Write-Warn2 "Could not list schedules for plan '$($p.name)' (HTTP $($sResp.StatusCode))."
+    }
+}
+Write-Ok "Read $schedTotal pooled schedule(s) across $($schedByPlan.Keys.Count) plan(s)."
 
 # ------------------------------------------------------------------- 3. pools + hosts
 Write-Info "[3/5] Reading host pools and counting registered session hosts..."
@@ -271,11 +302,20 @@ resources
 }
 
 # ------------------------------------------------------------------- 4. translate
-Write-Info "[4/5] Translating plans into NME auto-scale sheets..."
+Write-Info "[4/5] Translating plans into NME auto-scale profile cards..."
 
-function Field { param([string]$label, [string]$value) ("$label ").PadRight(30, '.') + ' ' + $value }
+function HtmlEnc { param($s) [System.Net.WebUtility]::HtmlEncode("$s") }
+function Row { param([string]$label, [string]$valueHtml) "<div class='row'><div class='lbl'>$(HtmlEnc $label)</div><div class='val'>$valueHtml</div></div>" }
+function TextRow { param([string]$label, [string]$value) Row $label (HtmlEnc $value) }
+function Toggle { param([bool]$on) if ($on) { "<span class='tg on'>ON</span>" } else { "<span class='tg off'>OFF</span>" } }
+function AggrPill { param([string]$a) "<span class='pill $($a.ToLowerInvariant())'>$(HtmlEnc $a)</span>" }
+function DayChips {
+    param($days)
+    (@($days) | ForEach-Object { $d = "$_"; "<span class='chip'>$(HtmlEnc $(if ($d.Length -ge 3) { $d.Substring(0,3) } else { $d }))</span>" }) -join ''
+}
 
-$sheets = New-Object System.Collections.Generic.List[string]
+$cards  = New-Object System.Collections.Generic.List[string]   # full profile cards
+$stubs  = New-Object System.Collections.Generic.List[string]   # skips / not-visible / no-schedules / unassigned
 $review = New-Object System.Collections.Generic.List[object]
 $referencedPoolIds = @{}
 $sheetCount = 0
@@ -289,12 +329,7 @@ foreach ($plan in ($pooledPlans | Sort-Object name)) {
     $dynamicFlag = (-not [string]::IsNullOrEmpty($plan.scalingMethod)) -and ($plan.scalingMethod -notmatch '^(?i)Powers?Manage$')
 
     if (@($plan.refs).Count -eq 0) {
-        $sheets.Add(("=" * 64))
-        $sheets.Add("SCALING PLAN: $($plan.name)   ($($plan.resourceGroup)) - NO HOST POOLS ASSIGNED")
-        $sheets.Add("The plan exists but is not attached to any host pool, so Azure is not")
-        $sheets.Add("scaling anything with it today. Nothing to enter in NME.")
-        if ($dynamicFlag) { $sheets.Add("DYNAMIC plan (scalingMethod '$($plan.scalingMethod)') - if you assign it later, its sheet needs manual review.") }
-        $sheets.Add(("=" * 64)); $sheets.Add("")
+        $stubs.Add("<!--stub-unassigned:$($plan.name)--><div class='stub'><b>Scaling plan $(HtmlEnc $plan.name)</b> ($(HtmlEnc $plan.resourceGroup)) &mdash; no host pools assigned. Azure is not scaling anything with it; nothing to enter in NME.$(if ($dynamicFlag) { " <span class='pill high'>DYNAMIC plan</span> If you assign it later, review its card manually." })</div>")
         $unassignedFlags = @('no host pools assigned')
         if ($dynamicFlag) { $unassignedFlags += 'dynamic plan - manual review' }
         $review.Add([pscustomobject]@{ Plan=$plan.name; Schedule='(none assigned)'; Days=''; Pool=''; RG=$plan.resourceGroup; EnabledOnPool=''
@@ -312,12 +347,7 @@ foreach ($plan in ($pooledPlans | Sort-Object name)) {
 
         if ($null -eq $pool) {
             $poolName = ($poolIdL -split '/')[-1]
-            $sheets.Add(("=" * 64))
-            $sheets.Add("HOST POOL: $poolName")
-            $sheets.Add("Scaling plan: $($plan.name) - POOL NOT VISIBLE to this account/scope.")
-            $sheets.Add("The plan references it, but it isn't in the subscriptions read here.")
-            $sheets.Add("Re-run with -SubscriptionId covering that pool's subscription.")
-            $sheets.Add(("=" * 64)); $sheets.Add("")
+            $stubs.Add("<!--stub-ghost:$poolName--><div class='stub'><b>$(HtmlEnc $poolName)</b> &mdash; referenced by plan $(HtmlEnc $plan.name) but not visible in the current scope. Re-run with -SubscriptionId covering that pool's subscription.</div>")
             $review.Add([pscustomobject]@{ Plan=$plan.name; Schedule=''; Days=''; Pool=$poolName; RG=''; EnabledOnPool=$enabled
                 SessionHosts=''; SessionLimit=''; MinActive=''; PreStageHosts=''; ScaleOutBelow=''; ScaleInAbove=''
                 Aggressiveness=''; ScaleInDelay=''; ProfileLB=''; StartVMOnConnect=''; TimeZone=$plan.timeZone
@@ -327,13 +357,7 @@ foreach ($plan in ($pooledPlans | Sort-Object name)) {
 
         if (-not $enabled) {
             $skipCount++
-            $sheets.Add(("=" * 64))
-            $sheets.Add("HOST POOL: $($pool.name)   ($($pool.resourceGroup))")
-            $sheets.Add("Scaling plan: $($plan.name) - ASSIGNED BUT NOT ENABLED on this pool.")
-            $sheets.Add("Azure is not scaling this pool today, so day-one mimicry needs no")
-            $sheets.Add("NME profile here. If it should have been enabled, use another sheet")
-            $sheets.Add("from this plan as the template - the numbers scale with host count.")
-            $sheets.Add(("=" * 64)); $sheets.Add("")
+            $stubs.Add("<!--stub-skip:$($pool.name)--><div class='stub'><b>$(HtmlEnc $pool.name)</b> ($(HtmlEnc $pool.resourceGroup)) &mdash; plan $(HtmlEnc $plan.name) is assigned but NOT enabled. Azure is not scaling this pool today; day-one mimicry needs no NME profile here.</div>")
             $review.Add([pscustomobject]@{ Plan=$plan.name; Schedule='(all)'; Days=''; Pool=$pool.name; RG=$pool.resourceGroup; EnabledOnPool=$false
                 SessionHosts=''; SessionLimit=''; MinActive=''; PreStageHosts=''; ScaleOutBelow=''; ScaleInAbove=''
                 Aggressiveness=''; ScaleInDelay=''; ProfileLB=''; StartVMOnConnect=''; TimeZone=$plan.timeZone
@@ -348,15 +372,13 @@ foreach ($plan in ($pooledPlans | Sort-Object name)) {
         $svocText = if ($svoc) { 'ON' } else { 'OFF' }
 
         if ($scheds.Count -eq 0) {
-            $sheets.Add(("=" * 64))
-            $sheets.Add("HOST POOL: $($pool.name)   ($($pool.resourceGroup))")
-            $sheets.Add("Scaling plan: $($plan.name) - NO POOLED SCHEDULES FOUND on the plan.")
-            $sheets.Add("Nothing to translate. Add schedules in Azure or configure NME fresh.")
-            $sheets.Add(("=" * 64)); $sheets.Add("")
+            $noSchedFlags = @('plan has no pooled schedules')
+            if ($dynamicFlag) { $noSchedFlags += 'dynamic plan - manual review' }
+            $stubs.Add("<!--stub-nosched:$($pool.name)--><div class='stub'><b>$(HtmlEnc $pool.name)</b> ($(HtmlEnc $pool.resourceGroup)) &mdash; plan $(HtmlEnc $plan.name) has no pooled schedules. Nothing to translate; add schedules in Azure or configure NME fresh.$(if ($dynamicFlag) { " <span class='pill high'>DYNAMIC plan</span>" })</div>")
             $review.Add([pscustomobject]@{ Plan=$plan.name; Schedule='(none)'; Days=''; Pool=$pool.name; RG=$pool.resourceGroup; EnabledOnPool=$true
                 SessionHosts=$B; SessionLimit=$L; MinActive=''; PreStageHosts=''; ScaleOutBelow=''; ScaleInAbove=''
                 Aggressiveness=''; ScaleInDelay=''; ProfileLB=''; StartVMOnConnect=$svocText; TimeZone=$plan.timeZone
-                Flags='plan has no pooled schedules' })
+                Flags=($noSchedFlags -join '; ') })
             continue
         }
 
@@ -388,16 +410,19 @@ foreach ($plan in ($pooledPlans | Sort-Object name)) {
         $notes = New-Object System.Collections.Generic.List[string]
         $flags = New-Object System.Collections.Generic.List[string]
         if ($dynamicFlag) {
-            $notes.Add("DYNAMIC plan (scalingMethod '$($plan.scalingMethod)') - it creates/deletes hosts. Base/Burst math on this sheet assumes power management only. Review manually before trusting it.")
+            $notes.Add("DYNAMIC plan (scalingMethod '$($plan.scalingMethod)') - it creates/deletes hosts. Base/Burst on this card assume power management only. Review manually before trusting it.")
             $flags.Add('dynamic plan - manual review')
         }
         if ($B -eq 0) {
-            $notes.Add("NO REGISTERED SESSION HOSTS found for this pool - every host-count number on this sheet is 0. Register hosts (or fix scope) and re-run.")
+            $notes.Add("NO REGISTERED SESSION HOSTS found for this pool - every host-count number on this card is 0. Register hosts (or fix scope) and re-run.")
             $flags.Add('0 session hosts')
         }
         if ($L -le 0) {
             $notes.Add("Pool has no max session limit set - the Available-sessions math needs one. Set 'Session limit per host' in NME to your real per-host capacity, then size the trigger: scale out below (base x limit) minus your buffer seats; scale in one host's worth above that.")
             $flags.Add('no session limit')
+        } elseif ($L -gt 1000) {
+            $notes.Add("Max session limit is $L - that looks like a placeholder, not a real per-host capacity. The trigger numbers use it verbatim; set the real limit and re-run for meaningful values.")
+            $flags.Add('session limit looks like a placeholder')
         }
         if ($raisedBy) {
             $notes.Add("Min active host capacity uses $profMinActive from schedule '$raisedBy' (higher than the primary schedule's $($prim.MinActive)) - never guarantee less than the plan did.")
@@ -405,7 +430,7 @@ foreach ($plan in ($pooledPlans | Sort-Object name)) {
         }
         $lbSet = @($p.RuLB, $p.PkLB, $p.RdLB, $p.OpLB) | Where-Object { -not [string]::IsNullOrEmpty($_) } | Sort-Object -Unique
         if ($lbSet.Count -gt 1) {
-            $notes.Add("Azure switches load balancing per phase (ramp-up $(Format-LB $p.RuLB) / peak $(Format-LB $p.PkLB) / ramp-down $(Format-LB $p.RdLB) / off-peak $(Format-LB $p.OpLB)). NME uses one value - this sheet uses the ramp-up/peak algorithm. Rolling Drain Mode is the NME-native lever for phase switches; revisit at optimization.")
+            $notes.Add("Azure switches load balancing per phase (ramp-up $(Format-LB $p.RuLB) / peak $(Format-LB $p.PkLB) / ramp-down $(Format-LB $p.RdLB) / off-peak $(Format-LB $p.OpLB)). NME uses one value - this card uses the ramp-up/peak algorithm. Rolling Drain Mode is the NME-native lever for phase switches; revisit at optimization.")
             $flags.Add('per-phase LB in plan')
         }
         if ([Math]::Abs($p.RdT - $p.RuT) -gt 10) {
@@ -442,61 +467,59 @@ foreach ($plan in ($pooledPlans | Sort-Object name)) {
             $notes.Add("Overnight floor is 0 hosts and Start VM on connect is OFF (matching Azure today) - the first off-hours user has nothing to log into until pre-stage. Same behavior as the plan; flagging so it's a choice, not a surprise.")
         }
 
-        # --- the sheet -------------------------------------------------------------
-        $sheetLines = New-Object System.Collections.Generic.List[string]
-        $sheetLines.Add(("=" * 64))
-        $sheetLines.Add("HOST POOL: $($pool.name)   ($($pool.resourceGroup))")
-        $sheetLines.Add("Scaling plan: $($plan.name)  |  Time zone: $($plan.timeZone)")
-        $sheetLines.Add("   (enter all times below in that time zone - no conversion)")
-        $sheetLines.Add("Pool facts: $B session hosts | MaxSessionLimit $L | pool LB $($pool.loadBalancerType) | StartVMOnConnect $svocText")
-        $sheetLines.Add(("-" * 64))
-        $sheetLines.Add("CREATE AUTO-SCALE PROFILE")
-        $sheetLines.Add((Field 'Auto-scale mode' 'Shared'))
-        $sheetLines.Add((Field 'Name' "$($plan.name)-mimic   (suggestion)"))
-        $sheetLines.Add((Field 'Session limit per host' "$L"))
-        $sheetLines.Add((Field 'Load balancing' "$profLB   (plan ramp-up/peak algorithm)"))
-        $sheetLines.Add((Field 'Start VM on connect' "$svocText   (pool's current setting)"))
-        $sheetLines.Add((Field 'Measure type' 'Count   (default)'))
-        $sheetLines.Add((Field 'Active host defined as' 'AVD agent Available   (default)'))
-        $sheetLines.Add((Field 'Base host pool capacity' "$B   (all existing hosts)"))
-        $minActiveExplain = "(ramp-down min $($p.RdMinPct)% x $B$(if ($raisedBy) { "; raised by schedule '$raisedBy'" }))"
-        $sheetLines.Add((Field 'Min active host capacity' "$profMinActive   $minActiveExplain"))
-        $sheetLines.Add((Field 'Burst beyond base capacity' '0   (plan never creates hosts)'))
-        $sheetLines.Add((Field 'Trigger type' 'Available sessions'))
-        $sheetLines.Add("  Scale out: up to 2 hosts if available sessions < $($prim.ScaleOutBelow)  for 5 min")
-        $sheetLines.Add("             (keep $(100 - $p.RuT)% of $B x $L = $($prim.ScaleOutBelow) seats free - plan threshold $($p.RuT)%)")
-        $sheetLines.Add("  Scale in:  up to 1 host  if available sessions > $($prim.ScaleInAbove)  for 15 min")
-        $sheetLines.Add("             (the $($prim.ScaleOutBelow)-seat buffer + one full host of $L)")
-        $sheetLines.Add((Field 'Scale in hosts only from' 'Any'))
-        $sheetLines.Add((Field 'Scale in aggressiveness' "$($prim.Aggr)   ($($prim.AggrWhy))"))
+        # --- the profile card ------------------------------------------------------
+        $cl = New-Object System.Collections.Generic.List[string]
+        $cl.Add("<!--card:$($pool.name)-->")
+        $cl.Add("<div class='card'>")
+        $cl.Add("<div class='card-head'><div class='pool'>$(HtmlEnc $pool.name)<span class='rg'>$(HtmlEnc $pool.resourceGroup)</span></div><div class='fromplan'>from scaling plan <b>$(HtmlEnc $plan.name)</b> &middot; time zone $(HtmlEnc $plan.timeZone) &mdash; enter times as shown</div></div>")
+        $cl.Add("<div class='sec'>Profile</div>")
+        $cl.Add((Row 'Auto-scale' (Toggle $true)))
+        $cl.Add((TextRow 'Profile name' "$($plan.name)-mimic"))
+        $cl.Add("<div class='sec'>Host pool properties</div>")
+        $cl.Add((TextRow 'Session limit per host' "$L"))
+        $cl.Add((TextRow 'Load balancing' $profLB))
+        $cl.Add((Row 'Start VM on connect' (Toggle $svoc)))
+        $cl.Add("<div class='sec'>Host pool sizing</div>")
+        $cl.Add((TextRow 'Measure type' 'Count'))
+        $cl.Add((TextRow 'Active host defined as' 'AVD agent Available'))
+        $cl.Add((TextRow 'Base host pool capacity' "$B"))
+        $minActiveHtml = "$profMinActive" + $(if ($raisedBy) { " <span class='why'>raised by schedule $(HtmlEnc $raisedBy)</span>" } else { '' })
+        $cl.Add((Row 'Min active host capacity' $minActiveHtml))
+        $cl.Add((TextRow 'Burst beyond base capacity' '0'))
+        $cl.Add("<div class='sec'>Scaling logic</div>")
+        $cl.Add((TextRow 'Trigger type' 'Available sessions'))
+        $cl.Add("<div class='logic out'>$(HtmlEnc "Scale out: start up to 2 hosts if available sessions < $($prim.ScaleOutBelow) for 5 minutes")</div>")
+        $cl.Add("<div class='logic in'>$(HtmlEnc "Scale in: stop up to 1 host if available sessions > $($prim.ScaleInAbove) for 15 minutes")</div>")
+        $cl.Add("<div class='sec'>Scale-in restrictions</div>")
+        $cl.Add((TextRow 'Stop/remove hosts only from' 'Any'))
+        $cl.Add((Row 'Scale-in aggressiveness' (AggrPill $prim.Aggr)))
         if ($p.ForceLogoff) {
-            $sheetLines.Add((Field 'Messaging' "warn $($p.WaitMins) min before scale-in (pick nearest dropdown value)"))
-            $sheetLines.Add("  Message: $($p.Notify)")
-        } else {
-            $sheetLines.Add((Field 'Messaging' 'n/a   (plan does not force logoff; never fires at Low/Medium)'))
+            $cl.Add("<div class='sec'>Messaging</div>")
+            $cl.Add((TextRow 'Warn users before scale-in' "$($p.WaitMins) minutes (pick nearest dropdown value)"))
+            $cl.Add((TextRow 'Message' $p.Notify))
         }
-        $sheetLines.Add((Field 'Rolling drain mode' 'OFF   (day one; the optimization lever later)'))
-        $sheetLines.Add((Field 'Auto-heal broken hosts' 'OFF   (day one)'))
-        $preStageHead = if ($scheds.Count -gt 1) { "ON - enable 'Use multiple schedules', add each block below" } else { 'ON' }
-        $sheetLines.Add((Field 'Pre-stage hosts' $preStageHead))
+        $cl.Add("<div class='sec'>Pre-stage hosts</div>")
+        $cl.Add((Row 'Pre-stage hosts' (Toggle $true)))
+        $cl.Add((Row 'Use multiple schedules' (Toggle ($calc.Count -gt 1))))
         $i = 0
-        foreach ($c in $calc) {
+        foreach ($ce in $calc) {
             $i++
-            $s = $c.S
-            $tag = if ($i -eq 1) { 'primary' } else { 'additional' }
-            $sheetLines.Add("  [Pre-stage schedule $i of $($calc.Count) - '$($s.Name)' ($tag)]")
-            $sheetLines.Add("    Work days: $(Format-Days $s.Days)")
-            $sheetLines.Add("    Start of work hours: $(Format-Time $s.RuH $s.RuM)   (ramp-up start)")
-            $sheetLines.Add("    Hosts to be active by start: $($c.PreStage)   (ramp-up min $($s.RuMinPct)% x $B)")
-            $sheetLines.Add("    Scale-in delay: $($c.DelayH) h $($c.DelayM) min   (holds floor $(Format-Time $s.RuH $s.RuM) -> $(Format-Time $s.RdH $s.RdM) ramp-down)")
+            $s = $ce.S
+            $cl.Add("<div class='sched'>")
+            $cl.Add("<div class='sched-head'>Schedule $i of $($calc.Count) &mdash; $(HtmlEnc $s.Name)$(if ($i -eq 1) { ' (primary)' })</div>")
+            $cl.Add((Row 'Work days' (DayChips $s.Days)))
+            $cl.Add((TextRow 'Start of work hours' (Format-Time $s.RuH $s.RuM)))
+            $cl.Add((TextRow 'Hosts to be active by start' "$($ce.PreStage)"))
+            $cl.Add((TextRow 'Scale-in delay' "$($ce.DelayH) h $($ce.DelayM) min"))
+            $cl.Add("</div>")
         }
         if ($notes.Count -gt 0) {
-            $sheetLines.Add("NOTES")
-            foreach ($n in $notes) { $sheetLines.Add("- $n") }
+            $cl.Add("<div class='notes'><div class='notes-t'>Notes</div><ul>")
+            foreach ($n in $notes) { $cl.Add("<li>$(HtmlEnc $n)</li>") }
+            $cl.Add("</ul></div>")
         }
-        $sheetLines.Add(("=" * 64))
-        $sheetLines.Add("")
-        $sheets.AddRange($sheetLines)
+        $cl.Add("</div>")
+        $cards.Add(($cl -join "`n"))
         $sheetCount++
 
         # --- review rows (one per schedule) ---------------------------------------
@@ -517,8 +540,10 @@ foreach ($plan in ($pooledPlans | Sort-Object name)) {
 }
 
 # --- personal plans + pools with no plan ------------------------------------------
+$personalHtml = New-Object System.Collections.Generic.List[string]
 foreach ($pp in $personalPlans) {
     foreach ($ref in @($pp.refs)) { $referencedPoolIds["$($ref.hostPoolArmPath)".ToLowerInvariant()] = $true }
+    $personalHtml.Add("<div class='stub'><b>$(HtmlEnc $pp.name)</b> &mdash; personal scaling plan ($(@($pp.refs).Count) pool reference(s), time zone $(HtmlEnc $pp.timeZone)). Not translated - this tool does pooled plans first.</div>")
     $review.Add([pscustomobject]@{ Plan=$pp.name; Schedule='(personal)'; Days=''; Pool="($(@($pp.refs).Count) pool(s))"; RG=$pp.resourceGroup; EnabledOnPool=''
         SessionHosts=''; SessionLimit=''; MinActive=''; PreStageHosts=''; ScaleOutBelow=''; ScaleInAbove=''
         Aggressiveness=''; ScaleInDelay=''; ProfileLB=''; StartVMOnConnect=''; TimeZone=$pp.timeZone
@@ -526,38 +551,72 @@ foreach ($pp in $personalPlans) {
 }
 $noPlanPools = @($poolRows | Where-Object { -not $referencedPoolIds.ContainsKey("$($_.id)".ToLowerInvariant()) } | Sort-Object name)
 
-if ($personalPlans.Count -gt 0) {
-    $sheets.Add("PERSONAL SCALING PLANS (not translated - this tool does pooled plans first)")
-    foreach ($pp in $personalPlans) { $sheets.Add("- $($pp.name)  ($(@($pp.refs).Count) pool reference(s), time zone $($pp.timeZone))") }
-    $sheets.Add("")
-}
-if ($noPlanPools.Count -gt 0) {
-    $sheets.Add("HOST POOLS WITH NO SCALING PLAN ($($noPlanPools.Count)) - nothing to mimic; configure NME auto-scale fresh on these:")
-    foreach ($np in $noPlanPools) { $sheets.Add("- $($np.name)  ($($np.resourceGroup), $($np.hostPoolType))") }
-    $sheets.Add("")
-}
-
 # ------------------------------------------------------------------- 5. output
 Write-Info "[5/5] Writing files..."
-$header = @(
-    "NME AUTO-SCALE SHEETS  -  generated $(Get-Date -Format 'yyyy-MM-dd HH:mm') by Get-NerdioAutoscaleSheet.ps1 $script:Version",
-    "Day-one mimicry of Azure scaling plans. One sheet per host pool.",
-    "",
-    "HOW TO USE",
-    " 1. In NME, open the host pool's Auto-scale settings.",
-    " 2. Enter each sheet line top to bottom. Text in (parentheses) explains",
-    "    where a number came from - don't type it into NME.",
-    " 3. If a sheet shows more than one pre-stage schedule, turn ON",
-    "    'Use multiple schedules' and add every block.",
-    " 4. Read each sheet's NOTES - anything Azure did that NME expresses",
-    "    differently is called out there. Nothing is translated silently.",
-    " 5. The Alternative Schedule tab in NME is for holidays/exceptions -",
-    "    weekends are handled by the pre-stage schedules above, not there.",
-    "",
-    ""
-)
-($header + $sheets) -join "`n" | Out-File -FilePath $OutFile -Encoding utf8NoBOM
-Write-Ok "Sheets written: $OutFile ($sheetCount profile sheet(s))"
+$css = @'
+body{font-family:-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;background:#f0f2f5;color:#172b4d;margin:0;padding:24px 12px}
+.top{max-width:760px;margin:0 auto 20px}
+h1{font-size:21px;margin:0 0 4px}
+.sub{color:#6b778c;font-size:12.5px;margin-bottom:10px}
+.how{background:#deebff;border-left:3px solid #0052cc;padding:10px 12px;font-size:13px;border-radius:0 6px 6px 0}
+.card,.stubs,.plist{max-width:760px;margin:0 auto 18px;background:#fff;border-radius:10px;padding:20px 24px;box-shadow:0 1px 3px rgba(9,30,66,.13)}
+.card-head{border-bottom:2px solid #ebecf0;padding-bottom:10px;margin-bottom:6px}
+.pool{font-size:17px;font-weight:700}
+.rg{font-weight:400;color:#6b778c;font-size:12px;margin-left:8px}
+.fromplan{color:#6b778c;font-size:12.5px;margin-top:3px}
+.sec{text-transform:uppercase;letter-spacing:.08em;font-size:11px;color:#6b778c;font-weight:700;margin:16px 0 2px;border-bottom:1px solid #ebecf0;padding-bottom:3px}
+.row{display:flex;justify-content:space-between;align-items:center;padding:7px 0;border-bottom:1px solid #f4f5f7;gap:12px}
+.lbl{font-size:13px;color:#42526e}
+.val{font-size:13.5px;font-weight:600;text-align:right}
+.why{font-weight:400;color:#974f0c;font-size:11.5px;margin-left:6px}
+.tg{display:inline-block;font-size:11px;font-weight:700;border-radius:10px;padding:2px 10px;background:#dfe1e6;color:#42526e}
+.tg.on{background:#e3fcef;color:#006644}
+.pill{display:inline-block;font-size:11.5px;font-weight:700;border-radius:10px;padding:2px 10px}
+.pill.low{background:#deebff;color:#0747a6}
+.pill.medium{background:#fff0b3;color:#7f5f01}
+.pill.high{background:#ffebe6;color:#bf2600}
+.chip{display:inline-block;background:#deebff;color:#0747a6;border-radius:4px;padding:1px 7px;margin-left:4px;font-size:11.5px;font-weight:600}
+.logic{font-size:13px;padding:6px 10px;margin:6px 0;border-left:3px solid #0052cc;background:#fafbfc;border-radius:0 4px 4px 0}
+.logic.in{border-left-color:#6b778c}
+.sched{background:#f7f8fa;border-radius:8px;padding:8px 14px;margin:8px 0}
+.sched-head{font-size:12.5px;font-weight:700;color:#42526e;padding:4px 0}
+.sched .row{border-bottom:1px solid #ebecf0}
+.notes{background:#fffae6;border-left:3px solid #ffab00;border-radius:0 6px 6px 0;padding:10px 14px;margin-top:16px}
+.notes-t{font-weight:700;font-size:12.5px;margin-bottom:4px}
+.notes ul{margin:0;padding-left:18px}
+.notes li{font-size:12.5px;margin:4px 0;color:#42526e}
+.stub{font-size:13px;color:#42526e;padding:8px 0;border-bottom:1px solid #f4f5f7}
+.stub:last-child{border-bottom:none}
+.h2{font-size:14px;font-weight:700;margin:0 0 6px}
+details{max-width:760px;margin:0 auto 18px;background:#fff;border-radius:10px;padding:14px 24px;box-shadow:0 1px 3px rgba(9,30,66,.13)}
+summary{cursor:pointer;font-size:13.5px;font-weight:600}
+.np{font-size:12.5px;color:#42526e;padding:4px 0}
+.foot{max-width:760px;margin:8px auto;color:#97a0af;font-size:11.5px;text-align:center}
+'@
+$doc = New-Object System.Collections.Generic.List[string]
+$doc.Add("<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>NME Auto-Scale Profiles</title><style>$css</style></head><body>")
+$doc.Add("<div class='top'><h1>NME Auto-Scale Profiles</h1><div class='sub'>Day-one mimicry of your Azure scaling plans &middot; generated $(Get-Date -Format 'yyyy-MM-dd HH:mm') by Get-NerdioAutoscaleSheet.ps1 $script:Version</div>")
+$doc.Add("<div class='how'>One card per host pool. Key each card into NME's Create Auto-Scale Profile for that pool, top to bottom &mdash; toggles, pills, and chips read exactly as the NME controls do. If a card shows more than one pre-stage schedule, turn on Use multiple schedules and add every block. Notes call out anything Azure expressed differently. The Alternative Schedule tab stays reserved for holidays.</div></div>")
+foreach ($c in $cards) { $doc.Add($c) }
+if ($stubs.Count -gt 0) {
+    $doc.Add("<div class='stubs'><div class='h2'>Nothing to enter for these</div>")
+    foreach ($s in $stubs) { $doc.Add($s) }
+    $doc.Add("</div>")
+}
+if ($personalHtml.Count -gt 0) {
+    $doc.Add("<div class='plist'><div class='h2'>Personal scaling plans</div>")
+    foreach ($s in $personalHtml) { $doc.Add($s) }
+    $doc.Add("</div>")
+}
+if ($noPlanPools.Count -gt 0) {
+    $doc.Add("<details><summary>$($noPlanPools.Count) host pool(s) have no scaling plan &mdash; nothing to mimic; configure NME auto-scale fresh (click to expand)</summary>")
+    foreach ($np in $noPlanPools) { $doc.Add("<div class='np'>$(HtmlEnc $np.name) &nbsp;($(HtmlEnc $np.resourceGroup), $(HtmlEnc $np.hostPoolType))</div>") }
+    $doc.Add("</details>")
+}
+$doc.Add("<div class='foot'>Read-only report &middot; every call behind it is a GET or a query</div>")
+$doc.Add("</body></html>")
+($doc -join "`n") | Out-File -FilePath $OutFile -Encoding utf8NoBOM
+Write-Ok "Profiles written: $OutFile ($sheetCount profile card(s))"
 if ($review.Count -gt 0) {
     $review | Export-Csv -Path $csvFile -NoTypeInformation -Encoding utf8NoBOM
     Write-Ok "Review table written: $csvFile ($($review.Count) row(s))"
@@ -576,13 +635,13 @@ if ($review.Count -gt 0) {
 }
 
 Write-Host ""
-Write-Ok "Pooled plans translated: $($pooledPlans.Count) | profile sheets: $sheetCount | assigned-but-not-enabled: $skipCount | personal plans listed: $($personalPlans.Count)"
+Write-Ok "Pooled plans translated: $($pooledPlans.Count) | profile cards: $sheetCount | assigned-but-not-enabled: $skipCount | personal plans listed: $($personalPlans.Count)"
 if ($noPlanPools.Count -gt 0) {
     $preview = ($noPlanPools | Select-Object -First 10 | ForEach-Object { $_.name }) -join ', '
-    $more = if ($noPlanPools.Count -gt 10) { " (+$($noPlanPools.Count - 10) more - full list in the .txt)" } else { '' }
+    $more = if ($noPlanPools.Count -gt 10) { " (+$($noPlanPools.Count - 10) more - full list in the HTML)" } else { '' }
     Write-Info "Pools with no scaling plan: $($noPlanPools.Count) - $preview$more"
 }
-Write-Info "Sheets are day-one mimicry. Once NME runs and gathers telemetry, optimize from there."
+Write-Info "Open the HTML and key each card into NME. Cards are day-one mimicry; optimize with Nerdio telemetry after."
 
 if (-not $SkipDownload) {
     Invoke-CloudShellDownload -Path $OutFile
