@@ -1,0 +1,248 @@
+//==================================================================================
+// MODELER IMPORT BUILDER — OPTIONAL DETAIL GRID               v0.7 (2026-08-04)
+// v0.7: synced with the main query — observed-first density (PerHostPeak column),
+// disk tier snap, 23:45 window cap. SKUs and disk types reported verbatim.
+// Per-pool breakdown of everything the main query (modeler-make-json.kql) puts
+// into the JSON. OPTIONAL — a magnifying glass, not a required step. Run it when
+// the main query's WorkspaceCheck or FlaggedPools says look closer, or when you
+// want to eyeball per-pool numbers before sending a model. Read-only.
+//----------------------------------------------------------------------------------
+// RUN IT
+//  1. Same workspace, same Logs window, same Time range ("Last 30 days"), and
+//     the same PARAMETERS values as modeler-make-json.kql.
+//  2. Paste this WHOLE file. Run. One row per host pool; anything defaulted or
+//     suspicious is spelled out in the Flags column.
+//
+// ACCESS NEEDED: Reader on the AVD subscription + access to this workspace.
+//----------------------------------------------------------------------------------
+// IF IT ERRORS
+//  - "No tabular expression statement found" -> an empty line split the query
+//    (the Logs editor treats blank lines as query separators). Every line in
+//    this file has text for exactly that reason. If you edited it, make sure no
+//    line is fully blank, then click anywhere inside the query text and Run.
+//  - "Failed to resolve table 'WVDConnections'" -> wrong workspace (redo step 1),
+//    or diagnostics were never enabled.
+//  - Pools/VMs missing from rows -> no Reader on the subscription, or a very
+//    large tenant hit the ~1000-row ARG cap: un-comment the "// | where"
+//    scope lines in the three arg("") blocks below and fill them in.
+//==================================================================================
+//
+//---------------------------- PARAMETERS (edit these) -----------------------------
+let ModelName        = "Customer - Actuals";   // model name shown in the Modeler
+let LookbackDays     = 30d;                    // how much history to analyze
+let LocalTimeZone    = "America/New_York";     // customer's zone, IANA format:
+                                               // America/Chicago, America/Denver,
+                                               // America/Los_Angeles, Europe/London
+//------------------------- ADVANCED (leave alone) ---------------------------------
+let WorkHourFloorPct = 0.20;  // hour is "working" if avg concurrency >= 20% of peak
+let WorkDayFloorPct  = 0.25;  // day is primary if its peak >= 25% of overall peak
+let OvertimeHoursDefault = 1; // "additional hours per user" (raised only if % caps)
+let OvertimeDayDivisor   = 7.0; // modeler applies additional-hours across all 7 days
+                                // (confirmed 2026-08-04)
+let WeeksObserved    = todouble(LookbackDays / 7d);
+//----------------------------------------------------------------------------------
+//
+//------------------------ TELEMETRY: session spans --------------------------------
+let ConnRaw = union isfuzzy=true
+    (datatable(TimeGenerated:datetime, State:string, CorrelationId:string, UserName:string, SessionHostName:string, _ResourceId:string)[]),
+    (WVDConnections | project TimeGenerated, State, CorrelationId, UserName, SessionHostName, _ResourceId)
+    // Pools sending diagnostics to ANOTHER workspace? Uncomment, put its name in (repeat per workspace):
+    // ,(workspace("OTHER-WORKSPACE-NAME").WVDConnections | project TimeGenerated, State, CorrelationId, UserName, SessionHostName, _ResourceId)
+    ;
+let Sessions =
+    ConnRaw
+    | where TimeGenerated > ago(LookbackDays)
+    | where State == "Connected"
+    | project CorrelationId, UserName, SessionHostName, HostPoolId = tolower(_ResourceId), StartTime = TimeGenerated
+    | join kind=leftouter (
+        ConnRaw
+        | where TimeGenerated > ago(LookbackDays)
+        | where State == "Completed"
+        | project CorrelationId, EndTime = TimeGenerated
+      ) on CorrelationId
+    | project-away CorrelationId1
+    | extend EndTime = coalesce(EndTime, min_of(StartTime + 12h, now()))
+    | where EndTime > StartTime;
+let Buckets =
+    Sessions
+    | extend Slots = range(bin(StartTime, 15m), bin(EndTime, 15m), 15m)
+    | mv-expand Slot = Slots to typeof(datetime)
+    | summarize ConcurrentUsers = dcount(UserName) by HostPoolId, Slot;
+// observed packing: peak concurrent users on any single host, per pool
+let PeakPerHost =
+    Sessions
+    | extend Slots = range(bin(StartTime, 15m), bin(EndTime, 15m), 15m)
+    | mv-expand Slot = Slots to typeof(datetime)
+    | summarize HostConcurrent = dcount(UserName) by HostPoolId, SessionHostName, Slot
+    | summarize HostPeak = max(HostConcurrent) by HostPoolId, SessionHostName
+    | summarize PeakUsersPerHost = max(HostPeak) by HostPoolId;
+let Peaks =
+    Buckets
+    | summarize PeakConcurrentUsers = max(ConcurrentUsers) by HostPoolId;
+let WorkDays =
+    Buckets
+    | extend DowN = toint(dayofweek(datetime_utc_to_local(Slot, LocalTimeZone)) / 1d)
+    | summarize DayPeak = max(ConcurrentUsers) by HostPoolId, DowN
+    | join kind=inner Peaks on HostPoolId
+    | where todouble(DayPeak) >= todouble(PeakConcurrentUsers) * WorkDayFloorPct
+    | extend ModelerDay = tolong(iff(DowN == 0, 7, DowN))
+    | summarize WorkDaysList = array_sort_asc(make_list(ModelerDay)) by HostPoolId;
+let WorkWindow =
+    Buckets
+    | extend LocalSlot = datetime_utc_to_local(Slot, LocalTimeZone)
+    | extend LocalHour = hourofday(LocalSlot),
+             DowN = toint(dayofweek(LocalSlot) / 1d)
+    | extend ModelerDay = tolong(iff(DowN == 0, 7, DowN))
+    | join kind=inner WorkDays on HostPoolId
+    | where set_has_element(WorkDaysList, ModelerDay)
+    | summarize AvgConcurrent = avg(todouble(ConcurrentUsers)) by HostPoolId, LocalHour
+    | join kind=inner Peaks on HostPoolId
+    | where AvgConcurrent >= todouble(PeakConcurrentUsers) * WorkHourFloorPct
+    | summarize StartHour = min(LocalHour), EndHour = max(LocalHour) by HostPoolId
+    | extend WorkDurationMinutes = (EndHour - StartHour + 1) * 60;
+let UsageTotals =
+    Buckets
+    | extend LocalSlot = datetime_utc_to_local(Slot, LocalTimeZone)
+    | extend LocalHour = hourofday(LocalSlot),
+             DowN = toint(dayofweek(LocalSlot) / 1d)
+    | extend ModelerDay = tolong(iff(DowN == 0, 7, DowN))
+    | join kind=leftouter WorkDays on HostPoolId
+    | join kind=leftouter WorkWindow on HostPoolId
+    | extend InWindow = isnotnull(StartHour)
+        and set_has_element(coalesce(WorkDaysList, dynamic([])), ModelerDay)
+        and LocalHour >= StartHour and LocalHour <= EndHour
+    | summarize TotalUH = sum(todouble(ConcurrentUsers)) * 0.25,
+                InWindowUH = sumif(todouble(ConcurrentUsers), InWindow) * 0.25
+        by HostPoolId
+    | extend WeeklyUH = round(TotalUH / WeeksObserved, 1),
+             WeeklyInWindowUH = round(InWindowUH / WeeksObserved, 1)
+    | extend WeeklyOffUH = round(WeeklyUH - WeeklyInWindowUH, 1);
+//
+//------------------- TELEMETRY: session host -> VM linkage ------------------------
+let AgentRaw = union isfuzzy=true
+    (datatable(TimeGenerated:datetime, SessionHostName:string, SessionHostResourceId:string, _ResourceId:string)[]),
+    (WVDAgentHealthStatus | project TimeGenerated, SessionHostName, SessionHostResourceId, _ResourceId)
+    // ,(workspace("OTHER-WORKSPACE-NAME").WVDAgentHealthStatus | project TimeGenerated, SessionHostName, SessionHostResourceId, _ResourceId)
+    ;
+let HostVmIds =
+    AgentRaw
+    | where TimeGenerated > ago(7d)
+    | where isnotempty(SessionHostResourceId)
+    | summarize arg_max(TimeGenerated, SessionHostResourceId) by SessionHostName, HostPoolId = tolower(_ResourceId)
+    | project HostPoolId, VmId = tolower(SessionHostResourceId);
+let PoolHostCounts =
+    HostVmIds
+    | summarize SessionHostsSeen = dcount(VmId) by HostPoolId;
+//
+//------------------------ AZURE CONFIG via arg("") --------------------------------
+let HostPools =
+    arg("").Resources
+    | where type =~ "microsoft.desktopvirtualization/hostpools"
+    // | where subscriptionId == "<sub-guid>"
+    // | where resourceGroup == "<rg-name>"
+    | project HostPoolId = tolower(id), PoolName = name, RG = resourceGroup, Region = location,
+              HostPoolType = tostring(properties.hostPoolType),
+              MaxSessionLimit = toint(properties.maxSessionLimit),
+              PreferredAppGroupType = tostring(properties.preferredAppGroupType);
+let Vms =
+    arg("").Resources
+    | where type =~ "microsoft.compute/virtualmachines"
+    // | where subscriptionId == "<sub-guid>"
+    // | where resourceGroup == "<rg-name>"
+    | project VmId = tolower(id),
+              VmSize = tostring(properties.hardwareProfile.vmSize),
+              Ephemeral = isnotempty(properties.storageProfile.osDisk.diffDiskSettings),
+              ImageId = tostring(properties.storageProfile.imageReference.id),
+              OsDiskId = tolower(tostring(properties.storageProfile.osDisk.managedDisk.id));
+let Disks =
+    arg("").Resources
+    | where type =~ "microsoft.compute/disks"
+    // | where subscriptionId == "<sub-guid>"
+    // | where resourceGroup == "<rg-name>"
+    | project OsDiskId = tolower(id), DiskSizeGb = toint(properties.diskSizeGB),
+              DiskSku = tostring(sku.name);
+let PoolVmSpec =
+    HostVmIds
+    | join kind=inner Vms on VmId
+    | join kind=leftouter Disks on OsDiskId
+    | summarize SpecCount = count() by HostPoolId, VmSize, Ephemeral, ImageId, DiskSizeGb, DiskSku
+    | summarize arg_max(SpecCount, VmSize, Ephemeral, ImageId, DiskSizeGb, DiskSku) by HostPoolId;
+//
+//------------------------------ ASSEMBLY ------------------------------------------
+let Assembled =
+    HostPools
+    | join kind=leftouter Peaks          on HostPoolId
+    | join kind=leftouter WorkWindow     on HostPoolId
+    | join kind=leftouter WorkDays       on HostPoolId
+    | join kind=leftouter UsageTotals    on HostPoolId
+    | join kind=leftouter PeakPerHost    on HostPoolId
+    | join kind=leftouter PoolVmSpec     on HostPoolId
+    | join kind=leftouter PoolHostCounts on HostPoolId
+    // duplicate-name detection done locally (joining two arg() subqueries gets
+    // pushed to ARG's backend, which rejects the join hints)
+    | sort by PoolName asc
+    | extend IsDupName = PoolName == coalesce(prev(PoolName), "") or PoolName == coalesce(next(PoolName), "")
+    | extend VmSizeFinal = iff(isempty(VmSize), "Standard_D4s_v5", VmSize)
+    | extend VCpus = toint(extract(@"_[A-Za-z]+?(\d+)", 1, VmSizeFinal))
+    | extend Experience = case(
+        HostPoolType =~ "Personal", 2,
+        PreferredAppGroupType =~ "RailApplications", 4,
+        MaxSessionLimit == 1, 3,
+        1)
+    | extend LimitSane = MaxSessionLimit >= 1 and MaxSessionLimit < 100
+    | extend ObsPerHost = toint(coalesce(PeakUsersPerHost, 0))
+    | extend UsersPerHost = case(
+        ObsPerHost >= 1 and LimitSane, min_of(ObsPerHost, MaxSessionLimit),
+        ObsPerHost >= 1, ObsPerHost,
+        LimitSane, MaxSessionLimit,
+        VCpus)
+    | extend Density = iff(Experience == 2, 1.0,
+        min_of(10.0, round(todouble(UsersPerHost) / todouble(VCpus), 2)))
+    | extend ImageType = iff(isnotempty(ImageId), 2, 1)
+    | extend UsersTotal      = toint(coalesce(PeakConcurrentUsers, 0)),
+             StartHourFinal  = toint(coalesce(StartHour, 9)),
+             DurationFinal   = min_of(toint(coalesce(WorkDurationMinutes, 540)), 1425 - 60 * toint(coalesce(StartHour, 9))),
+             WorkDaysFinal   = coalesce(WorkDaysList, dynamic([1,2,3,4,5])),
+             DiskSizeFinal   = case(toint(coalesce(DiskSizeGb, 128)) <= 128, 128, toint(coalesce(DiskSizeGb, 128)) <= 256, 256, toint(coalesce(DiskSizeGb, 128)) <= 512, 512, toint(coalesce(DiskSizeGb, 128)) <= 1024, 1024, toint(coalesce(DiskSizeGb, 128)) <= 2048, 2048, 4096),
+             DiskSkuFinal    = iff(isempty(DiskSku), "Premium_LRS", DiskSku),
+             EphemeralFinal  = coalesce(Ephemeral, false),
+             OffUH           = coalesce(WeeklyOffUH, 0.0)
+    | extend DisplayName = iff(IsDupName, strcat(PoolName, " (", RG, ")"), PoolName)
+    | extend OtHoursFinal = iff(UsersTotal > 0
+            and OffUH / OvertimeDayDivisor / todouble(UsersTotal) > 1.0,
+        toint(ceiling(OffUH / OvertimeDayDivisor / todouble(UsersTotal))),
+        OvertimeHoursDefault)
+    | extend OtPct = iff(UsersTotal > 0,
+        toint(min_of(100.0, round(100.0 * OffUH / OvertimeDayDivisor
+            / (todouble(UsersTotal) * todouble(OtHoursFinal)), 0))),
+        0)
+    | extend OffHrsModeled = round(todouble(UsersTotal) * OtPct / 100.0 * OtHoursFinal * OvertimeDayDivisor, 1)
+    | extend Flags = strcat(
+        iff(UsersTotal == 0, "NO TELEMETRY (users=0, hours defaulted); ", ""),
+        iff(Experience != 2 and ObsPerHost < 1, iff(LimitSane, "DENSITY FROM SESSION LIMIT (no per-host telemetry); ", "NO LIMIT + NO TELEMETRY -> density 1.0/vCPU; "), ""),
+        iff(isempty(VmSize), "NO VM SPEC IN TELEMETRY (defaulted D4s_v5/128GB); ", ""),
+        iff(isnull(StartHour) and UsersTotal > 0, "WORK WINDOW DEFAULTED 9-18; ", ""),
+        iff(OtPct >= 100, "OVERTIME CAPPED AT 100% -> check window/day detection; ", ""));
+//------------------------------ REVIEW GRID ---------------------------------------
+let ConnRows = toscalar(ConnRaw | where TimeGenerated > ago(LookbackDays) | count);
+union
+  (print PoolName = "!! THIS WORKSPACE HAS NO WVDConnections DATA in the lookback window. Wrong workspace (RUN IT step 1), diagnostics not enabled, or toolbar Time range too short. Rows below are config-only.",
+         Flags = "WORKSPACE CHECK FAILED", SortKey = 0
+   | where ConnRows == 0),
+  (Assembled
+   | project PoolName, RG, HostPoolType, Experience, Region,
+          VmSize = VmSizeFinal, VCpus, MaxSessionLimit, Density, PerHostPeak = ObsPerHost,
+          OsDisk = strcat(DiskSizeFinal, "GB ", DiskSkuFinal),
+          ImageType = iff(ImageType == 2, "Custom/Gallery", "Marketplace"),
+          PeakConcurrentUsers = UsersTotal,
+          WorkWindow = strcat(StartHourFinal, ":00-", StartHourFinal + DurationFinal / 60, ":00 (", LocalTimeZone, ")"),
+          WorkDays = WorkDaysFinal,
+          WeeklyUserHrs = coalesce(WeeklyUH, 0.0),
+          InWindowHrs = coalesce(WeeklyInWindowUH, 0.0),
+          OffHrsWeekly_Observed = OffUH,
+          Overtime = strcat(OtPct, "% x ", OtHoursFinal, "h"),
+          OffHrsWeekly_Modeled = OffHrsModeled,
+          SessionHostsSeen, Flags
+   | extend SortKey = 1)
+| order by SortKey asc, PoolName asc
+| project-away SortKey
