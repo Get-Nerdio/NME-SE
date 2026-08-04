@@ -24,12 +24,12 @@
     Nothing is modified anywhere - every call is a read.
 
 .PARAMETER ModelName
-    Model name shown inside the Nerdio Modeler. Default "Customer - Actuals".
+    Model name shown inside the Nerdio Modeler. Default "AVD Environment - Actuals".
 .PARAMETER LookbackDays
     Days of usage history to analyze. Default 30.
 .PARAMETER TimeZone
-    IANA time zone for work-hours math (customer's zone), e.g. America/New_York,
-    America/Chicago, Europe/London. Default America/New_York.
+    IANA time zone for work-hours math (the environment's local zone), e.g.
+    America/New_York, America/Chicago, Europe/London. Default America/New_York.
 .PARAMETER SubscriptionId
     Optional subscription ID(s) to scope to. Default: every subscription you can see.
 .PARAMETER OutFile
@@ -50,6 +50,8 @@
     ./modeler.ps1 -TimeZone 'America/Chicago' -ModelName 'Contoso - Actuals'
 
 .NOTES
+    v0.7 (2026-08-04). Language pass for customer-facing use; default ModelName
+    is now "AVD Environment - Actuals".
     v0.6 (2026-08-04). Adds model-vs-actual: last month's ACTUAL spend for the
     session-host VMs + disks via the Cost Management Query API, shown as an
     ActualMo column in the review table.
@@ -86,7 +88,7 @@
 #>
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $false)] [string]   $ModelName      = "Customer - Actuals",
+    [Parameter(Mandatory = $false)] [string]   $ModelName      = "AVD Environment - Actuals",
     [Parameter(Mandatory = $false)] [int]      $LookbackDays   = 30,
     [Parameter(Mandatory = $false)] [string]   $TimeZone       = "America/New_York",
     [Parameter(Mandatory = $false)] [string[]] $SubscriptionId = @(),

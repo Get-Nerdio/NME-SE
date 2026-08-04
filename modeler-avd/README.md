@@ -1,16 +1,16 @@
 # Nerdio Modeler Import Builder
 
-Turns a customer's **actual AVD environment** — every host pool, tenant-wide — into an import file for the Nerdio Modeler, plus a per-pool review of what was found and (where permitted) what those pools **actually cost last month**.
+Turns your **actual AVD environment** — every host pool, tenant-wide — into an import file for the Nerdio Modeler, plus a per-pool review of what was found and (where permitted) what those pools **actually cost last month**.
 
-One command in Azure Cloud Shell. Read-only. Nothing in the environment is changed.
+One command in Azure Cloud Shell. Read-only. Nothing in your environment is changed.
 
-Instead of asking a customer what they run and getting incomplete answers about three host pools, this reads the truth: real SKUs, real disks, real session limits, real observed concurrency and working hours, from every pool they have.
+A cost model is only as credible as the data behind it. This tool feeds the Modeler reality instead of estimates: real SKUs, real disks, real session limits, observed concurrency and working hours — from every host pool, not a sample. The result is a model that dials in Nerdio's value against how your environment actually runs, so the savings it shows are savings you can expect to keep.
 
 ---
 
 ## Quick start
 
-1. Open **Azure Cloud Shell** in the customer's tenant (portal, `>_` icon), **PowerShell** mode.
+1. Open **Azure Cloud Shell** in the tenant that hosts your AVD environment (portal, `>_` icon), **PowerShell** mode.
 2. Paste:
 
    ```powershell
@@ -33,9 +33,9 @@ irm 'https://raw.githubusercontent.com/dclawrence003/NME/main/modeler/Get-Nerdio
 
 | Parameter | Default | What it does |
 |---|---|---|
-| `-ModelName` | `Customer - Actuals` | Model name shown in the Modeler |
+| `-ModelName` | `AVD Environment - Actuals` | Model name shown in the Modeler |
 | `-LookbackDays` | `30` | Days of usage history analyzed |
-| `-TimeZone` | `America/New_York` | Customer's zone (IANA) for work-hours math — `America/Chicago`, `Europe/London`, etc. |
+| `-TimeZone` | `America/New_York` | Your environment's local time zone (IANA) for work-hours math — `America/Chicago`, `Europe/London`, etc. |
 | `-SubscriptionId` | all visible | Scope to specific subscription ID(s) |
 | `-OutFile` | timestamped | Output JSON name |
 | `-SkipCosts` | off | Skip the actual-spend pull |
@@ -78,12 +78,12 @@ Nothing needs to be installed: Cloud Shell ships every module the script uses, a
 
 ## The modeling rules (what lands in the JSON, and why)
 
-The goal is a model of how the pools **actually run**, so the Nerdio number is credible and the savings come from real levers — hours and true concurrency — not from optimistic assumptions.
+The goal is a model of how your pools **actually run**, so the Nerdio number is credible and the savings come from real levers — hours and true concurrency — not from optimistic assumptions.
 
 - **Users = observed peak concurrent**, not assigned users. Floored at 1 (Modeler minimum) on zero-utilization pools.
 - **Work days/hours = observed**, not the scaling plan's schedule. Windows never cross midnight (Modeler max 23:45); only full-day windows get trimmed.
 - **Weekend + off-hours load** folds into the Modeler's overtime fields (% of users × additional hours, applied across 7 days), reconciled so weekly compute hours match observation.
-- **Density (users per vCPU) = observed peak users on a single host** (capped at the configured session limit), because how they actually pack hosts is what the model should price. Falls back to session limit ÷ vCPUs when there's no telemetry; last resort 1.0 — both fallbacks flagged. The review table shows `PerHostPeak` next to `Limit`: the gap between them is density headroom.
+- **Density (users per vCPU) = observed peak users on a single host** (capped at the configured session limit), because how your hosts are actually packed is what the model should price. Falls back to session limit ÷ vCPUs when there's no telemetry; last resort 1.0 — both fallbacks flagged. The review table shows `PerHostPeak` next to `Limit`: the gap between them is density headroom.
 - **SKUs are reported exactly as found** — never substituted. The model uses the Custom workload type, which accepts any AVD SKU.
 - **Disks reported as found** (Premium SSD / Standard SSD / Standard HDD); size snapped **up** to the Modeler's offered tiers (128/256/512/1024/2048/4096 GB) only when the actual size isn't offered. Stopped-disk type is always Standard HDD — disk switching is the Nerdio feature being modeled.
 - Not derivable from Azure, so left for manual touch-up after import: FSLogix (defaults off), RDP egress GB (10), custom-image build-VM hours.
@@ -92,13 +92,13 @@ The goal is a model of how the pools **actually run**, so the Nerdio number is c
 
 ## The cost comparison (`ActualMo`)
 
-For every resource group holding session-host VMs, the script queries the **Cost Management Query API** for last calendar month, filtered to Virtual Machines + Storage services, grouped by resource — then attributes cost to each pool's VMs and OS disks. **Amortized** cost is tried first (so Reservations/Savings Plans customers get honest numbers), falling back to actual cost on pay-as-you-go offers that don't support amortized queries.
+For every resource group holding session-host VMs, the script queries the **Cost Management Query API** for last calendar month, filtered to Virtual Machines + Storage services, grouped by resource — then attributes cost to each pool's VMs and OS disks. **Amortized** cost is tried first (so environments with Reservations or Savings Plans get honest numbers), falling back to actual cost on pay-as-you-go offers that don't support amortized queries.
 
 **Permissions:** the same Reader access the script already needs is sufficient — any of Owner / Contributor / Reader / Cost Management Reader at RG or subscription scope.
 
 **When it skips (by design):** cost API failures are almost never RBAC. They're billing-side policy — CSP subscriptions without customer cost visibility enabled, EA enrollments where the admin disabled "view charges," or offer types with no cost API support at all (sponsored / internal / MSDN — typical in demo and lab tenants). Each failing scope is skipped with one warning line quoting Azure's actual error; the model, review table, JSON, and downloads are never affected. `-SkipCosts` turns the pull off entirely.
 
-Reading the numbers: `ActualMo` already includes whatever the customer's current scaling saves them. The comparison is *Nerdio-run vs. their current management* — which is the honest one.
+Reading the numbers: `ActualMo` already includes whatever your current scaling setup saves you. The comparison is *Nerdio-run vs. how the environment is managed today* — the honest one, and the one that shows where Nerdio's value actually comes from.
 
 ---
 
