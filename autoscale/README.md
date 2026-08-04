@@ -89,6 +89,7 @@ Some tenants block Cloud Shell. `fallback/nerdio-scalingplan-translator.kql` run
 |---|---|
 | "No scaling plans found" | None exist in the scoped subscriptions, or the account lacks Reader there — check `-SubscriptionId` and access |
 | A pool shows `POOL NOT VISIBLE` | The plan references a pool in a subscription outside the current scope — re-run with `-SubscriptionId` covering it |
+| A plan shows `NO HOST POOLS ASSIGNED` | The plan isn't attached to any pool, so Azure isn't scaling with it — nothing to enter in NME |
 | A sheet shows 0 session hosts | The pool has no registered hosts, so every host-count number is 0 — register hosts and re-run |
 | `no session limit` flag | The pool has no max session limit; Available-sessions math needs one — the sheet's NOTES explain how to size the trigger once you set it |
 | `dynamic plan - manual review` | The plan creates/deletes hosts (preview); review the sheet by hand before trusting base/burst |

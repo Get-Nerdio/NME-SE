@@ -47,6 +47,8 @@
     ./autoscale.ps1 -SubscriptionId 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'
 
 .NOTES
+    v0.1.1 (2026-08-04). Pooled plans with no host pool references are now
+    listed and flagged (previously they were invisible in the output).
     v0.1 (2026-08-04). First release. Sibling of modeler/Get-NerdioModelerJson.ps1
     (same skeleton: Resource Graph over REST, Cloud Shell auto-download).
 
@@ -87,7 +89,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:Version = 'v0.1'
+$script:Version = 'v0.1.1'
 if ([string]::IsNullOrEmpty($OutFile)) { $OutFile = "nme-autoscale-sheet-$(Get-Date -Format 'yyyyMMdd-HHmm').txt" }
 $csvDir  = [IO.Path]::GetDirectoryName($OutFile)
 $csvBase = [IO.Path]::GetFileNameWithoutExtension($OutFile) + '-review.csv'
@@ -285,6 +287,22 @@ foreach ($plan in ($pooledPlans | Sort-Object name)) {
         @($schedByPlan[$planIdL] | Sort-Object -Property @{Expression='DayCount';Descending=$true}, @{Expression='Name';Descending=$false})
     } else { @() }
     $dynamicFlag = (-not [string]::IsNullOrEmpty($plan.scalingMethod)) -and ($plan.scalingMethod -notmatch '^(?i)Powers?Manage$')
+
+    if (@($plan.refs).Count -eq 0) {
+        $sheets.Add(("=" * 64))
+        $sheets.Add("SCALING PLAN: $($plan.name)   ($($plan.resourceGroup)) - NO HOST POOLS ASSIGNED")
+        $sheets.Add("The plan exists but is not attached to any host pool, so Azure is not")
+        $sheets.Add("scaling anything with it today. Nothing to enter in NME.")
+        if ($dynamicFlag) { $sheets.Add("DYNAMIC plan (scalingMethod '$($plan.scalingMethod)') - if you assign it later, its sheet needs manual review.") }
+        $sheets.Add(("=" * 64)); $sheets.Add("")
+        $unassignedFlags = @('no host pools assigned')
+        if ($dynamicFlag) { $unassignedFlags += 'dynamic plan - manual review' }
+        $review.Add([pscustomobject]@{ Plan=$plan.name; Schedule='(none assigned)'; Days=''; Pool=''; RG=$plan.resourceGroup; EnabledOnPool=''
+            SessionHosts=''; SessionLimit=''; MinActive=''; PreStageHosts=''; ScaleOutBelow=''; ScaleInAbove=''
+            Aggressiveness=''; ScaleInDelay=''; ProfileLB=''; StartVMOnConnect=''; TimeZone=$plan.timeZone
+            Flags=($unassignedFlags -join '; ') })
+        continue
+    }
 
     foreach ($ref in (@($plan.refs) | Sort-Object { "$($_.hostPoolArmPath)" })) {
         $poolIdL = "$($ref.hostPoolArmPath)".ToLowerInvariant()
