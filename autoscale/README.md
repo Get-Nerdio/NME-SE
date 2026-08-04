@@ -99,3 +99,7 @@ Some tenants block Cloud Shell. `fallback/nerdio-scalingplan-translator.kql` run
 ---
 
 *Read-only by design: every call is a read. Version and change notes are in the script header. Sibling tool: [`modeler/`](../modeler/) builds a Nerdio Modeler import from the same environment's actual usage.*
+
+---
+
+*`test/Create-TestScalingPlans.ps1` is a demo-tenant fixture that **creates** two test scaling plans (and removes them with `-Remove`) for exercising this tool. Unlike everything else in this repo, it writes resources — read its header before running. Not needed for normal use.*
