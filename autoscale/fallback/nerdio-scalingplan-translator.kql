@@ -1,0 +1,171 @@
+//==================================================================================
+// SCALING PLAN -> NME AUTO-SCALE SHEET                        v0.2 (2026-08-04)
+// Prints exactly what to type into an NME Auto-Scale Profile so day-one behavior
+// mimics your Azure scaling plan. Read-only. Changes nothing.
+//----------------------------------------------------------------------------------
+// RUN IT
+//  1. Azure portal > search "Resource Graph Explorer" > open it.
+//  2. Top left: set Scope to your directory and subscription(s).
+//  3. Paste this WHOLE file. Run.
+//  4. You get one row per host pool per schedule. Click a row > "See details" >
+//     read the Sheet column top to bottom — it is written in the same order as
+//     NME's Create Auto-Scale Profile screen. (Or Download CSV and read the
+//     Sheet column in a text editor.)
+//
+// READ THE ROWS
+//  - UseAs = "PROFILE + pre-stage"  -> build the profile from this row's Sheet.
+//  - UseAs = "pre-stage schedule only" (weekend/secondary) -> enable
+//    "Use multiple schedules" under Pre-Stage on the SAME profile and add
+//    only that row's PRE-STAGE block.
+//  - UseAs = "SKIP" -> plan assigned but not enabled on that pool. Do nothing.
+//  - Same pool, different Min active between rows? Use the BIGGER number.
+//
+// ACCESS NEEDED: Reader on the subscription(s). No Log Analytics required.
+//----------------------------------------------------------------------------------
+// SCOPE: pooled, power-management plans only. Personal plans excluded (later
+// phase). Dynamic-autoscaling (preview) plans that create/delete hosts are not
+// detected — verify the plan is power management before trusting Base/Burst.
+// Trigger constants: scale-out up to 2 hosts / 5 min; scale-in up to 1 / 15 min.
+//==================================================================================
+let Pools = resources
+    | where type =~ "microsoft.desktopvirtualization/hostpools"
+    | project PoolIdL = tolower(id), PoolName = name, RG = resourceGroup,
+              SubId = subscriptionId,
+              MaxSessionLimit = toint(properties.maxSessionLimit),
+              PoolLB = tostring(properties.loadBalancerType),
+              SVOC = tobool(properties.startVMOnConnect),
+              PoolType = tostring(properties.hostPoolType);
+let HostCounts = desktopvirtualizationresources
+    | where type =~ "microsoft.desktopvirtualization/hostpools/sessionhosts"
+    | extend PoolIdL = tolower(substring(id, 0, indexof(tolower(id), "/sessionhosts")))
+    | summarize SessionHosts = count() by PoolIdL;
+let Refs = resources
+    | where type =~ "microsoft.desktopvirtualization/scalingplans"
+    | where tostring(properties.hostPoolType) =~ "Pooled"
+    | project PlanIdL = tolower(id), PlanName = name,
+              TimeZone = tostring(properties.timeZone),
+              ExclusionTag = tostring(properties.exclusionTag),
+              Refs = properties.hostPoolReferences
+    | mv-expand Ref = Refs
+    | project PlanIdL, PlanName, TimeZone, ExclusionTag,
+              PoolIdL = tolower(tostring(Ref.hostPoolArmPath)),
+              PlanEnabled = tobool(Ref.scalingPlanEnabled);
+let Schedules = desktopvirtualizationresources
+    | where type =~ "microsoft.desktopvirtualization/scalingplans/pooledschedules"
+    | extend PlanIdL = tolower(substring(id, 0, indexof(tolower(id), "/pooledschedules")))
+    | project PlanIdL, ScheduleName = name,
+              Days = properties.daysOfWeek,
+              RuH = toint(properties.rampUpStartTime.hour),   RuM = toint(properties.rampUpStartTime.minute),
+              PkH = toint(properties.peakStartTime.hour),     PkM = toint(properties.peakStartTime.minute),
+              RdH = toint(properties.rampDownStartTime.hour), RdM = toint(properties.rampDownStartTime.minute),
+              OpH = toint(properties.offPeakStartTime.hour),  OpM = toint(properties.offPeakStartTime.minute),
+              RuLB = tostring(properties.rampUpLoadBalancingAlgorithm),
+              PkLB = tostring(properties.peakLoadBalancingAlgorithm),
+              RdLB = tostring(properties.rampDownLoadBalancingAlgorithm),
+              OpLB = tostring(properties.offPeakLoadBalancingAlgorithm),
+              RuMinPct = toint(properties.rampUpMinimumHostsPct),
+              RdMinPct = toint(properties.rampDownMinimumHostsPct),
+              RuT = toint(properties.rampUpCapacityThresholdPct),
+              RdT = toint(properties.rampDownCapacityThresholdPct),
+              ForceLogoff = tobool(properties.rampDownForceLogoffUsers),
+              StopWhen = tostring(properties.rampDownStopHostsWhen),
+              WaitMins = toint(properties.rampDownWaitTimeMinutes),
+              Notify = tostring(properties.rampDownNotificationMessage);
+Refs
+| join kind=inner Pools on PoolIdL
+| join kind=leftouter HostCounts on PoolIdL
+| join kind=inner Schedules on PlanIdL
+| extend B = iff(isnull(SessionHosts), 0, SessionHosts),
+         L = iff(isnull(MaxSessionLimit), 0, MaxSessionLimit),
+         DayCount = array_length(Days)
+// ---- ceil() replacements (ceiling not available in ARG) --------------------------
+| extend MinActiveRaw = todouble(B) * todouble(RdMinPct) / 100.0
+| extend MinActive = toint(MinActiveRaw) + iff(MinActiveRaw > todouble(toint(MinActiveRaw)), 1, 0)
+| extend PreStageRaw = todouble(B) * todouble(RuMinPct) / 100.0
+| extend PreStageHosts = toint(PreStageRaw) + iff(PreStageRaw > todouble(toint(PreStageRaw)), 1, 0)
+| extend XRaw = todouble(B) * todouble(L) * (100.0 - todouble(RuT)) / 100.0
+| extend ScaleOutBelow = toint(XRaw) + iff(XRaw > todouble(toint(XRaw)), 1, 0)
+| extend ScaleInAbove = ScaleOutBelow + L
+// ---- ramp-up -> ramp-down span = pre-stage scale-in delay ------------------------
+| extend SpanMins0 = (RdH * 60 + RdM) - (RuH * 60 + RuM)
+| extend SpanMins = iff(SpanMins0 <= 0, SpanMins0 + 1440, SpanMins0)
+| extend DelayH = SpanMins / 60, DelayM = SpanMins % 60
+// ---- field translations ----------------------------------------------------------
+| extend Aggressiveness = case(
+    ForceLogoff == true, "High",
+    StopWhen =~ "ZeroActiveSessions", "Medium",
+    "Low")
+| extend AggrWhy = case(
+    ForceLogoff == true, "plan forces logoff in ramp-down",
+    StopWhen =~ "ZeroActiveSessions", "plan stops hosts at zero ACTIVE sessions",
+    "plan stops hosts only at zero sessions")
+| extend ProfileLB = case(RuLB =~ "DepthFirst", "Depth First", RuLB =~ "BreadthFirst", "Breadth First", RuLB)
+| extend MsgLine = iff(ForceLogoff == true,
+    strcat("Warn ", WaitMins, " min before scale-in | message: ", Notify),
+    "n/a (plan does not force logoff; never fires at Low/Medium)")
+| extend DaysText = replace_string(replace_string(replace_string(tostring(Days), "\"", ""), "[", ""), "]", "")
+| extend RuTime = strcat(RuH, ":", iff(RuM < 10, strcat("0", tostring(RuM)), tostring(RuM))),
+         RdTime = strcat(RdH, ":", iff(RdM < 10, strcat("0", tostring(RdM)), tostring(RdM)))
+| extend UseAs = case(
+    PlanEnabled != true, "SKIP - plan assigned but NOT enabled on this pool",
+    DayCount >= 3, "PROFILE + pre-stage",
+    "pre-stage schedule only (weekend/secondary)")
+| extend DeviationNotes = strcat(
+    iff(RdLB != RuLB or OpLB != RdLB or PkLB != RuLB,
+        strcat("Azure LB per phase (ru/", RuLB, " pk/", PkLB, " rd/", RdLB, " op/", OpLB, ") -> NME single LB = ", ProfileLB, ", revisit at optimization. "), ""),
+    iff(abs(RdT - RuT) > 10,
+        strcat("Ramp-down threshold ", RdT, "% differs from ramp-up ", RuT, "% by >10pts; trigger uses ", RuT, "%. "), ""),
+    iff(isempty(ExclusionTag), "", strcat("Plan exclusionTag='", ExclusionTag, "': exclude tagged hosts from auto-scale per host in NME. ")),
+    iff(B == 0, "NO SESSION HOSTS FOUND -> all host-count math is 0, investigate. ", ""))
+// ---- the plain-text sheet --------------------------------------------------------
+| extend Sheet1 = strcat(
+    "================================================================\n",
+    "HOST POOL: ", PoolName, "   (", RG, ")\n",
+    "Scaling plan: ", PlanName, " | Schedule: ", ScheduleName, " (", DaysText, ")\n",
+    "Plan enabled here: ", iff(PlanEnabled == true, "YES", "NO - SKIP"), " | Time zone: ", TimeZone, " (enter all times in this zone)\n",
+    "Pool facts: ", B, " session hosts | MaxSessionLimit ", L, " | pool LB ", PoolLB, " | StartVMOnConnect ", iff(SVOC == true, "ON", "OFF"), "\n",
+    "----------------------------------------------------------------\n")
+| extend Sheet2 = strcat(
+    "CREATE AUTO-SCALE PROFILE  (skip this half on secondary-schedule rows)\n",
+    "Auto-scale mode ............. Shared\n",
+    "Name ........................ ", PlanName, "-", ScheduleName, "-mimic\n",
+    "Session limit per host ...... ", L, "\n",
+    "Load balancing .............. ", ProfileLB, "   (plan ramp-up/peak algorithm)\n",
+    "Start VM on connect ......... ", iff(SVOC == true, "ON", "OFF"), "   (pool's current setting)\n",
+    "Measure type ................ Count (default)\n",
+    "Active host defined as ...... AVD agent Available (default)\n",
+    "Base host pool capacity ..... ", B, "   (all existing hosts)\n",
+    "Min active host capacity .... ", MinActive, "   (ramp-down min ", RdMinPct, "% x ", B, "; if schedules disagree use the MAX)\n",
+    "Burst beyond base ........... 0   (plan never creates hosts)\n")
+| extend Sheet3 = strcat(
+    "Trigger ..................... Available sessions\n",
+    "  Scale out: up to 2 hosts if available sessions < ", ScaleOutBelow, "  for 5 min   (keep ", 100 - RuT, "% of ", B, "x", L, " seats free)\n",
+    "  Scale in:  up to 1 host  if available sessions > ", ScaleInAbove, "  for 15 min  (buffer + one host)\n",
+    "Scale in hosts only from .... Any\n",
+    "Scale in aggressiveness ..... ", Aggressiveness, "   (", AggrWhy, ")\n",
+    "Messaging ................... ", MsgLine, "\n",
+    "Rolling drain mode .......... OFF (day one)\n",
+    "Auto-heal broken hosts ...... OFF (day one)\n",
+    "PRE-STAGE SCHEDULE  (add one per schedule row; enable 'Use multiple schedules' if >1)\n",
+    "  Work days: ", DaysText, "\n",
+    "  Start of work hours: ", RuTime, "   (ramp-up start)\n",
+    "  Hosts active by start: ", PreStageHosts, "   (ramp-up min ", RuMinPct, "% x ", B, ")\n",
+    "  Scale-in delay: ", DelayH, " h ", DelayM, " min   (holds floor ", RuTime, " -> ", RdTime, " ramp-down)\n",
+    iff(isempty(DeviationNotes), "", strcat("NOTES: ", DeviationNotes, "\n")),
+    "================================================================")
+| extend Sheet = strcat(Sheet1, Sheet2, Sheet3)
+| project PoolName, RG, PlanName, ScheduleName, DaysText, PlanEnabled, UseAs,
+          SessionHosts = B, SessionLimit = L, MinActive, PreStageHosts,
+          ScaleOutBelow, ScaleInAbove, Aggressiveness, ScaleInDelay = strcat(DelayH, "h", DelayM, "m"),
+          DeviationNotes, Sheet
+| order by PoolName asc, DayCount desc
+//==================================================================================
+// IF IT ERRORS / LOOKS WRONG
+//  - "No tabular expression statement found" (if pasted into Log Analytics):
+//    an empty line split the query — no line may be fully blank; click inside
+//    the query text and Run again.
+//  - Empty results: fix the Scope (top left) — wrong directory or subscriptions.
+//  - "replace_string" unknown: older ARG surface — change the DaysText line to
+//    tostring(Days) and live with the brackets.
+//  - A pool shows 0 session hosts: its hosts aren't registered; numbers will be 0.
+//==================================================================================
