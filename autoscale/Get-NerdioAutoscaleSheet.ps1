@@ -48,6 +48,8 @@
     ./autoscale.ps1 -SubscriptionId 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'
 
 .NOTES
+    v0.2.1 (2026-08-04). Schedule names from the ARM list come back as
+    "plan/schedule" - now displayed as just the schedule name.
     v0.2 (2026-08-04). Output is now a self-contained HTML page styled like
     NME's Create Auto-Scale Profile screen (plus the review CSV). Schedules
     and plan properties are read DIRECTLY from each plan over ARM
@@ -97,7 +99,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:Version = 'v0.2'
+$script:Version = 'v0.2.1'
 if ([string]::IsNullOrEmpty($OutFile)) { $OutFile = "nme-autoscale-profiles-$(Get-Date -Format 'yyyyMMdd-HHmm').html" }
 $csvDir  = [IO.Path]::GetDirectoryName($OutFile)
 $csvBase = [IO.Path]::GetFileNameWithoutExtension($OutFile) + '-review.csv'
@@ -187,6 +189,7 @@ $schedByPlan = @{}
 $schedTotal = 0
 function Add-ScheduleRow {
     param([string]$PlanIdL, [string]$Name, $p)
+    $Name = ($Name -split '/')[-1]   # ARM list returns child names as "plan/schedule"
     if (-not $schedByPlan.ContainsKey($PlanIdL)) { $schedByPlan[$PlanIdL] = New-Object System.Collections.Generic.List[object] }
     $days = @($p.daysOfWeek)
     $schedByPlan[$PlanIdL].Add([pscustomobject]@{
