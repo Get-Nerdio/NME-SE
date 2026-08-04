@@ -48,6 +48,9 @@
     ./autoscale.ps1 -SubscriptionId 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'
 
 .NOTES
+    v0.2.2 (2026-08-04). Dynamic detection moved to where the service actually
+    stores scalingMethod: per SCHEDULE (with a createDelete sizing block, now
+    printed in the note when populated). Plan-level check kept as well.
     v0.2.1 (2026-08-04). Schedule names from the ARM list come back as
     "plan/schedule" - now displayed as just the schedule name.
     v0.2 (2026-08-04). Output is now a self-contained HTML page styled like
@@ -99,7 +102,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:Version = 'v0.2.1'
+$script:Version = 'v0.2.2'
 if ([string]::IsNullOrEmpty($OutFile)) { $OutFile = "nme-autoscale-profiles-$(Get-Date -Format 'yyyyMMdd-HHmm').html" }
 $csvDir  = [IO.Path]::GetDirectoryName($OutFile)
 $csvBase = [IO.Path]::GetFileNameWithoutExtension($OutFile) + '-review.csv'
@@ -210,6 +213,9 @@ function Add-ScheduleRow {
         StopWhen    = "$($p.rampDownStopHostsWhen)"
         WaitMins    = [int]$p.rampDownWaitTimeMinutes
         Notify      = "$($p.rampDownNotificationMessage)"
+        Method      = "$($p.scalingMethod)"                       # live schema: per SCHEDULE, not per plan
+        CDRuMin = $p.createDelete.rampUpMinimumHostPoolSize;  CDRuMax = $p.createDelete.rampUpMaximumHostPoolSize
+        CDRdMin = $p.createDelete.rampDownMinimumHostPoolSize; CDRdMax = $p.createDelete.rampDownMaximumHostPoolSize
     })
     $script:schedTotal++
 }
@@ -329,7 +335,11 @@ foreach ($plan in ($pooledPlans | Sort-Object name)) {
     $scheds = if ($schedByPlan.ContainsKey($planIdL)) {
         @($schedByPlan[$planIdL] | Sort-Object -Property @{Expression='DayCount';Descending=$true}, @{Expression='Name';Descending=$false})
     } else { @() }
-    $dynamicFlag = (-not [string]::IsNullOrEmpty($plan.scalingMethod)) -and ($plan.scalingMethod -notmatch '^(?i)Powers?Manage$')
+    # dynamic detection: the live service stores scalingMethod per SCHEDULE (with a
+    # createDelete sizing block); some surfaces also expose it per plan - check both.
+    $planLevelDynamic  = (-not [string]::IsNullOrEmpty($plan.scalingMethod)) -and ($plan.scalingMethod -notmatch '^(?i)Powers?Manage$')
+    $schedLevelDynamic = @($scheds | Where-Object { $_.Method -match '(?i)CreateDelete' })
+    $dynamicFlag = $planLevelDynamic -or ($schedLevelDynamic.Count -gt 0)
 
     if (@($plan.refs).Count -eq 0) {
         $stubs.Add("<!--stub-unassigned:$($plan.name)--><div class='stub'><b>Scaling plan $(HtmlEnc $plan.name)</b> ($(HtmlEnc $plan.resourceGroup)) &mdash; no host pools assigned. Azure is not scaling anything with it; nothing to enter in NME.$(if ($dynamicFlag) { " <span class='pill high'>DYNAMIC plan</span> If you assign it later, review its card manually." })</div>")
@@ -413,7 +423,16 @@ foreach ($plan in ($pooledPlans | Sort-Object name)) {
         $notes = New-Object System.Collections.Generic.List[string]
         $flags = New-Object System.Collections.Generic.List[string]
         if ($dynamicFlag) {
-            $notes.Add("DYNAMIC plan (scalingMethod '$($plan.scalingMethod)') - it creates/deletes hosts. Base/Burst on this card assume power management only. Review manually before trusting it.")
+            $dynMethod = if ($planLevelDynamic) { $plan.scalingMethod } else { $schedLevelDynamic[0].Method }
+            $cdBits = @()
+            foreach ($ds in $schedLevelDynamic) {
+                $sizes = @()
+                if ($null -ne $ds.CDRuMin -or $null -ne $ds.CDRuMax) { $sizes += "ramp-up pool size $($ds.CDRuMin)-$($ds.CDRuMax)" }
+                if ($null -ne $ds.CDRdMin -or $null -ne $ds.CDRdMax) { $sizes += "ramp-down $($ds.CDRdMin)-$($ds.CDRdMax)" }
+                if ($sizes.Count -gt 0) { $cdBits += "'$($ds.Name)': $($sizes -join ', ')" }
+            }
+            $cdText = if ($cdBits.Count -gt 0) { " Plan create/delete sizing - $($cdBits -join '; ')." } else { '' }
+            $notes.Add("DYNAMIC plan (scalingMethod '$dynMethod') - it creates/deletes hosts. Base/Burst on this card assume power management only.$cdText Review manually before trusting it.")
             $flags.Add('dynamic plan - manual review')
         }
         if ($B -eq 0) {
