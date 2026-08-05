@@ -50,6 +50,10 @@
     ./modeler.ps1 -TimeZone 'America/Chicago' -ModelName 'Contoso - Actuals'
 
 .NOTES
+    v0.8.1 (2026-08-05). ActualMo column now always present in the review CSV
+    (Export-Csv takes columns from the first row; a costless first pool was
+    silently dropping the column for every pool). Empty ActualMo = cost pull
+    skipped for that pool's scope.
     v0.8 (2026-08-05). Work window and work days now qualify by REGULAR load:
     hourly averages include the silent slots, and days count by their share of
     the busiest day's user-hours - so a handful of off-hours logins lands in
@@ -477,6 +481,9 @@ Write-Host ""
 Write-Host "================= REVIEW =================" -ForegroundColor Cyan
 $review | Sort-Object Pool | Format-Table -AutoSize | Out-String -Width 300 | Write-Host
 $reviewFile = ($OutFile -replace '\.json$', '') + '-review.csv'
+# Export-Csv takes its column set from the FIRST row - make ActualMo uniform so the
+# column survives even when the first pool had no cost attribution (empty = skipped).
+foreach ($r in $review) { if (-not $r.PSObject.Properties['ActualMo']) { $r | Add-Member -NotePropertyName ActualMo -NotePropertyValue '' } }
 $review | Sort-Object Pool | Export-Csv -Path $reviewFile
 Write-Ok "Review table (including ActualMo when pulled) also written to: $reviewFile"
 $withUsage = @($review | Where-Object { $_.PeakUsers -gt 0 }).Count
