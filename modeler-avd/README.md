@@ -88,7 +88,7 @@ The goal is a model of how your pools **actually run**, so the Nerdio number is 
 - **SKUs are reported exactly as found** — never substituted. The model uses the Custom workload type, which accepts any AVD SKU.
 - **Disks reported as found** (Premium SSD / Standard SSD / Standard HDD); size snapped **up** to the Modeler's offered tiers (128/256/512/1024/2048/4096 GB) only when the actual size isn't offered. Stopped-disk type is always Standard HDD — disk switching is the Nerdio feature being modeled.
 - **FSLogix profile storage is modeled from the storage itself** — one small "FSLogix — \<share\>" deployment per discovered profile store, carrying the measured GB (see the FSLogix section below). Individual pools keep fsLogix off so storage is never double-counted.
-- Not derivable from Azure, so left for manual touch-up after import: the storage tier dropdown on FSLogix deployments, RDP egress GB (10), custom-image build-VM hours.
+- Not derivable from Azure, so left for manual touch-up after import: RDP egress GB (10), custom-image build-VM hours.
 
 ---
 
@@ -100,7 +100,7 @@ Each discovered profile store becomes one small **"FSLogix — \<share\>"** depl
 
 If your tenant sends file-share diagnostics to Log Analytics (`StorageFileLogs`), the tool also reads which usernames touch which share and names the pools each share serves, right in the deployment name. Without those logs the share appears as "pools not mapped" — a one-line question for whoever runs your AVD ("which pools use this share?") settles it.
 
-One manual step after import: the Modeler's storage-tier dropdown on each FSLogix deployment (the API field is set to a safe default — the review table's Flags column reminds you). Shares are found by name (`profile`, `fslogix`, `user…`) and by tier (premium file storage); if your profiles live somewhere unusual, add the FSLogix numbers by hand in the Modeler.
+The storage tier is read from the storage itself and set exactly: Azure Files Premium LRS or ZRS from the account's SKU, and NetApp Standard / Premium / Ultra from the volume's service level. One caveat: the Modeler offers no standard-tier Azure Files option, so a standard share is modeled at Premium LRS rates on its **used** GB — slightly conservative, and flagged. Shares are found by name (`profile`, `fslogix`, `user…`) and by tier (premium file storage); if your profiles live somewhere unusual, add the FSLogix numbers by hand in the Modeler.
 
 ---
 

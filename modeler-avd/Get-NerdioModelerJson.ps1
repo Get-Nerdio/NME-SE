@@ -50,6 +50,11 @@
     ./modeler.ps1 -TimeZone 'America/Chicago' -ModelName 'Contoso - Actuals'
 
 .NOTES
+    v0.9.1 (2026-08-05). storageType emitted exactly from the storage itself -
+    dropdown enum decoded (1=Files Premium LRS, 2=Files Premium ZRS, 3/4/5=ANF
+    Standard/Premium/Ultra): LRS/ZRS from the account SKU, ANF tier from the
+    volume's service level. The Modeler has no standard-Files option, so
+    standard shares model as Premium LRS on USED GB (flagged, conservative).
     v0.9 (2026-08-05). FSLogix profile storage, modeled from the cost surface:
     discovers Azure Files shares (provisioned + used via share stats) and SMB
     ANF volumes, maps shares to pools from StorageFileLogs usernames when the
@@ -358,11 +363,16 @@ resources
                 if ($null -ne $stProps.shareUsageBytes) { $usedGb = [Math]::Round($stProps.shareUsageBytes / 1GB, 1) }
             }
             $provGb = if ($null -ne $sh.properties.shareQuota) { [int]$sh.properties.shareQuota } else { $null }
+            # Modeler storage enum (dropdown order): 1=Files Premium LRS, 2=Files Premium ZRS,
+            # 3=ANF Standard, 4=ANF Premium, 5=ANF Ultra. No standard-Files option exists.
+            $isZrs = "$($sa.skuName)" -match '(?i)zrs'
             $profileStores.Add([pscustomobject]@{
-                Kind = if ($isPremiumFiles) { 'Azure Files Premium' } else { 'Azure Files Standard' }
+                Kind = if ($isPremiumFiles) { "Azure Files Premium ($(if ($isZrs) { 'ZRS' } else { 'LRS' }))" } else { 'Azure Files Standard' }
                 Account = $sa.name; Share = $shName; RG = $sa.resourceGroup; Region = $sa.location
                 ProvisionedGb = $provGb; UsedGb = $usedGb
                 NameMatch = [bool]($shName -match $profileNameRx)
+                StorageTypeEnum = if ($isPremiumFiles -and $isZrs) { 2 } else { 1 }
+                TierNote = if (-not $isPremiumFiles) { 'standard file share - the Modeler has no standard Files tier, so this is modeled as Azure Files Premium (LRS) on USED GB; slightly conservative' } else { '' }
                 ServesPools = @()
             })
         }
@@ -379,12 +389,15 @@ resources
         $volName = ($v.name -split '/')[-1]
         $isSmb = ((@($v.protocols) | ForEach-Object { "$_" }) -join ',') -match '(?i)cifs|smb'
         if (-not $isSmb) { continue }
+        $anfEnum = switch -Regex ("$($v.serviceLevel)") { '^(?i)standard$' { 3; break } '^(?i)premium$' { 4; break } '^(?i)ultra$' { 5; break } default { 4 } }
         $profileStores.Add([pscustomobject]@{
             Kind = "Azure NetApp Files $($v.serviceLevel)"
             Account = ($v.id -split '/')[-5] + '/' + ($v.id -split '/')[-3]
             Share = $volName; RG = $v.resourceGroup; Region = $v.location
             ProvisionedGb = [int][Math]::Round($v.provisionedBytes / 1GB); UsedGb = $null
             NameMatch = [bool]($volName -match $profileNameRx)
+            StorageTypeEnum = $anfEnum
+            TierNote = if ("$($v.serviceLevel)" -notmatch '^(?i)(standard|premium|ultra)$') { "ANF service level '$($v.serviceLevel)' unrecognized - modeled as ANF Premium; verify" } else { '' }
             ServesPools = @()
         })
     }
@@ -569,7 +582,7 @@ foreach ($ps in $profileStores) {
         }
         image = [ordered]@{ type = 1; isCisHardenedImage = $false }
         autoScale = [ordered]@{ type = 0; workDays = @(1); workStartHour = 9; workStartMinutes = 0; workDurationMinutes = 60 }
-        fsLogix = [ordered]@{ enabled = $true; profileSizeGb = $gbInt; storageType = 1 }
+        fsLogix = [ordered]@{ enabled = $true; profileSizeGb = $gbInt; storageType = $ps.StorageTypeEnum }
         administrative = [ordered]@{ tasks = $adminTasks; hourlyRate = 100; isEnabled = $false }
         savings = [ordered]@{ reservedInstances = [ordered]@{ count = 0; years = 1 } }
     })
@@ -579,7 +592,7 @@ foreach ($ps in $profileStores) {
         Pool = "FSLogix: $storeLabel"; RG = $ps.RG; Type = $ps.Kind; Exp = '-'; Region = $ps.Region
         VmSize = 'Standard_B2s (dummy)'; Limit = '-'; Density = '-'; PerHostPeak = '-'
         PeakUsers = 1; Window = '9:00+1h'; Days = '1'; Overtime = '-'
-        Flags = "profile storage dummy - models $gbInt GB ($provText / $usedText); $servesNote; storageType set to 1 - verify the storage tier in the Modeler's FSLogix dropdown"
+        Flags = "profile storage dummy - models $gbInt GB ($provText / $usedText); $servesNote; storage tier: $($ps.Kind) (storageType $($ps.StorageTypeEnum))$(if ($ps.TierNote) { "; $($ps.TierNote)" })"
     })
 }
 if ($profileStores.Count -gt 0) {
@@ -672,7 +685,7 @@ if ($vmRgGroups.Count -gt 0) {
     Write-Info "Session-host VMs live in these resource groups (Cost Management: filter Resource group to this list, Service name = Virtual Machines + Storage):"
     foreach ($g in $vmRgGroups) { Write-Host ("      {0}  ({1} VM(s))" -f $g.Name, $g.Count) -ForegroundColor Gray }
 }
-Write-Info "After import, touch up: the storage tier on any 'FSLogix - ...' deployments (dropdown), RDP egress GB (10), custom-image VM hours, any '(no usage data)' pools."
+Write-Info "After import, touch up: RDP egress GB (10), custom-image VM hours, any '(no usage data)' pools."
 if (-not $SkipDownload) {
     Invoke-CloudShellDownload -Path $OutFile
     Invoke-CloudShellDownload -Path $reviewFile
