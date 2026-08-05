@@ -50,6 +50,12 @@
     ./modeler.ps1 -TimeZone 'America/Chicago' -ModelName 'Contoso - Actuals'
 
 .NOTES
+    v0.8 (2026-08-05). Work window and work days now qualify by REGULAR load:
+    hourly averages include the silent slots, and days count by their share of
+    the busiest day's user-hours - so a handful of off-hours logins lands in
+    the overtime fields instead of stretching the work window to 24h. New
+    flags: genuine round-the-clock presence; usage too sparse for a window.
+    Field-driven fix from the first real-customer run.
     v0.7 (2026-08-04). Language pass for customer-facing use; default ModelName
     is now "AVD Environment - Actuals".
     v0.6 (2026-08-04). Adds model-vs-actual: last month's ACTUAL spend for the
@@ -275,8 +281,9 @@ let Sessions = ConnRaw | where TimeGenerated > ago(LookbackDays) | where State =
 let Buckets = Sessions | extend Slots = range(bin(StartTime, 15m), bin(EndTime, 15m), 15m) | mv-expand Slot = Slots to typeof(datetime) | summarize ConcurrentUsers = dcount(UserName) by HostPoolId, Slot;
 let PeakPerHost = Sessions | extend Slots = range(bin(StartTime, 15m), bin(EndTime, 15m), 15m) | mv-expand Slot = Slots to typeof(datetime) | summarize HostConcurrent = dcount(UserName) by HostPoolId, SessionHostName, Slot | summarize HostPeak = max(HostConcurrent) by HostPoolId, SessionHostName | summarize PeakUsersPerHost = max(HostPeak) by HostPoolId;
 let Peaks = Buckets | summarize PeakConcurrentUsers = max(ConcurrentUsers) by HostPoolId;
-let WorkDays = Buckets | extend DowN = toint(dayofweek(datetime_utc_to_local(Slot, LocalTimeZone)) / 1d) | summarize DayPeak = max(ConcurrentUsers) by HostPoolId, DowN | join kind=inner Peaks on HostPoolId | where todouble(DayPeak) >= todouble(PeakConcurrentUsers) * WorkDayFloorPct | extend ModelerDay = tolong(iff(DowN == 0, 7, DowN)) | summarize WorkDaysList = array_sort_asc(make_list(ModelerDay)) by HostPoolId;
-let WorkWindow = Buckets | extend LocalSlot = datetime_utc_to_local(Slot, LocalTimeZone) | extend LocalHour = hourofday(LocalSlot), DowN = toint(dayofweek(LocalSlot) / 1d) | extend ModelerDay = tolong(iff(DowN == 0, 7, DowN)) | join kind=inner WorkDays on HostPoolId | where set_has_element(WorkDaysList, ModelerDay) | summarize AvgConcurrent = avg(todouble(ConcurrentUsers)) by HostPoolId, LocalHour | join kind=inner Peaks on HostPoolId | where AvgConcurrent >= todouble(PeakConcurrentUsers) * WorkHourFloorPct | summarize StartHour = min(LocalHour), EndHour = max(LocalHour) by HostPoolId | extend WorkDurationMinutes = (EndHour - StartHour + 1) * 60;
+let DayLoads = Buckets | extend DowN = toint(dayofweek(datetime_utc_to_local(Slot, LocalTimeZone)) / 1d) | summarize DayUH = sum(todouble(ConcurrentUsers)) * 0.25 by HostPoolId, DowN;
+let WorkDays = DayLoads | join kind=inner (DayLoads | summarize MaxDayUH = max(DayUH) by HostPoolId) on HostPoolId | where DayUH >= MaxDayUH * WorkDayFloorPct | extend ModelerDay = tolong(iff(DowN == 0, 7, DowN)) | summarize WorkDaysList = array_sort_asc(make_list(ModelerDay)) by HostPoolId;
+let WorkWindow = Buckets | extend LocalSlot = datetime_utc_to_local(Slot, LocalTimeZone) | extend LocalHour = hourofday(LocalSlot), DowN = toint(dayofweek(LocalSlot) / 1d) | extend ModelerDay = tolong(iff(DowN == 0, 7, DowN)) | join kind=inner WorkDays on HostPoolId | where set_has_element(WorkDaysList, ModelerDay) | extend NWorkDays = todouble(array_length(WorkDaysList)) | summarize SumConcurrent = sum(todouble(ConcurrentUsers)), NWorkDays = take_any(NWorkDays) by HostPoolId, LocalHour | extend AvgConcurrent = SumConcurrent / (WeeksObserved * NWorkDays * 4.0) | join kind=inner Peaks on HostPoolId | where AvgConcurrent >= todouble(PeakConcurrentUsers) * WorkHourFloorPct | summarize StartHour = min(LocalHour), EndHour = max(LocalHour) by HostPoolId | extend WorkDurationMinutes = (EndHour - StartHour + 1) * 60;
 let UsageTotals = Buckets | extend LocalSlot = datetime_utc_to_local(Slot, LocalTimeZone) | extend LocalHour = hourofday(LocalSlot), DowN = toint(dayofweek(LocalSlot) / 1d) | extend ModelerDay = tolong(iff(DowN == 0, 7, DowN)) | join kind=leftouter WorkDays on HostPoolId | join kind=leftouter WorkWindow on HostPoolId | extend InWindow = isnotnull(StartHour) and set_has_element(coalesce(WorkDaysList, dynamic([])), ModelerDay) and LocalHour >= StartHour and LocalHour <= EndHour | summarize TotalUH = sum(todouble(ConcurrentUsers)) * 0.25, InWindowUH = sumif(todouble(ConcurrentUsers), InWindow) * 0.25 by HostPoolId | extend WeeklyUH = round(TotalUH / WeeksObserved, 1), WeeklyInWindowUH = round(InWindowUH / WeeksObserved, 1) | extend WeeklyOffUH = round(WeeklyUH - WeeklyInWindowUH, 1);
 Peaks
 | join kind=leftouter WorkWindow on HostPoolId
@@ -375,6 +382,8 @@ foreach ($p in $pools) {
     if (-not $spec) { $flags += 'VM spec defaulted' }
     if ($diskGb -ne $diskGbRaw) { $flags += "disk $($diskGbRaw)GB snapped up to $($diskGb)GB tier" }
     if ($duration -ne $durationRaw) { $flags += 'window trimmed to the 23:45 UI boundary' }
+    if ($durationRaw -ge 1200) { $flags += "round-the-clock usage ($([Math]::Round($durationRaw/60.0,1))h window) - regular presence at nearly every hour; check for parked/service sessions" }
+    if ($peak -gt 0 -and $u -and ($null -eq $u.StartHour -or "$($u.StartHour)" -eq '')) { $flags += 'usage too sparse to derive a window - defaulted 9:00+9h; all load lands in overtime' }
     $displayName = if ($nameCounts[$p.name] -gt 1) { "$($p.name) ($($p.resourceGroup))" } else { $p.name }
     $depName = if ($peak -eq 0) { "$displayName (no usage data)" } else { $displayName }
     $deployments.Add([ordered]@{

@@ -79,12 +79,14 @@ let PeakPerHost =
 let Peaks =
     Buckets
     | summarize PeakConcurrentUsers = max(ConcurrentUsers) by HostPoolId;
-let WorkDays =
+let DayLoads =
     Buckets
     | extend DowN = toint(dayofweek(datetime_utc_to_local(Slot, LocalTimeZone)) / 1d)
-    | summarize DayPeak = max(ConcurrentUsers) by HostPoolId, DowN
-    | join kind=inner Peaks on HostPoolId
-    | where todouble(DayPeak) >= todouble(PeakConcurrentUsers) * WorkDayFloorPct
+    | summarize DayUH = sum(todouble(ConcurrentUsers)) * 0.25 by HostPoolId, DowN;
+let WorkDays =
+    DayLoads
+    | join kind=inner (DayLoads | summarize MaxDayUH = max(DayUH) by HostPoolId) on HostPoolId
+    | where DayUH >= MaxDayUH * WorkDayFloorPct
     | extend ModelerDay = tolong(iff(DowN == 0, 7, DowN))
     | summarize WorkDaysList = array_sort_asc(make_list(ModelerDay)) by HostPoolId;
 let WorkWindow =
@@ -95,7 +97,9 @@ let WorkWindow =
     | extend ModelerDay = tolong(iff(DowN == 0, 7, DowN))
     | join kind=inner WorkDays on HostPoolId
     | where set_has_element(WorkDaysList, ModelerDay)
-    | summarize AvgConcurrent = avg(todouble(ConcurrentUsers)) by HostPoolId, LocalHour
+    | extend NWorkDays = todouble(array_length(WorkDaysList))
+    | summarize SumConcurrent = sum(todouble(ConcurrentUsers)), NWorkDays = take_any(NWorkDays) by HostPoolId, LocalHour
+    | extend AvgConcurrent = SumConcurrent / (WeeksObserved * NWorkDays * 4.0)
     | join kind=inner Peaks on HostPoolId
     | where AvgConcurrent >= todouble(PeakConcurrentUsers) * WorkHourFloorPct
     | summarize StartHour = min(LocalHour), EndHour = max(LocalHour) by HostPoolId
