@@ -50,6 +50,16 @@
     ./modeler.ps1 -TimeZone 'America/Chicago' -ModelName 'Contoso - Actuals'
 
 .NOTES
+    v0.9 (2026-08-05). FSLogix profile storage, modeled from the cost surface:
+    discovers Azure Files shares (provisioned + used via share stats) and SMB
+    ANF volumes, maps shares to pools from StorageFileLogs usernames when the
+    tenant ships file diagnostics to Log Analytics, and adds ONE dummy
+    deployment per profile store (users=1, profileSizeGb=measured GB, B2s for
+    1h/week - compute noise ~zero). Storage is priced once per share, never
+    per pool, so users in multiple pools can't double-count profile GB.
+    Premium/ANF model PROVISIONED (today's bill); standard models USED.
+    storageType emitted as 1 pending the Modeler dropdown enum - verify tier.
+    All paths skip-graceful; no candidates = model unchanged.
     v0.8.1 (2026-08-05). ActualMo column now always present in the review CSV
     (Export-Csv takes columns from the first row; a costless first pool was
     silently dropping the column for every pool). Empty ActualMo = cost pull
@@ -192,7 +202,7 @@ function Get-ActualCostRows {
 if (-not (Get-AzContext)) { throw "No Azure context. In Cloud Shell this is automatic; locally run Connect-AzAccount first." }
 
 # ------------------------------------------------------------------------- 1. pools
-Write-Info "[1/7] Inventorying host pools via Resource Graph..."
+Write-Info "[1/8] Inventorying host pools via Resource Graph..."
 $pools = Invoke-ArgQuery -Query @"
 resources
 | where type =~ 'microsoft.desktopvirtualization/hostpools'
@@ -206,7 +216,7 @@ if ($pools.Count -eq 0) { throw "No host pools visible. Check subscription acces
 Write-Ok "Found $($pools.Count) host pool(s)."
 
 # ------------------------------------------------------------- 2. session host -> VM
-Write-Info "[2/7] Mapping session hosts to VMs..."
+Write-Info "[2/8] Mapping session hosts to VMs..."
 $sessionHosts = Invoke-ArgQuery -Query @"
 desktopvirtualizationresources
 | where type =~ 'microsoft.desktopvirtualization/hostpools/sessionhosts'
@@ -254,7 +264,7 @@ resources
 Write-Ok "VM specs resolved for $($vmSpecs.Count) session host VM(s)."
 
 # ------------------------------------------- 3. discover diagnostic workspaces per pool
-Write-Info "[3/7] Discovering Log Analytics workspaces from host pool diagnostic settings..."
+Write-Info "[3/8] Discovering Log Analytics workspaces from host pool diagnostic settings..."
 $workspaceIds = @{}   # workspaceResourceId -> $true
 foreach ($p in $pools) {
     try {
@@ -273,7 +283,7 @@ if ($workspaceIds.Count -eq 0) {
 }
 
 # ------------------------------------------------------------- 4. usage per workspace
-Write-Info "[4/7] Querying $LookbackDays days of WVDConnections concurrency..."
+Write-Info "[4/8] Querying $LookbackDays days of WVDConnections concurrency..."
 $telemetryKql = @'
 let LookbackDays = __LOOKBACK__d;
 let LocalTimeZone = '__TZ__';
@@ -317,8 +327,117 @@ foreach ($wsId in $workspaceIds.Keys) {
     }
 }
 
-# --------------------------------------------------------------- 5. assemble the model
-Write-Info "[5/7] Assembling deployments..."
+# ------------------------------------------ 5. FSLogix profile storage discovery
+# FSLogix configuration (VHDLocations) lives in GPO/Intune - invisible to Azure.
+# The COST surface is visible: profiles live on Azure Files shares / ANF volumes.
+# Discover candidates, measure provisioned + used, and (when the tenant ships
+# StorageFileLogs to Log Analytics) map shares to pools from observed usernames.
+# Everything here is skip-graceful: no candidates -> model unchanged, note printed.
+Write-Info "[5/8] Discovering FSLogix profile storage (Azure Files + ANF)..."
+$profileStores = [System.Collections.Generic.List[object]]::new()
+$profileNameRx = '(?i)prof|fslogix|upd|userdisk|usrprof'
+try {
+    $storAccts = Invoke-ArgQuery -Query @'
+resources
+| where type =~ 'microsoft.storage/storageaccounts'
+| project id, name, resourceGroup, location, kind = tostring(kind), skuName = tostring(sku.name)
+'@
+    foreach ($sa in $storAccts) {
+        $isPremiumFiles = $sa.kind -match '^(?i)FileStorage$'
+        $shResp = Invoke-AzRestMethod -Method GET -Path "$($sa.id)/fileServices/default/shares?api-version=2023-01-01"
+        if ($shResp.StatusCode -ne 200) { continue }   # no file service or not visible
+        foreach ($sh in @((($shResp.Content | ConvertFrom-Json).value))) {
+            $shName = "$($sh.name)"
+            $smb = ($null -eq $sh.properties.enabledProtocols) -or ("$($sh.properties.enabledProtocols)" -match '(?i)smb')
+            if (-not $smb) { continue }
+            if (-not ($isPremiumFiles -or $shName -match $profileNameRx)) { continue }
+            $usedGb = $null
+            $stResp = Invoke-AzRestMethod -Method GET -Path "$($sa.id)/fileServices/default/shares/$($shName)?api-version=2023-01-01&`$expand=stats"
+            if ($stResp.StatusCode -eq 200) {
+                $stProps = ($stResp.Content | ConvertFrom-Json).properties
+                if ($null -ne $stProps.shareUsageBytes) { $usedGb = [Math]::Round($stProps.shareUsageBytes / 1GB, 1) }
+            }
+            $provGb = if ($null -ne $sh.properties.shareQuota) { [int]$sh.properties.shareQuota } else { $null }
+            $profileStores.Add([pscustomobject]@{
+                Kind = if ($isPremiumFiles) { 'Azure Files Premium' } else { 'Azure Files Standard' }
+                Account = $sa.name; Share = $shName; RG = $sa.resourceGroup; Region = $sa.location
+                ProvisionedGb = $provGb; UsedGb = $usedGb
+                NameMatch = [bool]($shName -match $profileNameRx)
+                ServesPools = @()
+            })
+        }
+    }
+    $anfVols = Invoke-ArgQuery -Query @'
+resources
+| where type =~ 'microsoft.netapp/netappaccounts/capacitypools/volumes'
+| project id, name, resourceGroup, location,
+          provisionedBytes = tolong(properties.usageThreshold),
+          protocols = properties.protocolTypes,
+          serviceLevel = tostring(properties.serviceLevel)
+'@
+    foreach ($v in $anfVols) {
+        $volName = ($v.name -split '/')[-1]
+        $isSmb = ((@($v.protocols) | ForEach-Object { "$_" }) -join ',') -match '(?i)cifs|smb'
+        if (-not $isSmb) { continue }
+        $profileStores.Add([pscustomobject]@{
+            Kind = "Azure NetApp Files $($v.serviceLevel)"
+            Account = ($v.id -split '/')[-5] + '/' + ($v.id -split '/')[-3]
+            Share = $volName; RG = $v.resourceGroup; Region = $v.location
+            ProvisionedGb = [int][Math]::Round($v.provisionedBytes / 1GB); UsedGb = $null
+            NameMatch = [bool]($volName -match $profileNameRx)
+            ServesPools = @()
+        })
+    }
+} catch {
+    Write-Warn2 "Profile storage discovery failed ($($_.Exception.Message)) - continuing without FSLogix modeling."
+}
+
+# ---- share -> pool mapping from StorageFileLogs (only when the logs exist) -------
+if ($profileStores.Count -gt 0 -and $workspaceIds.Keys.Count -gt 0) {
+    Write-Info "      Checking Log Analytics for file-access logs (share -> pool mapping)..."
+    $mapKql = @'
+let LookbackDays = __LOOKBACK__d;
+let FileOps = union isfuzzy=true (datatable(TimeGenerated:datetime, AccountName:string, ObjectKey:string)[]), (StorageFileLogs | project TimeGenerated, AccountName, ObjectKey);
+let ShareUsers = FileOps | where TimeGenerated > ago(LookbackDays) | extend Parts = split(ObjectKey, '/') | extend Share = tolower(tostring(Parts[2])) | extend U1 = extract(@'(?i)Profiles?[_-]([^/\\.]+)\.vhdx?', 1, ObjectKey) | extend U2 = extract(@'(?i)/([^/]+?)_S-1-[0-9-]+', 1, ObjectKey) | extend UserGuess = tolower(coalesce(U1, U2)) | where isnotempty(UserGuess) and isnotempty(Share) | summarize by AccountName = tolower(AccountName), Share, UserGuess;
+let PoolUsers = union isfuzzy=true (datatable(TimeGenerated:datetime, State:string, UserName:string, _ResourceId:string)[]), (WVDConnections | project TimeGenerated, State, UserName, _ResourceId) | where TimeGenerated > ago(LookbackDays) | where State == 'Connected' | summarize by HostPoolId = tolower(_ResourceId), UserGuess = tolower(tostring(split(UserName, '@')[0]));
+ShareUsers | join kind=inner PoolUsers on UserGuess | summarize Overlap = dcount(UserGuess) by AccountName, Share, HostPoolId
+'@
+    $mapKql = $mapKql.Replace('__LOOKBACK__', "$LookbackDays")
+    $mapRows = [System.Collections.Generic.List[object]]::new()
+    foreach ($wsId in $workspaceIds.Keys) {
+        try {
+            $wsResp = Invoke-AzRestMethod -Method GET -Path "$wsId`?api-version=2021-06-01"
+            if ($wsResp.StatusCode -ne 200) { continue }
+            $customerId = ($wsResp.Content | ConvertFrom-Json).properties.customerId
+            $result = Invoke-AzOperationalInsightsQuery -WorkspaceId $customerId -Query $mapKql
+            foreach ($row in @($result.Results)) { $mapRows.Add($row) }
+        } catch { }
+    }
+    if ($mapRows.Count -gt 0) {
+        $poolNameById = @{}
+        foreach ($p in $pools) { $poolNameById["$($p.id)".ToLowerInvariant()] = $p.name }
+        foreach ($ps in $profileStores) {
+            $hits = @($mapRows | Where-Object { "$($_.AccountName)" -eq $ps.Account.ToLowerInvariant() -and "$($_.Share)" -eq $ps.Share.ToLowerInvariant() -and [int]$_.Overlap -ge 2 } |
+                     Sort-Object { -[int]$_.Overlap })
+            $ps.ServesPools = @($hits | ForEach-Object { $poolNameById["$($_.HostPoolId)".ToLowerInvariant()] } | Where-Object { $_ } | Select-Object -Unique -First 6)
+        }
+        Write-Ok "File-access logs found - $(@($profileStores | Where-Object { $_.ServesPools.Count -gt 0 }).Count) share(s) mapped to pools by observed users."
+    } else {
+        Write-Info "      No StorageFileLogs data (file-share diagnostics not enabled) - shares reported unmapped; confirm pool assignment with the AVD admin."
+    }
+}
+if ($profileStores.Count -gt 0) {
+    $profileStores | Select-Object Kind, Account, Share, Region, ProvisionedGb, UsedGb, @{n='ServesPools'; e={ $_.ServesPools -join ', ' }} |
+        Format-Table -AutoSize | Out-String -Width 220 | Write-Host
+    $gap = 0.0
+    foreach ($ps in $profileStores) { if ($ps.Kind -notmatch 'Standard$' -and $null -ne $ps.ProvisionedGb -and $null -ne $ps.UsedGb) { $gap += [Math]::Max(0, $ps.ProvisionedGb - $ps.UsedGb) } }
+    if ($gap -gt 0) { Write-Info "Provisioned-over-used gap across premium profile storage: $([Math]::Round($gap)) GB - the gap Nerdio storage auto-scale reclaims." }
+} else {
+    Write-Info "No FSLogix profile storage candidates found - fsLogix stays off in the model (add by hand in the Modeler if profiles live outside Azure's view)."
+}
+
+# --------------------------------------------------------------- 6. assemble the model
+Write-Info "[6/8] Assembling deployments..."
 $adminTasks = @'
 {"0":[{"id":0,"isEnabled":true,"hoursWithoutNerdio":5,"hoursWithNerdio":0.5},{"id":1,"isEnabled":true,"hoursWithoutNerdio":2,"hoursWithNerdio":0.5},{"id":2,"isEnabled":true,"hoursWithoutNerdio":16,"hoursWithNerdio":4},{"id":3,"isEnabled":true,"hoursWithoutNerdio":20,"hoursWithNerdio":0.5},{"id":4,"isEnabled":false,"hoursWithoutNerdio":0,"hoursWithNerdio":2},{"id":5,"isEnabled":true,"hoursWithoutNerdio":16,"hoursWithNerdio":4}],"1":[{"id":6,"isEnabled":true,"hoursWithoutNerdio":5,"hoursWithNerdio":0.5},{"id":7,"isEnabled":true,"hoursWithoutNerdio":10,"hoursWithNerdio":2},{"id":8,"isEnabled":true,"hoursWithoutNerdio":3,"hoursWithNerdio":0.5},{"id":9,"isEnabled":true,"hoursWithoutNerdio":2,"hoursWithNerdio":0.5},{"id":10,"isEnabled":true,"hoursWithoutNerdio":3,"hoursWithNerdio":5}],"2":[{"id":11,"isEnabled":true,"hoursWithoutNerdio":10,"hoursWithNerdio":2.5},{"id":12,"isEnabled":true,"hoursWithoutNerdio":8,"hoursWithNerdio":0.5},{"id":13,"isEnabled":true,"hoursWithoutNerdio":10,"hoursWithNerdio":0.5},{"id":14,"isEnabled":true,"hoursWithoutNerdio":8,"hoursWithNerdio":2},{"id":15,"isEnabled":true,"hoursWithoutNerdio":5,"hoursWithNerdio":1},{"id":16,"isEnabled":true,"hoursWithoutNerdio":20,"hoursWithNerdio":2},{"id":17,"isEnabled":true,"hoursWithoutNerdio":3,"hoursWithNerdio":0.5},{"id":18,"isEnabled":true,"hoursWithoutNerdio":10,"hoursWithNerdio":2},{"id":19,"isEnabled":true,"hoursWithoutNerdio":2.5,"hoursWithNerdio":0.5},{"id":20,"isEnabled":true,"hoursWithoutNerdio":8,"hoursWithNerdio":2},{"id":21,"isEnabled":true,"hoursWithoutNerdio":2,"hoursWithNerdio":0.5},{"id":22,"isEnabled":true,"hoursWithoutNerdio":3,"hoursWithNerdio":0},{"id":23,"isEnabled":true,"hoursWithoutNerdio":3,"hoursWithNerdio":0.5},{"id":24,"isEnabled":true,"hoursWithoutNerdio":5,"hoursWithNerdio":1},{"id":25,"isEnabled":true,"hoursWithoutNerdio":2,"hoursWithNerdio":1},{"id":26,"isEnabled":false,"hoursWithoutNerdio":0,"hoursWithNerdio":0.5}]}
 '@ | ConvertFrom-Json
@@ -415,6 +534,58 @@ foreach ($p in $pools) {
         Overtime = "$otPct% x $($otHours)h"; Flags = ($flags -join '; ')
     })
 }
+# ---- FSLogix dummy deployments: one per profile store ----------------------------
+# Priced once per share (never per pool - the same user in two pools would double-
+# count profile GB). users=1 + profileSizeGb=measured keeps license/compute noise
+# at zero; compute floor is a B2s for one hour on Mondays. Import-tested shape.
+$shareNameCounts = @{}
+foreach ($ps in $profileStores) { $shareNameCounts[$ps.Share] = 1 + ($shareNameCounts[$ps.Share] ?? 0) }
+foreach ($ps in $profileStores) {
+    # premium/ANF bill provisioned; standard bills used - model what they pay today
+    $gb = if ($ps.Kind -match '(?i)Premium|NetApp') { $ps.ProvisionedGb ?? $ps.UsedGb } else { $ps.UsedGb ?? $ps.ProvisionedGb }
+    $storeLabel = if ($shareNameCounts[$ps.Share] -gt 1) { "$($ps.Account)/$($ps.Share)" } else { $ps.Share }
+    if ($null -eq $gb -or [double]$gb -lt 1) {
+        $review.Add([pscustomobject]@{
+            Pool = "FSLogix: $storeLabel"; RG = $ps.RG; Type = $ps.Kind; Exp = '-'; Region = $ps.Region
+            VmSize = '-'; Limit = '-'; Density = '-'; PerHostPeak = '-'
+            PeakUsers = '-'; Window = '-'; Days = '-'; Overtime = '-'
+            Flags = 'profile storage candidate found but size unreadable - not modeled; check access to share stats'
+        })
+        continue
+    }
+    $gbInt = [int][Math]::Max(1, [Math]::Round([double]$gb))
+    $servesNote = if ($ps.ServesPools.Count -gt 0) { "serves: $($ps.ServesPools -join ', ')" } else { 'pools not mapped - confirm with the AVD admin which pools use this share' }
+    $nameServes = if ($ps.ServesPools.Count -gt 0) { " ($(@($ps.ServesPools | Select-Object -First 3) -join ', ')$(if ($ps.ServesPools.Count -gt 3) { " +$($ps.ServesPools.Count - 3)" }))" } else { '' }
+    $deployments.Add([ordered]@{
+        mode = 'avd'
+        name = "FSLogix - $storeLabel$nameServes"
+        users = [ordered]@{ total = 1; absentPercent = 0; overtimeEnabled = $false; overtimePercent = 0; overtimeHours = 0 }
+        experience = 1
+        region = $ps.Region
+        workload = [ordered]@{
+            type = 5; vmSize = 'Standard_B2s'
+            disk = [ordered]@{ isEphemeral = $false; size = 128; type = 'Standard_LRS' }
+            maxUsersPerVCpu = 1; stoppedDiskType = 'Standard_LRS'; rdpEgressGb = 10
+        }
+        image = [ordered]@{ type = 1; isCisHardenedImage = $false }
+        autoScale = [ordered]@{ type = 0; workDays = @(1); workStartHour = 9; workStartMinutes = 0; workDurationMinutes = 60 }
+        fsLogix = [ordered]@{ enabled = $true; profileSizeGb = $gbInt; storageType = 1 }
+        administrative = [ordered]@{ tasks = $adminTasks; hourlyRate = 100; isEnabled = $false }
+        savings = [ordered]@{ reservedInstances = [ordered]@{ count = 0; years = 1 } }
+    })
+    $provText = if ($null -ne $ps.ProvisionedGb) { "$($ps.ProvisionedGb)GB prov" } else { 'prov n/a' }
+    $usedText = if ($null -ne $ps.UsedGb) { "$($ps.UsedGb)GB used" } else { 'used n/a' }
+    $review.Add([pscustomobject]@{
+        Pool = "FSLogix: $storeLabel"; RG = $ps.RG; Type = $ps.Kind; Exp = '-'; Region = $ps.Region
+        VmSize = 'Standard_B2s (dummy)'; Limit = '-'; Density = '-'; PerHostPeak = '-'
+        PeakUsers = 1; Window = '9:00+1h'; Days = '1'; Overtime = '-'
+        Flags = "profile storage dummy - models $gbInt GB ($provText / $usedText); $servesNote; storageType set to 1 - verify the storage tier in the Modeler's FSLogix dropdown"
+    })
+}
+if ($profileStores.Count -gt 0) {
+    Write-Ok "Added $(@($deployments | Where-Object { $_.name -like 'FSLogix - *' }).Count) FSLogix storage deployment(s) - compute noise ~zero (1 user, B2s, 1h/week); pools' own fsLogix stays off so storage is never double-counted."
+}
+
 $model = [ordered]@{
     schema = 4
     name = $ModelName
@@ -424,12 +595,12 @@ $model = [ordered]@{
 }
 
 # ------------------------------------------------------------------- 6. output + download
-Write-Info "[6/7] Writing $OutFile..."
+Write-Info "[7/8] Writing $OutFile..."
 $model | ConvertTo-Json -Depth 30 -Compress | Out-File -FilePath $OutFile -Encoding utf8NoBOM
 
 # ---------------------------------------- 7. actual spend (optional, skip-safe)
 if (-not $SkipCosts) {
-    Write-Info "[7/7] Pulling last month's ACTUAL spend for session-host VMs + disks (skips any scope without cost visibility)..."
+    Write-Info "[8/8] Pulling last month's ACTUAL spend for session-host VMs + disks (skips any scope without cost visibility)..."
     $costByResource = @{}
     $costCurrency = ''
     $rgScopes = @{}
@@ -501,7 +672,7 @@ if ($vmRgGroups.Count -gt 0) {
     Write-Info "Session-host VMs live in these resource groups (Cost Management: filter Resource group to this list, Service name = Virtual Machines + Storage):"
     foreach ($g in $vmRgGroups) { Write-Host ("      {0}  ({1} VM(s))" -f $g.Name, $g.Count) -ForegroundColor Gray }
 }
-Write-Info "After import, touch up: FSLogix (off by default), RDP egress GB (10), custom-image VM hours, any '(no usage data)' pools."
+Write-Info "After import, touch up: the storage tier on any 'FSLogix - ...' deployments (dropdown), RDP egress GB (10), custom-image VM hours, any '(no usage data)' pools."
 if (-not $SkipDownload) {
     Invoke-CloudShellDownload -Path $OutFile
     Invoke-CloudShellDownload -Path $reviewFile

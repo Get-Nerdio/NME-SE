@@ -72,7 +72,8 @@ Nothing needs to be installed: Cloud Shell ships every module the script uses, a
 3. **Workspace discovery** — reads every host pool's diagnostic settings and finds **all** Log Analytics workspaces receiving AVD telemetry. No "which workspace?" hunting; environments that split pools across workspaces are handled automatically.
 4. **Usage** — 30 days of `WVDConnections` per workspace: 15-minute concurrency buckets (distinct users) produce peak concurrent users, observed work days (days reaching ≥25% of pool peak), the observed work window (hours ≥20% of peak, measured on primary days), weekly in-window vs. off-window user-hours, and peak concurrent users on any single host.
 5. **Assembly** — the modeling rules below, a flag for every default.
-6. **Actual spend** — last calendar month's cost for exactly those session-host VMs and OS disks, per resource group, via the Cost Management Query API (see below).
+6. **Profile storage** — Azure Files shares and SMB NetApp volumes that hold FSLogix profiles, with provisioned and used capacity — and, when file-access diagnostics flow to Log Analytics, which host pools use each share (see the FSLogix section below).
+7. **Actual spend** — last calendar month's cost for exactly those session-host VMs and OS disks, per resource group, via the Cost Management Query API (see below).
 
 ---
 
@@ -86,7 +87,20 @@ The goal is a model of how your pools **actually run**, so the Nerdio number is 
 - **Density (users per vCPU) = observed peak users on a single host** (capped at the configured session limit), because how your hosts are actually packed is what the model should price. Falls back to session limit ÷ vCPUs when there's no telemetry; last resort 1.0 — both fallbacks flagged. The review table shows `PerHostPeak` next to `Limit`: the gap between them is density headroom.
 - **SKUs are reported exactly as found** — never substituted. The model uses the Custom workload type, which accepts any AVD SKU.
 - **Disks reported as found** (Premium SSD / Standard SSD / Standard HDD); size snapped **up** to the Modeler's offered tiers (128/256/512/1024/2048/4096 GB) only when the actual size isn't offered. Stopped-disk type is always Standard HDD — disk switching is the Nerdio feature being modeled.
-- Not derivable from Azure, so left for manual touch-up after import: FSLogix (defaults off), RDP egress GB (10), custom-image build-VM hours.
+- **FSLogix profile storage is modeled from the storage itself** — one small "FSLogix — \<share\>" deployment per discovered profile store, carrying the measured GB (see the FSLogix section below). Individual pools keep fsLogix off so storage is never double-counted.
+- Not derivable from Azure, so left for manual touch-up after import: the storage tier dropdown on FSLogix deployments, RDP egress GB (10), custom-image build-VM hours.
+
+---
+
+## FSLogix profile storage
+
+FSLogix's *configuration* lives in Group Policy or Intune — nothing in Azure says "this pool uses FSLogix," and this tool will not reach inside session hosts to look. What Azure does show, with the same Reader access, is the *storage the profiles live on*: Azure Files shares (provisioned quota and actual used bytes) and SMB NetApp volumes. That's the part that costs money, so that's what gets modeled.
+
+Each discovered profile store becomes one small **"FSLogix — \<share\>"** deployment in the import: 1 user, the share's measured GB as the profile size, and a deliberately negligible compute footprint (one B2s, one hour a week — cents). Storage is priced **once per share**, never spread across pools — spreading per-user costs across pools would double-count everyone who uses more than one pool. Premium shares and NetApp volumes model their **provisioned** capacity (what's billed today); standard shares model **used**. The review table shows provisioned next to used — on premium storage, that gap is exactly what Nerdio's storage auto-scale reclaims.
+
+If your tenant sends file-share diagnostics to Log Analytics (`StorageFileLogs`), the tool also reads which usernames touch which share and names the pools each share serves, right in the deployment name. Without those logs the share appears as "pools not mapped" — a one-line question for whoever runs your AVD ("which pools use this share?") settles it.
+
+One manual step after import: the Modeler's storage-tier dropdown on each FSLogix deployment (the API field is set to a safe default — the review table's Flags column reminds you). Shares are found by name (`profile`, `fslogix`, `user…`) and by tier (premium file storage); if your profiles live somewhere unusual, add the FSLogix numbers by hand in the Modeler.
 
 ---
 
@@ -122,6 +136,8 @@ Fallback caveats vs. the script: you find the workspace yourself, extra workspac
 | Cost lines skipped with an error message | Billing-side policy or unsupported offer (see cost section); everything else completed |
 | A pool shows defaults with `VM spec defaulted` | Pool has no registered session hosts to sample |
 | Peak = 1 pools show odd windows | With one observed user, any active hour counts as "working" — noise on near-idle pools, meaningless at real load |
+| No `FSLogix - ...` deployments appeared | No premium file shares, profile-named shares, or SMB NetApp volumes are visible to this account — if profiles exist elsewhere, add FSLogix by hand in the Modeler |
+| FSLogix rows say `pools not mapped` | File-share diagnostics aren't flowing to Log Analytics, so share→pool mapping has no evidence — the storage cost is still correct; ask your AVD admin which pools use the share |
 | Auto-download didn't fire | Use Cloud Shell's **Manage files → Download** and enter the printed filename |
 
 ---
