@@ -50,6 +50,10 @@
     ./modeler.ps1 -TimeZone 'America/Chicago' -ModelName 'Contoso - Actuals'
 
 .NOTES
+    v0.10 (2026-08-05). One-file handoff: the run's console output is captured
+    (transcript, ANSI-stripped) and packaged with the JSON + review CSV into
+    modeler-import-<ts>.zip - one download, one file to send back. Degrades
+    to individual downloads if transcription or zipping is unavailable.
     v0.9.1 (2026-08-05). storageType emitted exactly from the storage itself -
     dropdown enum decoded (1=Files Premium LRS, 2=Files Premium ZRS, 3/4/5=ANF
     Standard/Premium/Ultra): LRS/ZRS from the account SKU, ANF tier from the
@@ -128,6 +132,12 @@ if ([string]::IsNullOrEmpty($OutFile)) { $OutFile = "modeler-import-$(Get-Date -
 function Write-Info { param([string]$m) Write-Host "[i] $m" -ForegroundColor Gray }
 function Write-Ok   { param([string]$m) Write-Host "[+] $m" -ForegroundColor Green }
 function Write-Warn2{ param([string]$m) Write-Host "[!] $m" -ForegroundColor Yellow }
+
+# --- console transcript: captured into the output zip so one run = one file back ---
+$script:TranscriptFile = ($OutFile -replace '\.json$', '') + '-console.log'
+$script:TranscriptOn = $false
+try { Start-Transcript -Path $script:TranscriptFile -Force | Out-Null; $script:TranscriptOn = $true }
+catch { Write-Warn2 "Console transcript unavailable ($($_.Exception.Message)) - the zip will omit the run log." }
 
 # --- Cloud Shell detection + auto-download (same pattern as Test-NmeDeploymentReadiness) ---
 $script:IsCloudShell = (-not [string]::IsNullOrEmpty($env:ACC_CLOUD)) -or ($env:AZUREPS_HOST_ENVIRONMENT -like "cloud-shell*")
@@ -686,7 +696,29 @@ if ($vmRgGroups.Count -gt 0) {
     foreach ($g in $vmRgGroups) { Write-Host ("      {0}  ({1} VM(s))" -f $g.Name, $g.Count) -ForegroundColor Gray }
 }
 Write-Info "After import, touch up: RDP egress GB (10), custom-image VM hours, any '(no usage data)' pools."
+# ---- one-file handoff: zip = model JSON + review CSV + console log ---------------
+$zipFile = ($OutFile -replace '\.json$', '') + '.zip'
+if ($script:TranscriptOn) {
+    try { Stop-Transcript | Out-Null } catch { }
+    $script:TranscriptOn = $false
+    try {
+        $rawLog = Get-Content -LiteralPath $script:TranscriptFile -Raw
+        Set-Content -LiteralPath $script:TranscriptFile -Value ($rawLog -replace "`e\[[0-9;]*[A-Za-z]", '') -Encoding utf8
+    } catch { }
+}
+$zipOk = $false
+try {
+    $zipItems = @(@($OutFile, $reviewFile, $script:TranscriptFile) | Where-Object { $_ -and (Test-Path -LiteralPath $_) })
+    Compress-Archive -Path $zipItems -DestinationPath $zipFile -Force
+    $zipOk = $true
+    Write-Ok "Packaged into one file: $zipFile (model JSON + review CSV + console log)"
+    Write-Info "Send that single zip back - it carries the model, the review table, and the full run log."
+} catch {
+    Write-Warn2 "Could not build the zip ($($_.Exception.Message)) - files download individually."
+}
 if (-not $SkipDownload) {
-    Invoke-CloudShellDownload -Path $OutFile
-    Invoke-CloudShellDownload -Path $reviewFile
+    if ($zipOk) { Invoke-CloudShellDownload -Path $zipFile }
+    else { Invoke-CloudShellDownload -Path $OutFile; Invoke-CloudShellDownload -Path $reviewFile }
+} else {
+    Write-Info "Downloads skipped (-SkipDownload). In the session: $(if ($zipOk) { $zipFile } else { \"$OutFile, $reviewFile\" })"
 }

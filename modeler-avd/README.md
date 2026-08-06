@@ -18,8 +18,8 @@ A cost model is only as credible as the data behind it. This tool feeds the Mode
    ```
 
 3. Read the review table it prints (one row per pool — anything defaulted is spelled out in `Flags`).
-4. Two files download automatically: `modeler-import-<timestamp>.json` and `modeler-import-<timestamp>-review.csv`.
-5. Nerdio Modeler → **Import** → pick the JSON. Done.
+4. One zip downloads automatically: `modeler-import-<timestamp>.zip` — the import JSON, the review CSV, and the run's full console log. If someone asked you to run this, **that zip is the only thing to send back**.
+5. Nerdio Modeler → **Import** → pick the JSON (from the zip). Done.
 
 Prefer to read code before running it (you should):
 

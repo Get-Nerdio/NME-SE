@@ -17,7 +17,7 @@ Moving from native scaling plans to NME auto-scale shouldn't change how your env
    iex (irm 'https://raw.githubusercontent.com/dclawrence003/NME/main/autoscale/Get-NerdioAutoscaleSheet.ps1')
    ```
 
-3. A review table prints (one row per pool + schedule), and two files download automatically: `nme-autoscale-profiles-<timestamp>.html` and `...-review.csv`.
+3. A review table prints (one row per pool + schedule), and one zip downloads automatically: `nme-autoscale-profiles-<timestamp>.zip` — the HTML, the review CSV, and the run's console log. If someone asked you to run this, that zip is the only thing to send back.
 4. Open the HTML. For each host pool, open its Auto-scale settings in NME and enter the card top to bottom — toggles, pills, and day chips read exactly as the NME controls do.
 
 Prefer to read code before running it (you should):

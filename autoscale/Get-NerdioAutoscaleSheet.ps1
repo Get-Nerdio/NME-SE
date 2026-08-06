@@ -48,6 +48,10 @@
     ./autoscale.ps1 -SubscriptionId 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'
 
 .NOTES
+    v0.3 (2026-08-05). One-file handoff: console output captured (transcript,
+    ANSI-stripped) and packaged with the HTML + review CSV into a single zip -
+    one download, one file to send back. Degrades to individual downloads if
+    transcription or zipping is unavailable.
     v0.2.2 (2026-08-04). Dynamic detection moved to where the service actually
     stores scalingMethod: per SCHEDULE (with a createDelete sizing block, now
     printed in the note when populated). Plan-level check kept as well.
@@ -102,7 +106,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:Version = 'v0.2.2'
+$script:Version = 'v0.3'
 if ([string]::IsNullOrEmpty($OutFile)) { $OutFile = "nme-autoscale-profiles-$(Get-Date -Format 'yyyyMMdd-HHmm').html" }
 $csvDir  = [IO.Path]::GetDirectoryName($OutFile)
 $csvBase = [IO.Path]::GetFileNameWithoutExtension($OutFile) + '-review.csv'
@@ -111,6 +115,12 @@ $csvFile = if ([string]::IsNullOrEmpty($csvDir)) { $csvBase } else { [IO.Path]::
 function Write-Info { param([string]$m) Write-Host "[i] $m" -ForegroundColor Gray }
 function Write-Ok   { param([string]$m) Write-Host "[+] $m" -ForegroundColor Green }
 function Write-Warn2{ param([string]$m) Write-Host "[!] $m" -ForegroundColor Yellow }
+
+# --- console transcript: captured into the output zip so one run = one file back ---
+$script:TranscriptFile = ($OutFile -replace '\.html$', '') + '-console.log'
+$script:TranscriptOn = $false
+try { Start-Transcript -Path $script:TranscriptFile -Force | Out-Null; $script:TranscriptOn = $true }
+catch { Write-Warn2 "Console transcript unavailable ($($_.Exception.Message)) - the zip will omit the run log." }
 
 # --- Cloud Shell detection + auto-download (same pattern as the modeler tool) ---
 $script:IsCloudShell = (-not [string]::IsNullOrEmpty($env:ACC_CLOUD)) -or ($env:AZUREPS_HOST_ENVIRONMENT -like "cloud-shell*")
@@ -665,9 +675,29 @@ if ($noPlanPools.Count -gt 0) {
 }
 Write-Info "Open the HTML and key each card into NME. Cards are day-one mimicry; optimize with Nerdio telemetry after."
 
+# ---- one-file handoff: zip = profile HTML + review CSV + console log ---------------
+$zipFile = ($OutFile -replace '\.html$', '') + '.zip'
+if ($script:TranscriptOn) {
+    try { Stop-Transcript | Out-Null } catch { }
+    $script:TranscriptOn = $false
+    try {
+        $rawLog = Get-Content -LiteralPath $script:TranscriptFile -Raw
+        Set-Content -LiteralPath $script:TranscriptFile -Value ($rawLog -replace "`e\[[0-9;]*[A-Za-z]", '') -Encoding utf8
+    } catch { }
+}
+$zipOk = $false
+try {
+    $zipItems = @(@($OutFile, $csvFile, $script:TranscriptFile) | Where-Object { $_ -and (Test-Path -LiteralPath $_) })
+    Compress-Archive -Path $zipItems -DestinationPath $zipFile -Force
+    $zipOk = $true
+    Write-Ok "Packaged into one file: $zipFile (profile HTML + review CSV + console log)"
+    Write-Info "Send that single zip back - it carries the profiles, the review table, and the full run log."
+} catch {
+    Write-Warn2 "Could not build the zip ($($_.Exception.Message)) - files download individually."
+}
 if (-not $SkipDownload) {
-    Invoke-CloudShellDownload -Path $OutFile
-    Invoke-CloudShellDownload -Path $csvFile
+    if ($zipOk) { Invoke-CloudShellDownload -Path $zipFile }
+    else { Invoke-CloudShellDownload -Path $OutFile; Invoke-CloudShellDownload -Path $csvFile }
 } else {
-    Write-Info "Downloads skipped (-SkipDownload). Files remain in the session: $OutFile, $csvFile"
+    Write-Info "Downloads skipped (-SkipDownload). In the session: $(if ($zipOk) { $zipFile } else { \"$OutFile, $csvFile\" })"
 }
