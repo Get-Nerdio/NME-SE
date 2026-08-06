@@ -50,6 +50,11 @@
     ./modeler.ps1 -TimeZone 'America/Chicago' -ModelName 'Contoso - Actuals'
 
 .NOTES
+    v0.11 (2026-08-06). Raw decision data rides in the zip: <name>-rawdata.json
+    (inventory, VM/disk specs, workspaces, usage aggregates, storage findings,
+    cost rows + skips, run parameters) and <name>-usage-buckets.csv (per-pool
+    15-minute concurrency, UTC). Purpose: model adjustments re-derive offline
+    from one customer run - no repeat asks. Boundaries in the file's meta.notes.
     v0.10.1 (2026-08-06). Two live-run fixes from Don's demo tenant log:
     (1) FSLogix storage discovery query used 'kind' as a projected column name -
     ARG's parser rejects it as reserved; renamed accountKind. (2) The Cost
@@ -315,7 +320,7 @@ if ($workspaceIds.Count -eq 0) {
 
 # ------------------------------------------------------------- 4. usage per workspace
 Write-Info "[4/8] Querying $LookbackDays days of WVDConnections concurrency..."
-$telemetryKql = @'
+$kqlPrelude = @'
 let LookbackDays = __LOOKBACK__d;
 let LocalTimeZone = '__TZ__';
 let WorkHourFloorPct = 0.20;
@@ -324,6 +329,8 @@ let WeeksObserved = todouble(LookbackDays / 7d);
 let ConnRaw = union isfuzzy=true (datatable(TimeGenerated:datetime, State:string, CorrelationId:string, UserName:string, SessionHostName:string, _ResourceId:string)[]), (WVDConnections | project TimeGenerated, State, CorrelationId, UserName, SessionHostName, _ResourceId);
 let Sessions = ConnRaw | where TimeGenerated > ago(LookbackDays) | where State == 'Connected' | project CorrelationId, UserName, SessionHostName, HostPoolId = tolower(_ResourceId), StartTime = TimeGenerated | join kind=leftouter (ConnRaw | where TimeGenerated > ago(LookbackDays) | where State == 'Completed' | project CorrelationId, EndTime = TimeGenerated) on CorrelationId | project-away CorrelationId1 | extend EndTime = coalesce(EndTime, min_of(StartTime + 12h, now())) | where EndTime > StartTime;
 let Buckets = Sessions | extend Slots = range(bin(StartTime, 15m), bin(EndTime, 15m), 15m) | mv-expand Slot = Slots to typeof(datetime) | summarize ConcurrentUsers = dcount(UserName) by HostPoolId, Slot;
+'@
+$telemetryKql = $kqlPrelude + @'
 let PeakPerHost = Sessions | extend Slots = range(bin(StartTime, 15m), bin(EndTime, 15m), 15m) | mv-expand Slot = Slots to typeof(datetime) | summarize HostConcurrent = dcount(UserName) by HostPoolId, SessionHostName, Slot | summarize HostPeak = max(HostConcurrent) by HostPoolId, SessionHostName | summarize PeakUsersPerHost = max(HostPeak) by HostPoolId;
 let Peaks = Buckets | summarize PeakConcurrentUsers = max(ConcurrentUsers) by HostPoolId;
 let DayLoads = Buckets | extend DowN = toint(dayofweek(datetime_utc_to_local(Slot, LocalTimeZone)) / 1d) | summarize DayUH = sum(todouble(ConcurrentUsers)) * 0.25 by HostPoolId, DowN;
@@ -338,6 +345,11 @@ Peaks
 | project HostPoolId, PeakConcurrentUsers, StartHour, WorkDurationMinutes, WorkDaysJson = tostring(WorkDaysList), WeeklyOffUH, PeakUsersPerHost
 '@
 $telemetryKql = $telemetryKql.Replace('__LOOKBACK__', "$LookbackDays").Replace('__TZ__', $TimeZone)
+$bucketsKql = $kqlPrelude + @'
+Buckets | project HostPoolId, SlotUtc = Slot, ConcurrentUsers
+'@
+$bucketsKql = $bucketsKql.Replace('__LOOKBACK__', "$LookbackDays").Replace('__TZ__', $TimeZone)
+$rawBuckets = [System.Collections.Generic.List[object]]::new()
 $usage = @{}   # poolIdLower -> usage row (keep highest peak if seen in multiple workspaces)
 $usageRows = 0
 foreach ($wsId in $workspaceIds.Keys) {
@@ -353,6 +365,11 @@ foreach ($wsId in $workspaceIds.Keys) {
             $usageRows++
         }
         Write-Ok "Workspace $($wsId.Split('/')[-1]): usage for $(@($result.Results).Count) pool(s)."
+        try {
+            $bres = Invoke-AzOperationalInsightsQuery -WorkspaceId $customerId -Query $bucketsKql
+            $wsName = $wsId.Split('/')[-1]
+            foreach ($brow in @($bres.Results)) { $rawBuckets.Add([pscustomobject]@{ Workspace = $wsName; HostPoolId = $brow.HostPoolId; SlotUtc = $brow.SlotUtc; ConcurrentUsers = $brow.ConcurrentUsers }) }
+        } catch { Write-Warn2 "Raw usage buckets skipped for $($wsId.Split('/')[-1]) ($($_.Exception.Message)) - aggregates unaffected." }
     } catch {
         Write-Warn2 "Workspace $($wsId.Split('/')[-1]) query failed ($($_.Exception.Message)) - pools that only log there will show as no-telemetry."
     }
@@ -712,6 +729,34 @@ if ($vmRgGroups.Count -gt 0) {
     foreach ($g in $vmRgGroups) { Write-Host ("      {0}  ({1} VM(s))" -f $g.Name, $g.Count) -ForegroundColor Gray }
 }
 Write-Info "After import, touch up: RDP egress GB (10), custom-image VM hours, any '(no usage data)' pools."
+# ---- raw decision data: everything observed, so adjustments never need a re-run ---
+$rawFile = ($OutFile -replace '\.json$', '') + '-rawdata.json'
+$bucketsFile = ($OutFile -replace '\.json$', '') + '-usage-buckets.csv'
+try {
+    $raw = [ordered]@{
+        meta = [ordered]@{
+            tool = 'Get-NerdioModelerJson.ps1'; version = 'v0.11'; generatedUtc = [DateTime]::UtcNow.ToString('o')
+            parameters = [ordered]@{ ModelName = $ModelName; LookbackDays = $LookbackDays; TimeZone = $TimeZone; SubscriptionId = @($SubscriptionId); SkipCosts = [bool]$SkipCosts }
+            notes = 'usage-buckets.csv holds per-pool 15-minute concurrency (UTC slots; convert with meta.parameters.TimeZone). Buckets include every reachable workspace - when a pool logs to several, the aggregates used the max-peak workspace, so filter buckets by Workspace to match. PeakUsersPerHost is an aggregate (per-host slot detail is not exported). Not re-derivable offline: a longer lookback, or telemetry that was not flowing during this run.'
+        }
+        pools = @($pools)
+        poolVmIds = @($poolVmIds.Keys | ForEach-Object { [ordered]@{ poolId = $_; vmIds = @($poolVmIds[$_]) } })
+        vmSpecs = @($vmSpecs.Keys | ForEach-Object { [ordered]@{ vmId = $_; spec = $vmSpecs[$_] } })
+        workspaces = @($workspaceIds.Keys)
+        usageAggregates = @($usage.Values)
+        profileStores = @($profileStores)
+        shareUserOverlaps = @($(if (Get-Variable -Name mapRows -ErrorAction SilentlyContinue) { $mapRows } else { @() }))
+        costByResource = @($(if (Get-Variable -Name costByResource -ErrorAction SilentlyContinue) { $costByResource.Keys | ForEach-Object { [ordered]@{ resourceId = $_; cost = $costByResource[$_] } } } else { @() }))
+        costSkipped = @($(if (Get-Variable -Name costSkipped -ErrorAction SilentlyContinue) { $costSkipped } else { @() }))
+        costCurrency = $(if (Get-Variable -Name costCurrency -ErrorAction SilentlyContinue) { $costCurrency } else { $null })
+    }
+    $raw | ConvertTo-Json -Depth 12 | Out-File -FilePath $rawFile -Encoding utf8NoBOM
+    if ($rawBuckets.Count -gt 0) { $rawBuckets | Export-Csv -Path $bucketsFile -NoTypeInformation -Encoding utf8NoBOM }
+    Write-Ok "Raw decision data written: $rawFile$(if ($rawBuckets.Count -gt 0) { \" + $bucketsFile ($($rawBuckets.Count) usage slots)\" }) - adjustments can be re-derived from the zip without another customer run."
+} catch {
+    Write-Warn2 "Raw data export failed ($($_.Exception.Message)) - zip will carry the standard outputs only."
+}
+
 # ---- one-file handoff: zip = model JSON + review CSV + console log ---------------
 $zipFile = ($OutFile -replace '\.json$', '') + '.zip'
 if ($script:TranscriptOn) {
@@ -724,10 +769,10 @@ if ($script:TranscriptOn) {
 }
 $zipOk = $false
 try {
-    $zipItems = @(@($OutFile, $reviewFile, $script:TranscriptFile) | Where-Object { $_ -and (Test-Path -LiteralPath $_) })
+    $zipItems = @(@($OutFile, $reviewFile, $rawFile, $bucketsFile, $script:TranscriptFile) | Where-Object { $_ -and (Test-Path -LiteralPath $_) })
     Compress-Archive -Path $zipItems -DestinationPath $zipFile -Force
     $zipOk = $true
-    Write-Ok "Packaged into one file: $zipFile (model JSON + review CSV + console log)"
+    Write-Ok "Packaged into one file: $zipFile (model JSON + review CSV + raw decision data + console log)"
     Write-Info "Send that single zip back - it carries the model, the review table, and the full run log."
 } catch {
     Write-Warn2 "Could not build the zip ($($_.Exception.Message)) - files download individually."

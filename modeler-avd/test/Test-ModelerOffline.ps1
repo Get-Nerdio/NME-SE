@@ -72,6 +72,13 @@ function Invoke-AzRestMethod {
 }
 function Invoke-AzOperationalInsightsQuery {
     param([string]$WorkspaceId, [string]$Query)
+    if ($Query -match 'Buckets \| project HostPoolId, SlotUtc') {
+        return [pscustomobject]@{ Results = @(
+            [pscustomobject]@{ HostPoolId = $poolAId.ToLower(); SlotUtc = '2026-08-05T13:00:00Z'; ConcurrentUsers = '5' },
+            [pscustomobject]@{ HostPoolId = $poolAId.ToLower(); SlotUtc = '2026-08-05T13:15:00Z'; ConcurrentUsers = '7' },
+            [pscustomobject]@{ HostPoolId = $poolAId.ToLower(); SlotUtc = '2026-08-05T13:30:00Z'; ConcurrentUsers = '6' }
+        ) }
+    }
     if ($Query -match 'StorageFileLogs') {
         return [pscustomobject]@{ Results = @(
             [pscustomobject]@{ AccountName = 'stprofiles'; Share = 'profiles01'; HostPoolId = $poolAId.ToLower(); Overlap = '12' }
@@ -98,6 +105,8 @@ Remove-Item /tmp/zipcheck -Recurse -Force -ErrorAction SilentlyContinue
 $zipOk = Test-Path /tmp/test-model.zip
 if ($zipOk) { Expand-Archive /tmp/test-model.zip -DestinationPath /tmp/zipcheck -Force }
 $logPath = '/tmp/zipcheck/test-model-console.log'
+$rawJson = if (Test-Path /tmp/zipcheck/test-model-rawdata.json) { Get-Content /tmp/zipcheck/test-model-rawdata.json -Raw | ConvertFrom-Json } else { $null }
+$rawBucketsCsv = if (Test-Path /tmp/zipcheck/test-model-usage-buckets.csv) { Import-Csv /tmp/zipcheck/test-model-usage-buckets.csv } else { @() }
 $log = if (Test-Path $logPath) { Get-Content $logPath -Raw } else { '' }
 
 $checks = [ordered]@{
@@ -120,6 +129,8 @@ $checks = [ordered]@{
     'zip packaged'                    = $zipOk
     'zip holds json+csv+log'          = ((Test-Path /tmp/zipcheck/test-model.json) -and (Test-Path /tmp/zipcheck/test-model-review.csv) -and (Test-Path $logPath))
     'console log captured + clean'    = ($log -match 'Assembling deployments' -and $log -match 'FSLogix' -and $log -notmatch [char]27)
+    'rawdata.json in zip + sane'      = ($null -ne $rawJson -and @($rawJson.pools).Count -eq 1 -and @($rawJson.usageAggregates).Count -eq 1 -and @($rawJson.profileStores).Count -eq 3 -and $rawJson.meta.parameters.TimeZone -eq 'America/New_York' -and @($rawJson.costByResource).Count -eq 3)
+    'usage buckets csv in zip'        = (@($rawBucketsCsv).Count -eq 3 -and $rawBucketsCsv[1].ConcurrentUsers -eq '7' -and $rawBucketsCsv[0].Workspace -eq 'ws1')
 }
 $fail = 0
 foreach ($k in $checks.Keys) {

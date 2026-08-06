@@ -28,6 +28,7 @@ $checks = [ordered]@{
     'zip packaged'              = $zipOk
     'zip holds html + log'      = (($html -ne '') -and ($log -ne ''))
     'no csv in zip (0 plans)'   = (-not (Test-Path /tmp/smokecheck/smoke-autoscale-review.csv))
+    'rawdata in zip'            = (Test-Path /tmp/smokecheck/smoke-autoscale-rawdata.json)
     'html is the profiles page' = ($html -match 'NME Auto-Scale Profiles')
     'log captured + clean'      = ($log -match 'No scaling plans found' -and $log -notmatch [char]27)
 }

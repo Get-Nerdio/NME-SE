@@ -18,7 +18,7 @@ A cost model is only as credible as the data behind it. This tool feeds the Mode
    ```
 
 3. Read the review table it prints (one row per pool — anything defaulted is spelled out in `Flags`).
-4. One zip downloads automatically: `modeler-import-<timestamp>.zip` — the import JSON, the review CSV, and the run's full console log. If someone asked you to run this, **that zip is the only thing to send back**.
+4. One zip downloads automatically: `modeler-import-<timestamp>.zip` — the import JSON, the review CSV, the raw observation data, and the run's full console log. If someone asked you to run this, **that zip is the only thing to send back**.
 5. Nerdio Modeler → **Import** → pick the JSON (from the zip). Done.
 
 Prefer to read code before running it (you should):
@@ -60,6 +60,8 @@ Nothing needs to be installed: Cloud Shell ships every module the script uses, a
 **The import JSON** — schema-4 Nerdio Modeler format, one deployment per host pool, every pool in the tenant.
 
 **The review table / CSV** — per pool: resource group, type, SKU, session limit, density used, observed per-host peak, peak concurrent users, observed work window and days, overtime fields, actual last-month cost (`ActualMo`, when retrievable), and a `Flags` column that names every default or adjustment applied. If a value was touched, it says so — nothing is changed silently.
+
+**The raw observation data** — `...-rawdata.json` (inventory, VM and disk specs, workspaces, usage aggregates, storage findings, cost rows, run parameters) and `...-usage-buckets.csv` (per-pool concurrency in 15-minute slots). This is everything the modeling rules were computed *from*, so if the model needs tuning after review, it can be re-derived from the zip — without asking you to run anything again.
 
 **Console summary** — pool counts, workspaces found, usage coverage, the resource groups where session-host VMs live (that list is the Cost Management filter for manual comparisons), and cost totals split into *attributed to session hosts + disks* vs. *other VM/Storage spend in the same resource groups*.
 

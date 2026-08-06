@@ -48,6 +48,9 @@
     ./autoscale.ps1 -SubscriptionId 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'
 
 .NOTES
+    v0.4 (2026-08-06). Raw decision data (plans, schedules, pools, host counts,
+    tagged VMs) exported as <name>-rawdata.json inside the zip, so adjustments
+    can be re-derived offline without asking for another run.
     v0.3 (2026-08-05). One-file handoff: console output captured (transcript,
     ANSI-stripped) and packaged with the HTML + review CSV into a single zip -
     one download, one file to send back. Degrades to individual downloads if
@@ -106,7 +109,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:Version = 'v0.3'
+$script:Version = 'v0.4'
 if ([string]::IsNullOrEmpty($OutFile)) { $OutFile = "nme-autoscale-profiles-$(Get-Date -Format 'yyyyMMdd-HHmm').html" }
 $csvDir  = [IO.Path]::GetDirectoryName($OutFile)
 $csvBase = [IO.Path]::GetFileNameWithoutExtension($OutFile) + '-review.csv'
@@ -675,6 +678,21 @@ if ($noPlanPools.Count -gt 0) {
 }
 Write-Info "Open the HTML and key each card into NME. Cards are day-one mimicry; optimize with Nerdio telemetry after."
 
+# ---- raw decision data: everything read, so adjustments never need a re-run ------
+$rawFile = ($OutFile -replace '\.html$', '') + '-rawdata.json'
+try {
+    $raw = [ordered]@{
+        meta = [ordered]@{ tool = 'Get-NerdioAutoscaleSheet.ps1'; version = $script:Version; generatedUtc = [DateTime]::UtcNow.ToString('o'); parameters = [ordered]@{ SubscriptionId = @($SubscriptionId) } }
+        scalingPlans = @($planRows)
+        schedulesByPlan = @($schedByPlan.Keys | ForEach-Object { [ordered]@{ planId = $_; schedules = @($schedByPlan[$_]) } })
+        hostPools = @($poolRows)
+        sessionHostsByPool = @($hostsByPool.Keys | ForEach-Object { [ordered]@{ poolId = $_; count = $hostsByPool[$_].Count; vmIds = @($hostsByPool[$_].VmIds) } })
+        taggedVms = @($vmTagKeys.Keys | ForEach-Object { [ordered]@{ vmId = $_; name = $vmTagKeys[$_].Name; tagKeys = @($vmTagKeys[$_].TagKeys) } })
+    }
+    $raw | ConvertTo-Json -Depth 12 | Out-File -FilePath $rawFile -Encoding utf8NoBOM
+    Write-Ok "Raw decision data written: $rawFile - adjustments can be re-derived from the zip without another run."
+} catch { Write-Warn2 "Raw data export failed ($($_.Exception.Message)) - zip will carry the standard outputs only." }
+
 # ---- one-file handoff: zip = profile HTML + review CSV + console log ---------------
 $zipFile = ($OutFile -replace '\.html$', '') + '.zip'
 if ($script:TranscriptOn) {
@@ -687,7 +705,7 @@ if ($script:TranscriptOn) {
 }
 $zipOk = $false
 try {
-    $zipItems = @(@($OutFile, $csvFile, $script:TranscriptFile) | Where-Object { $_ -and (Test-Path -LiteralPath $_) })
+    $zipItems = @(@($OutFile, $csvFile, $rawFile, $script:TranscriptFile) | Where-Object { $_ -and (Test-Path -LiteralPath $_) })
     Compress-Archive -Path $zipItems -DestinationPath $zipFile -Force
     $zipOk = $true
     Write-Ok "Packaged into one file: $zipFile (profile HTML + review CSV + console log)"
