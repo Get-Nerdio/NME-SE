@@ -50,6 +50,25 @@
     ./modeler.ps1 -TimeZone 'America/Chicago' -ModelName 'Contoso - Actuals'
 
 .NOTES
+    v0.12 (2026-08-06). Validated against a live customer's Nerdio Mothership
+    telemetry (independent hourly per-pool concurrency); three changes came out:
+    (1) DAY RULE NORMALIZATION - a 30-day lookback holds 5 of some weekdays and
+    4 of others; normalizing by uniform weeks penalized the 4-occurrence days
+    ~20%, which cost a real call center its Saturday shift. Day and hour rules
+    now normalize by each weekday's actual calendar occurrence count.
+    (2) MAU column in the review table (distinct users per pool over the
+    lookback) - INFORMATIONAL ONLY, never in the JSON. users.total stays peak
+    concurrent: this is an Azure compute exercise, and hosts are sized per-pool
+    from concurrency. MAU answers "the model says 24 users, we have 5,000" and
+    feeds licensing conversations.
+    (3) COUNTING BASIS, made explicit: concurrency counts CONNECTED sessions
+    (WVDConnections spans). NME's console counts sessions incl. disconnected
+    and reads higher (~10-25% at the validation customer). Sizing is safe
+    either way - peak and per-host density share the same basis, so it cancels;
+    observed density was measured on hosts that also carried the disconnected
+    load. When WVDAgentHealthStatus is available and session peaks run >=15%
+    above connected peaks, the pool is flagged so nobody is surprised.
+    Also: rawdata meta version now comes from the same constant as this header.
     v0.11.1 (2026-08-06). Live-run polish: raw-export success message had a bad
     escape (files were written; only the message threw - now clean); usage/flag
     counters exclude storage rows; MSIX/app-attach shares are labeled
@@ -143,6 +162,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$ScriptVersion = 'v0.12'
 if ([string]::IsNullOrEmpty($OutFile)) { $OutFile = "modeler-import-$(Get-Date -Format 'yyyyMMdd-HHmm').json" }
 
 function Write-Info { param([string]$m) Write-Host "[i] $m" -ForegroundColor Gray }
@@ -331,6 +351,7 @@ let LocalTimeZone = '__TZ__';
 let WorkHourFloorPct = 0.20;
 let WorkDayFloorPct = 0.25;
 let WeeksObserved = todouble(LookbackDays / 7d);
+let DowCal = dynamic([__DOWCAL__]);
 let ConnRaw = union isfuzzy=true (datatable(TimeGenerated:datetime, State:string, CorrelationId:string, UserName:string, SessionHostName:string, _ResourceId:string)[]), (WVDConnections | project TimeGenerated, State, CorrelationId, UserName, SessionHostName, _ResourceId);
 let Sessions = ConnRaw | where TimeGenerated > ago(LookbackDays) | where State == 'Connected' | project CorrelationId, UserName, SessionHostName, HostPoolId = tolower(_ResourceId), StartTime = TimeGenerated | join kind=leftouter (ConnRaw | where TimeGenerated > ago(LookbackDays) | where State == 'Completed' | project CorrelationId, EndTime = TimeGenerated) on CorrelationId | project-away CorrelationId1 | extend EndTime = coalesce(EndTime, min_of(StartTime + 12h, now())) | where EndTime > StartTime;
 let Buckets = Sessions | extend Slots = range(bin(StartTime, 15m), bin(EndTime, 15m), 15m) | mv-expand Slot = Slots to typeof(datetime) | summarize ConcurrentUsers = dcount(UserName) by HostPoolId, Slot;
@@ -338,22 +359,49 @@ let Buckets = Sessions | extend Slots = range(bin(StartTime, 15m), bin(EndTime, 
 $telemetryKql = $kqlPrelude + @'
 let PeakPerHost = Sessions | extend Slots = range(bin(StartTime, 15m), bin(EndTime, 15m), 15m) | mv-expand Slot = Slots to typeof(datetime) | summarize HostConcurrent = dcount(UserName) by HostPoolId, SessionHostName, Slot | summarize HostPeak = max(HostConcurrent) by HostPoolId, SessionHostName | summarize PeakUsersPerHost = max(HostPeak) by HostPoolId;
 let Peaks = Buckets | summarize PeakConcurrentUsers = max(ConcurrentUsers) by HostPoolId;
-let DayLoads = Buckets | extend DowN = toint(dayofweek(datetime_utc_to_local(Slot, LocalTimeZone)) / 1d) | summarize DayUH = sum(todouble(ConcurrentUsers)) * 0.25 by HostPoolId, DowN;
+let PoolMau = Sessions | summarize Mau = dcount(UserName) by HostPoolId;
+let DayLoads = Buckets | extend DowN = toint(dayofweek(datetime_utc_to_local(Slot, LocalTimeZone)) / 1d) | summarize DayUH = sum(todouble(ConcurrentUsers)) * 0.25 by HostPoolId, DowN | extend DayUH = DayUH / todouble(max_of(toint(DowCal[DowN]), 1));
 let WorkDays = DayLoads | join kind=inner (DayLoads | summarize MaxDayUH = max(DayUH) by HostPoolId) on HostPoolId | where DayUH >= MaxDayUH * WorkDayFloorPct | extend ModelerDay = tolong(iff(DowN == 0, 7, DowN)) | summarize WorkDaysList = array_sort_asc(make_list(ModelerDay)) by HostPoolId;
-let WorkWindow = Buckets | extend LocalSlot = datetime_utc_to_local(Slot, LocalTimeZone) | extend LocalHour = hourofday(LocalSlot), DowN = toint(dayofweek(LocalSlot) / 1d) | extend ModelerDay = tolong(iff(DowN == 0, 7, DowN)) | join kind=inner WorkDays on HostPoolId | where set_has_element(WorkDaysList, ModelerDay) | extend NWorkDays = todouble(array_length(WorkDaysList)) | summarize SumConcurrent = sum(todouble(ConcurrentUsers)), NWorkDays = take_any(NWorkDays) by HostPoolId, LocalHour | extend AvgConcurrent = SumConcurrent / (WeeksObserved * NWorkDays * 4.0) | join kind=inner Peaks on HostPoolId | where AvgConcurrent >= todouble(PeakConcurrentUsers) * WorkHourFloorPct | summarize StartHour = min(LocalHour), EndHour = max(LocalHour) by HostPoolId | extend WorkDurationMinutes = (EndHour - StartHour + 1) * 60;
+let WorkDaySlots = WorkDays | mv-expand M = WorkDaysList to typeof(long) | extend DowX = toint(iff(M == 7, tolong(0), M)) | summarize DaySlots = sum(todouble(max_of(toint(DowCal[DowX]), 1))) * 4.0 by HostPoolId;
+let WorkWindow = Buckets | extend LocalSlot = datetime_utc_to_local(Slot, LocalTimeZone) | extend LocalHour = hourofday(LocalSlot), DowN = toint(dayofweek(LocalSlot) / 1d) | extend ModelerDay = tolong(iff(DowN == 0, 7, DowN)) | join kind=inner WorkDays on HostPoolId | where set_has_element(WorkDaysList, ModelerDay) | summarize SumConcurrent = sum(todouble(ConcurrentUsers)) by HostPoolId, LocalHour | join kind=inner WorkDaySlots on HostPoolId | extend AvgConcurrent = SumConcurrent / DaySlots | join kind=inner Peaks on HostPoolId | where AvgConcurrent >= todouble(PeakConcurrentUsers) * WorkHourFloorPct | summarize StartHour = min(LocalHour), EndHour = max(LocalHour) by HostPoolId | extend WorkDurationMinutes = (EndHour - StartHour + 1) * 60;
 let UsageTotals = Buckets | extend LocalSlot = datetime_utc_to_local(Slot, LocalTimeZone) | extend LocalHour = hourofday(LocalSlot), DowN = toint(dayofweek(LocalSlot) / 1d) | extend ModelerDay = tolong(iff(DowN == 0, 7, DowN)) | join kind=leftouter WorkDays on HostPoolId | join kind=leftouter WorkWindow on HostPoolId | extend InWindow = isnotnull(StartHour) and set_has_element(coalesce(WorkDaysList, dynamic([])), ModelerDay) and LocalHour >= StartHour and LocalHour <= EndHour | summarize TotalUH = sum(todouble(ConcurrentUsers)) * 0.25, InWindowUH = sumif(todouble(ConcurrentUsers), InWindow) * 0.25 by HostPoolId | extend WeeklyUH = round(TotalUH / WeeksObserved, 1), WeeklyInWindowUH = round(InWindowUH / WeeksObserved, 1) | extend WeeklyOffUH = round(WeeklyUH - WeeklyInWindowUH, 1);
 Peaks
 | join kind=leftouter WorkWindow on HostPoolId
 | join kind=leftouter WorkDays on HostPoolId
 | join kind=leftouter UsageTotals on HostPoolId
 | join kind=leftouter PeakPerHost on HostPoolId
-| project HostPoolId, PeakConcurrentUsers, StartHour, WorkDurationMinutes, WorkDaysJson = tostring(WorkDaysList), WeeklyOffUH, PeakUsersPerHost
+| join kind=leftouter PoolMau on HostPoolId
+| project HostPoolId, PeakConcurrentUsers, StartHour, WorkDurationMinutes, WorkDaysJson = tostring(WorkDaysList), WeeklyOffUH, PeakUsersPerHost, Mau
 '@
-$telemetryKql = $telemetryKql.Replace('__LOOKBACK__', "$LookbackDays").Replace('__TZ__', $TimeZone)
+# Per-weekday calendar occurrence counts across the lookback (customer TZ).
+# A 30-day window holds 5 of some weekdays and 4 of others; normalizing the day
+# rule by uniform weeks penalized 4-occurrence days ~20% - a real call center's
+# Saturday shift missed the cut by exactly that bias. DowCal[0]=Sunday..[6]=Saturday.
+$tzInfo = $null
+try { $tzInfo = [TimeZoneInfo]::FindSystemTimeZoneById($TimeZone) } catch { }
+$dowCal = @(0, 0, 0, 0, 0, 0, 0)
+$nowUtcForCal = [DateTime]::UtcNow
+$calStart = if ($tzInfo) { [TimeZoneInfo]::ConvertTimeFromUtc($nowUtcForCal.AddDays(-$LookbackDays), $tzInfo).Date } else { $nowUtcForCal.AddDays(-$LookbackDays).Date }
+$calEnd   = if ($tzInfo) { [TimeZoneInfo]::ConvertTimeFromUtc($nowUtcForCal, $tzInfo).Date } else { $nowUtcForCal.Date }
+for ($cd = $calStart; $cd -le $calEnd; $cd = $cd.AddDays(1)) { $dowCal[[int]$cd.DayOfWeek]++ }
+# both boundary days are partial; when they share a weekday they jointly ~= one occurrence
+if ($calStart.DayOfWeek -eq $calEnd.DayOfWeek -and $calStart -ne $calEnd) { $dowCal[[int]$calStart.DayOfWeek]-- }
+$dowCalCsv = ($dowCal -join ',')
+$telemetryKql = $telemetryKql.Replace('__LOOKBACK__', "$LookbackDays").Replace('__TZ__', $TimeZone).Replace('__DOWCAL__', $dowCalCsv)
 $bucketsKql = $kqlPrelude + @'
 Buckets | project HostPoolId, SlotUtc = Slot, ConcurrentUsers
 '@
-$bucketsKql = $bucketsKql.Replace('__LOOKBACK__', "$LookbackDays").Replace('__TZ__', $TimeZone)
+$bucketsKql = $bucketsKql.Replace('__LOOKBACK__', "$LookbackDays").Replace('__TZ__', $TimeZone).Replace('__DOWCAL__', $dowCalCsv)
+# Sessions incl. disconnected (WVDAgentHealthStatus) - INFORMATIONAL. Connected-basis
+# sizing stays; this only feeds a review flag when NME-style counts read higher.
+# Separate query + separate catch so a schema surprise can never hurt the core pull.
+$sessionsKql = @'
+let LookbackDays = __LOOKBACK__d;
+let AgentRaw = union isfuzzy=true (datatable(TimeGenerated:datetime, SessionHostName:string, ActiveSessions:long, InactiveSessions:long, _ResourceId:string)[]), (WVDAgentHealthStatus | project TimeGenerated, SessionHostName, ActiveSessions = tolong(ActiveSessions), InactiveSessions = tolong(InactiveSessions), _ResourceId);
+AgentRaw | where TimeGenerated > ago(LookbackDays) | extend HostPoolId = tolower(_ResourceId), TotalSessions = coalesce(ActiveSessions, tolong(0)) + coalesce(InactiveSessions, tolong(0)) | summarize HostSessions = max(TotalSessions) by HostPoolId, SessionHostName, Slot = bin(TimeGenerated, 15m) | summarize PoolSessions = sum(HostSessions) by HostPoolId, Slot | summarize PeakSessions = max(PoolSessions) by HostPoolId
+'@
+$sessionsKql = $sessionsKql.Replace('__LOOKBACK__', "$LookbackDays")
+$sessionPeaks = @{}   # poolIdLower -> peak sessions incl. disconnected (max across workspaces)
 $rawBuckets = [System.Collections.Generic.List[object]]::new()
 $usage = @{}   # poolIdLower -> usage row (keep highest peak if seen in multiple workspaces)
 $usageRows = 0
@@ -375,6 +423,14 @@ foreach ($wsId in $workspaceIds.Keys) {
             $wsName = $wsId.Split('/')[-1]
             foreach ($brow in @($bres.Results)) { $rawBuckets.Add([pscustomobject]@{ Workspace = $wsName; HostPoolId = $brow.HostPoolId; SlotUtc = $brow.SlotUtc; ConcurrentUsers = $brow.ConcurrentUsers }) }
         } catch { Write-Warn2 "Raw usage buckets skipped for $($wsId.Split('/')[-1]) ($($_.Exception.Message)) - aggregates unaffected." }
+        try {
+            $sres = Invoke-AzOperationalInsightsQuery -WorkspaceId $customerId -Query $sessionsKql
+            foreach ($srow in @($sres.Results)) {
+                $skey = $srow.HostPoolId.ToLower()
+                $sp = [int]$srow.PeakSessions
+                if (-not $sessionPeaks.ContainsKey($skey) -or $sp -gt $sessionPeaks[$skey]) { $sessionPeaks[$skey] = $sp }
+            }
+        } catch { }   # informational only - missing table/columns just means no session flag
     } catch {
         Write-Warn2 "Workspace $($wsId.Split('/')[-1]) query failed ($($_.Exception.Message)) - pools that only log there will show as no-telemetry."
     }
@@ -557,8 +613,11 @@ foreach ($p in $pools) {
         if ($raw -gt 1.0) { $otHours = [int][Math]::Ceiling($raw) }
         $otPct = [int][Math]::Min(100, [Math]::Round(100.0 * $offUH / 7.0 / ($peak * $otHours)))
     }
+    $mau = if ($u -and $u.PSObject.Properties['Mau'] -and "$($u.Mau)" -ne '') { [int]$u.Mau } else { 0 }
+    $sessPeak = if ($sessionPeaks.ContainsKey($key)) { [int]$sessionPeaks[$key] } else { 0 }
     $flags = @()
     if ($peak -eq 0) { $flags += 'no telemetry (users set to 1)' }
+    if ($peak -gt 0 -and $sessPeak -ge [int][Math]::Ceiling(1.15 * $peak)) { $flags += "sessions incl. disconnected peaked at $sessPeak vs $peak connected - NME console counts read higher; compute is sized on connected users" }
     if ($experience -ne 2 -and $obsPerHost -lt 1) {
         $flags += if ($limitSane) { 'density from session limit (no per-host telemetry)' }
                   else { 'no session limit and no per-host telemetry; density defaulted 1.0/vCPU' }
@@ -591,7 +650,7 @@ foreach ($p in $pools) {
     $review.Add([pscustomobject]@{
         Pool = $displayName; RG = $p.resourceGroup; Type = $p.hostPoolType; Exp = $experience; Region = $p.location
         VmSize = $vmSize; Limit = $limit; Density = $density; PerHostPeak = $obsPerHost
-        PeakUsers = $peak; Window = "$startHr`:00+$([Math]::Round($duration/60.0,2))h"; Days = ($workDays -join ',')
+        PeakUsers = $peak; MAU = $(if ($mau -gt 0) { $mau } else { '' }); Window = "$startHr`:00+$([Math]::Round($duration/60.0,2))h"; Days = ($workDays -join ',')
         Overtime = "$otPct% x $($otHours)h"; Flags = ($flags -join '; ')
     })
 }
@@ -609,7 +668,7 @@ foreach ($ps in $profileStores) {
         $review.Add([pscustomobject]@{
             Pool = "$(if ($ps.Share -match '(?i)msix|app[-_]?attach') { 'AppAttach' } else { 'FSLogix' }): $storeLabel"; RG = $ps.RG; Type = $ps.Kind; Exp = '-'; Region = $ps.Region
             VmSize = '-'; Limit = '-'; Density = '-'; PerHostPeak = '-'
-            PeakUsers = '-'; Window = '-'; Days = '-'; Overtime = '-'
+            PeakUsers = '-'; MAU = '-'; Window = '-'; Days = '-'; Overtime = '-'
             Flags = 'profile storage candidate found but size unreadable - not modeled; check access to share stats'
         })
         continue
@@ -643,7 +702,7 @@ foreach ($ps in $profileStores) {
     $review.Add([pscustomobject]@{
         Pool = "$($storagePrefix): $storeLabel"; RG = $ps.RG; Type = $ps.Kind; Exp = '-'; Region = $ps.Region
         VmSize = 'Standard_B2s (dummy)'; Limit = '-'; Density = '-'; PerHostPeak = '-'
-        PeakUsers = 1; Window = '9:00+1h'; Days = '1'; Overtime = '-'
+        PeakUsers = 1; MAU = '-'; Window = '9:00+1h'; Days = '1'; Overtime = '-'
         Flags = "profile storage dummy - models $gbInt GB ($provText / $usedText); $servesNote; storage tier: $($ps.Kind) (storageType $($ps.StorageTypeEnum))$(if ($ps.TierNote) { "; $($ps.TierNote)" })"
     })
 }
@@ -745,7 +804,7 @@ $bucketsFile = ($OutFile -replace '\.json$', '') + '-usage-buckets.csv'
 try {
     $raw = [ordered]@{
         meta = [ordered]@{
-            tool = 'Get-NerdioModelerJson.ps1'; version = 'v0.11'; generatedUtc = [DateTime]::UtcNow.ToString('o')
+            tool = 'Get-NerdioModelerJson.ps1'; version = $ScriptVersion; generatedUtc = [DateTime]::UtcNow.ToString('o')
             parameters = [ordered]@{ ModelName = $ModelName; LookbackDays = $LookbackDays; TimeZone = $TimeZone; SubscriptionId = @($SubscriptionId); SkipCosts = [bool]$SkipCosts }
             notes = 'usage-buckets.csv holds per-pool 15-minute concurrency (UTC slots; convert with meta.parameters.TimeZone). Buckets include every reachable workspace - when a pool logs to several, the aggregates used the max-peak workspace, so filter buckets by Workspace to match. PeakUsersPerHost is an aggregate (per-host slot detail is not exported). Not re-derivable offline: a longer lookback, or telemetry that was not flowing during this run.'
         }
@@ -754,6 +813,7 @@ try {
         vmSpecs = @($vmSpecs.Keys | ForEach-Object { [ordered]@{ vmId = $_; spec = $vmSpecs[$_] } })
         workspaces = @($workspaceIds.Keys)
         usageAggregates = @($usage.Values)
+        sessionPeaks = @($sessionPeaks.Keys | ForEach-Object { [ordered]@{ poolId = $_; peakSessionsInclDisconnected = $sessionPeaks[$_] } })
         profileStores = @($profileStores)
         shareUserOverlaps = @($(if (Get-Variable -Name mapRows -ErrorAction SilentlyContinue) { $mapRows } else { @() }))
         costByResource = @($(if (Get-Variable -Name costByResource -ErrorAction SilentlyContinue) { $costByResource.Keys | ForEach-Object { [ordered]@{ resourceId = $_; cost = $costByResource[$_] } } } else { @() }))

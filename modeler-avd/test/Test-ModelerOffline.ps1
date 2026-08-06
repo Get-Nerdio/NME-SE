@@ -85,8 +85,13 @@ function Invoke-AzOperationalInsightsQuery {
             [pscustomobject]@{ AccountName = 'stprofiles'; Share = 'profiles01'; HostPoolId = $poolAId.ToLower(); Overlap = '12' }
         ) }
     }
+    if ($Query -match 'WVDAgentHealthStatus') {
+        return [pscustomobject]@{ Results = @(
+            [pscustomobject]@{ HostPoolId = $poolAId.ToLower(); PeakSessions = '60' }
+        ) }
+    }
     [pscustomobject]@{ Results = @(
-        [pscustomobject]@{ HostPoolId = $poolAId.ToLower(); PeakConcurrentUsers = '40'; StartHour = '8'; WorkDurationMinutes = '600'; WorkDaysJson = '[1,2,3,4,5]'; WeeklyOffUH = '84'; PeakUsersPerHost = '9' }
+        [pscustomobject]@{ HostPoolId = $poolAId.ToLower(); PeakConcurrentUsers = '40'; StartHour = '8'; WorkDurationMinutes = '600'; WorkDaysJson = '[1,2,3,4,5]'; WeeklyOffUH = '84'; PeakUsersPerHost = '9'; Mau = '120' }
     ) }
 }
 
@@ -135,6 +140,10 @@ $checks = [ordered]@{
     'counters exclude storage rows'   = ($log -match 'Usage found for 1 of 1 pool')
     'rawdata.json in zip + sane'      = ($null -ne $rawJson -and @($rawJson.pools).Count -eq 1 -and @($rawJson.usageAggregates).Count -eq 1 -and @($rawJson.profileStores).Count -eq 4 -and $rawJson.meta.parameters.TimeZone -eq 'America/New_York' -and @($rawJson.costByResource).Count -eq 3)
     'usage buckets csv in zip'        = (@($rawBucketsCsv).Count -eq 3 -and $rawBucketsCsv[1].ConcurrentUsers -eq '7' -and $rawBucketsCsv[0].Workspace -eq 'ws1')
+    'review: MAU column (PoolA 120)'  = ($rowPoolA.MAU -eq '120' -and $rowProf.MAU -eq '-')
+    'session flag fires (60 vs 40)'   = ($rowPoolA.Flags -match 'sessions incl\. disconnected peaked at 60 vs 40 connected')
+    'users.total stays peak (40)'     = ($a.users.total -eq 40 -and $a.users.absentPercent -eq 0)
+    'rawdata v0.12 + sessionPeaks'    = ($rawJson.meta.version -eq 'v0.12' -and @($rawJson.sessionPeaks).Count -eq 1 -and [int]$rawJson.sessionPeaks[0].peakSessionsInclDisconnected -eq 60)
 }
 $fail = 0
 foreach ($k in $checks.Keys) {
