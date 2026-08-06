@@ -50,6 +50,11 @@
     ./modeler.ps1 -TimeZone 'America/Chicago' -ModelName 'Contoso - Actuals'
 
 .NOTES
+    v0.11.1 (2026-08-06). Live-run polish: raw-export success message had a bad
+    escape (files were written; only the message threw - now clean); usage/flag
+    counters exclude storage rows; MSIX/app-attach shares are labeled
+    'AppAttach - <share>' instead of FSLogix (still modeled - the storage cost
+    is real - but never confused with user profiles).
     v0.11 (2026-08-06). Raw decision data rides in the zip: <name>-rawdata.json
     (inventory, VM/disk specs, workspaces, usage aggregates, storage findings,
     cost rows + skips, run parameters) and <name>-usage-buckets.csv (per-pool
@@ -383,7 +388,7 @@ foreach ($wsId in $workspaceIds.Keys) {
 # Everything here is skip-graceful: no candidates -> model unchanged, note printed.
 Write-Info "[5/8] Discovering FSLogix profile storage (Azure Files + ANF)..."
 $profileStores = [System.Collections.Generic.List[object]]::new()
-$profileNameRx = '(?i)prof|fslogix|upd|userdisk|usrprof'
+$profileNameRx = '(?i)prof|fslogix|upd|userdisk|usrprof|msix|app[-_]?attach'
 try {
     $storAccts = Invoke-ArgQuery -Query @'
 resources
@@ -602,7 +607,7 @@ foreach ($ps in $profileStores) {
     $storeLabel = if ($shareNameCounts[$ps.Share] -gt 1) { "$($ps.Account)/$($ps.Share)" } else { $ps.Share }
     if ($null -eq $gb -or [double]$gb -lt 1) {
         $review.Add([pscustomobject]@{
-            Pool = "FSLogix: $storeLabel"; RG = $ps.RG; Type = $ps.Kind; Exp = '-'; Region = $ps.Region
+            Pool = "$(if ($ps.Share -match '(?i)msix|app[-_]?attach') { 'AppAttach' } else { 'FSLogix' }): $storeLabel"; RG = $ps.RG; Type = $ps.Kind; Exp = '-'; Region = $ps.Region
             VmSize = '-'; Limit = '-'; Density = '-'; PerHostPeak = '-'
             PeakUsers = '-'; Window = '-'; Days = '-'; Overtime = '-'
             Flags = 'profile storage candidate found but size unreadable - not modeled; check access to share stats'
@@ -610,11 +615,15 @@ foreach ($ps in $profileStores) {
         continue
     }
     $gbInt = [int][Math]::Max(1, [Math]::Round([double]$gb))
-    $servesNote = if ($ps.ServesPools.Count -gt 0) { "serves: $($ps.ServesPools -join ', ')" } else { 'pools not mapped - confirm with the AVD admin which pools use this share' }
-    $nameServes = if ($ps.ServesPools.Count -gt 0) { " ($(@($ps.ServesPools | Select-Object -First 3) -join ', ')$(if ($ps.ServesPools.Count -gt 3) { " +$($ps.ServesPools.Count - 3)" }))" } else { '' }
+    $isAppAttach = $ps.Share -match '(?i)msix|app[-_]?attach'
+    $storagePrefix = if ($isAppAttach) { 'AppAttach' } else { 'FSLogix' }
+    $servesNote = if ($isAppAttach) { 'MSIX app attach storage, not user profiles - included so the storage cost is modeled; excluded from FSLogix sizing questions' }
+                  elseif ($ps.ServesPools.Count -gt 0) { "serves: $($ps.ServesPools -join ', ')" }
+                  else { 'pools not mapped - confirm with the AVD admin which pools use this share' }
+    $nameServes = if (-not $isAppAttach -and $ps.ServesPools.Count -gt 0) { " ($(@($ps.ServesPools | Select-Object -First 3) -join ', ')$(if ($ps.ServesPools.Count -gt 3) { " +$($ps.ServesPools.Count - 3)" }))" } else { '' }
     $deployments.Add([ordered]@{
         mode = 'avd'
-        name = "FSLogix - $storeLabel$nameServes"
+        name = "$storagePrefix - $storeLabel$nameServes"
         users = [ordered]@{ total = 1; absentPercent = 0; overtimeEnabled = $false; overtimePercent = 0; overtimeHours = 0 }
         experience = 1
         region = $ps.Region
@@ -632,14 +641,14 @@ foreach ($ps in $profileStores) {
     $provText = if ($null -ne $ps.ProvisionedGb) { "$($ps.ProvisionedGb)GB prov" } else { 'prov n/a' }
     $usedText = if ($null -ne $ps.UsedGb) { "$($ps.UsedGb)GB used" } else { 'used n/a' }
     $review.Add([pscustomobject]@{
-        Pool = "FSLogix: $storeLabel"; RG = $ps.RG; Type = $ps.Kind; Exp = '-'; Region = $ps.Region
+        Pool = "$($storagePrefix): $storeLabel"; RG = $ps.RG; Type = $ps.Kind; Exp = '-'; Region = $ps.Region
         VmSize = 'Standard_B2s (dummy)'; Limit = '-'; Density = '-'; PerHostPeak = '-'
         PeakUsers = 1; Window = '9:00+1h'; Days = '1'; Overtime = '-'
         Flags = "profile storage dummy - models $gbInt GB ($provText / $usedText); $servesNote; storage tier: $($ps.Kind) (storageType $($ps.StorageTypeEnum))$(if ($ps.TierNote) { "; $($ps.TierNote)" })"
     })
 }
 if ($profileStores.Count -gt 0) {
-    Write-Ok "Added $(@($deployments | Where-Object { $_.name -like 'FSLogix - *' }).Count) FSLogix storage deployment(s) - compute noise ~zero (1 user, B2s, 1h/week); pools' own fsLogix stays off so storage is never double-counted."
+    Write-Ok "Added $(@($deployments | Where-Object { $_.name -like 'FSLogix - *' -or $_.name -like 'AppAttach - *' }).Count) storage deployment(s) (FSLogix profiles + app attach) - compute noise ~zero (1 user, B2s, 1h/week); pools' own fsLogix stays off so storage is never double-counted."
 }
 
 $model = [ordered]@{
@@ -713,8 +722,9 @@ $reviewFile = ($OutFile -replace '\.json$', '') + '-review.csv'
 foreach ($r in $review) { if (-not $r.PSObject.Properties['ActualMo']) { $r | Add-Member -NotePropertyName ActualMo -NotePropertyValue '' } }
 $review | Sort-Object Pool | Export-Csv -Path $reviewFile
 Write-Ok "Review table (including ActualMo when pulled) also written to: $reviewFile"
-$withUsage = @($review | Where-Object { $_.PeakUsers -gt 0 }).Count
-$flagged   = @($review | Where-Object { $_.Flags }).Count
+$poolRowsOnly = @($review | Where-Object { $_.Pool -notlike 'FSLogix:*' -and $_.Pool -notlike 'AppAttach:*' })
+$withUsage = @($poolRowsOnly | Where-Object { $_.PeakUsers -gt 0 }).Count
+$flagged   = @($poolRowsOnly | Where-Object { $_.Flags }).Count
 if ($usageRows -eq 0) {
     Write-Warn2 "WORKSPACE CHECK: FAIL - no WVDConnections data found in any discovered workspace. All usage fields defaulted."
 } else {
@@ -752,7 +762,8 @@ try {
     }
     $raw | ConvertTo-Json -Depth 12 | Out-File -FilePath $rawFile -Encoding utf8NoBOM
     if ($rawBuckets.Count -gt 0) { $rawBuckets | Export-Csv -Path $bucketsFile -NoTypeInformation -Encoding utf8NoBOM }
-    Write-Ok "Raw decision data written: $rawFile$(if ($rawBuckets.Count -gt 0) { \" + $bucketsFile ($($rawBuckets.Count) usage slots)\" }) - adjustments can be re-derived from the zip without another customer run."
+    $bucketsNote = if ($rawBuckets.Count -gt 0) { " + $bucketsFile ($($rawBuckets.Count) usage slots)" } else { '' }
+    Write-Ok "Raw decision data written: $rawFile$bucketsNote - adjustments can be re-derived from the zip without another customer run."
 } catch {
     Write-Warn2 "Raw data export failed ($($_.Exception.Message)) - zip will carry the standard outputs only."
 }

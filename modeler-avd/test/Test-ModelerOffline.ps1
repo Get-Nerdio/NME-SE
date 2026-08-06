@@ -56,7 +56,8 @@ function Invoke-AzRestMethod {
         } else {
             $v = @(
                 @{ name = 'data';         properties = @{ shareQuota = 100; enabledProtocols = 'SMB' } },
-                @{ name = 'userprofiles'; properties = @{ shareQuota = 500; enabledProtocols = 'SMB' } }
+                @{ name = 'userprofiles'; properties = @{ shareQuota = 500; enabledProtocols = 'SMB' } },
+                @{ name = 'msixapps';     properties = @{ shareQuota = 300; enabledProtocols = 'SMB' } }
             )
         }
         return [pscustomobject]@{ StatusCode = 200; Content = (@{ value = $v } | ConvertTo-Json -Depth 10) }
@@ -111,7 +112,7 @@ $log = if (Test-Path $logPath) { Get-Content $logPath -Raw } else { '' }
 
 $checks = [ordered]@{
     'schema=4'                        = ($m.schema -eq 4)
-    '4 deployments (1 pool + 3 fsx)'  = (@($m.deployments).Count -eq 4)
+    '5 deployments (1 pool + 4 stor)' = (@($m.deployments).Count -eq 5)
     'PoolA users=40'                  = ($a.users.total -eq 40)
     'PoolA density 1.13 (obs 9/8)'    = ($a.workload.maxUsersPerVCpu -eq 1.13)
     'PoolA window 8+10h M-F'          = ($a.autoScale.workStartHour -eq 8 -and $a.autoScale.workDurationMinutes -eq 600)
@@ -129,7 +130,10 @@ $checks = [ordered]@{
     'zip packaged'                    = $zipOk
     'zip holds json+csv+log'          = ((Test-Path /tmp/zipcheck/test-model.json) -and (Test-Path /tmp/zipcheck/test-model-review.csv) -and (Test-Path $logPath))
     'console log captured + clean'    = ($log -match 'Assembling deployments' -and $log -match 'FSLogix' -and $log -notmatch [char]27)
-    'rawdata.json in zip + sane'      = ($null -ne $rawJson -and @($rawJson.pools).Count -eq 1 -and @($rawJson.usageAggregates).Count -eq 1 -and @($rawJson.profileStores).Count -eq 3 -and $rawJson.meta.parameters.TimeZone -eq 'America/New_York' -and @($rawJson.costByResource).Count -eq 3)
+    'no raw-export failure in log'    = ($log -notmatch 'Raw data export failed' -and $log -match 'Raw decision data written')
+    'appattach labeled + modeled'     = (($m.deployments | Where-Object { $_.name -eq 'AppAttach - msixapps' }).fsLogix.profileSizeGb -eq 200 -and (($csv | Where-Object { $_.Pool -eq 'AppAttach: msixapps' }).Flags -match 'app attach storage, not user profiles'))
+    'counters exclude storage rows'   = ($log -match 'Usage found for 1 of 1 pool')
+    'rawdata.json in zip + sane'      = ($null -ne $rawJson -and @($rawJson.pools).Count -eq 1 -and @($rawJson.usageAggregates).Count -eq 1 -and @($rawJson.profileStores).Count -eq 4 -and $rawJson.meta.parameters.TimeZone -eq 'America/New_York' -and @($rawJson.costByResource).Count -eq 3)
     'usage buckets csv in zip'        = (@($rawBucketsCsv).Count -eq 3 -and $rawBucketsCsv[1].ConcurrentUsers -eq '7' -and $rawBucketsCsv[0].Workspace -eq 'ws1')
 }
 $fail = 0
