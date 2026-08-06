@@ -25,8 +25,8 @@ function Invoke-AzRestMethod {
             $data = @(@{ id = '/subscriptions/s1/resourcegroups/rg1/providers/microsoft.compute/disks/d1'; diskSizeGb = 128; diskSku = 'Premium_LRS' })
         } elseif ($q -match 'storageaccounts') {
             $data = @(
-                @{ id = $saProf; name = 'stprofiles'; resourceGroup = 'rg-stor'; location = 'eastus'; kind = 'FileStorage'; skuName = 'Premium_ZRS' },
-                @{ id = $saGen;  name = 'stgen';      resourceGroup = 'rg-stor'; location = 'eastus'; kind = 'StorageV2';   skuName = 'Standard_LRS' }
+                @{ id = $saProf; name = 'stprofiles'; resourceGroup = 'rg-stor'; location = 'eastus'; accountKind = 'FileStorage'; skuName = 'Premium_ZRS' },
+                @{ id = $saGen;  name = 'stgen';      resourceGroup = 'rg-stor'; location = 'eastus'; accountKind = 'StorageV2';   skuName = 'Standard_LRS' }
             )
         } elseif ($q -match 'netappaccounts') {
             $data = @(@{ id = '/subscriptions/s1/resourcegroups/rg-anf/providers/microsoft.netapp/netappaccounts/anf1/capacitypools/pool1/volumes/anfprof'

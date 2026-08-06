@@ -50,6 +50,12 @@
     ./modeler.ps1 -TimeZone 'America/Chicago' -ModelName 'Contoso - Actuals'
 
 .NOTES
+    v0.10.1 (2026-08-06). Two live-run fixes from Don's demo tenant log:
+    (1) FSLogix storage discovery query used 'kind' as a projected column name -
+    ARG's parser rejects it as reserved; renamed accountKind. (2) The Cost
+    Management API no longer supports timeframe 'TheLastMonth' (HTTP 400
+    everywhere - cost pull was silently dead on every tenant); now uses an
+    explicit Custom range for last calendar month (UTC).
     v0.10 (2026-08-05). One-file handoff: the run's console output is captured
     (transcript, ANSI-stripped) and packaged with the JSON + review CSV into
     modeler-import-<ts>.zip - one download, one file to send back. Degrades
@@ -174,9 +180,19 @@ function Invoke-ArgQuery {
 # --- Cost Management Query API, one RG scope at a time (skip-safe; see .NOTES) ---
 function Get-ActualCostRows {
     param([string]$Scope, [string]$CostType = 'ActualCost')
+    # The API dropped support for timeframe 'TheLastMonth' (HTTP 400: "currently not
+    # supported") - use an explicit Custom range covering last calendar month (UTC).
+    $utcNow = [DateTime]::UtcNow
+    $firstOfThisMonth = [DateTime]::new($utcNow.Year, $utcNow.Month, 1, 0, 0, 0, [DateTimeKind]::Utc)
+    $lastMonthStart = $firstOfThisMonth.AddMonths(-1)
+    $lastMonthEnd = $firstOfThisMonth.AddDays(-1)
     $body = @{
         type = $CostType
-        timeframe = 'TheLastMonth'
+        timeframe = 'Custom'
+        timePeriod = @{
+            from = $lastMonthStart.ToString('yyyy-MM-ddT00:00:00+00:00')
+            to   = $lastMonthEnd.ToString('yyyy-MM-ddT23:59:59+00:00')
+        }
         dataset = @{
             aggregation = @{ totalCost = @{ name = 'Cost'; function = 'Sum' } }
             grouping = @(@{ type = 'Dimension'; name = 'ResourceId' })
@@ -355,10 +371,10 @@ try {
     $storAccts = Invoke-ArgQuery -Query @'
 resources
 | where type =~ 'microsoft.storage/storageaccounts'
-| project id, name, resourceGroup, location, kind = tostring(kind), skuName = tostring(sku.name)
+| project id, name, resourceGroup, location, accountKind = tostring(kind), skuName = tostring(sku.name)
 '@
     foreach ($sa in $storAccts) {
-        $isPremiumFiles = $sa.kind -match '^(?i)FileStorage$'
+        $isPremiumFiles = $sa.accountKind -match '^(?i)FileStorage$'
         $shResp = Invoke-AzRestMethod -Method GET -Path "$($sa.id)/fileServices/default/shares?api-version=2023-01-01"
         if ($shResp.StatusCode -ne 200) { continue }   # no file service or not visible
         foreach ($sh in @((($shResp.Content | ConvertFrom-Json).value))) {
