@@ -56,6 +56,19 @@
     ./modeler.ps1 -TimeZone 'America/Chicago' -ModelName 'Contoso - Actuals'
 
 .NOTES
+    v0.16 (2026-08-07). CREDENTIAL CIRCUIT BREAKER - from a live Cloud Shell
+    run where the shell's token service started returning garbage mid-run
+    ("ManagedIdentityCredential ... invalid: ExpiresOn"). The user was signed
+    in; the token provider glitched, and every later Azure call failed
+    instantly and identically: 72 storage accounts mislabeled "slow or
+    unreadable", ANF and the cost pull dead, ~150 identical error dumps in
+    the transcript. Now: credential-shaped failures are classified apart
+    from slow/unreadable; the first one triggers a pause + one cheap probe;
+    if the token is still broken, ONE plain banner explains the glitch and
+    the fix (restart Cloud Shell / Connect-AzAccount, run again), and every
+    remaining Azure call is skipped fast under an accurate label. The census
+    reports token-blocked accounts separately. Telemetry (stage 4) completes
+    before storage, so pools/windows/MAU survive even a mid-run token death.
     v0.15.1 (2026-08-07). Local runs save to DOWNLOADS. The first Windows
     PowerShell 5.1 run (successful end to end - 5.1 support live-proven)
     wrote its zip to C:\Windows\System32, because that's where an elevated
@@ -238,7 +251,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = 'v0.15.1'
+$ScriptVersion = 'v0.16'
 # Windows PowerShell 5.1 compatibility: force TLS 1.2 (old .NET Framework
 # defaults can be lower and ARM/Log Analytics require 1.2), and no PS7-only
 # syntax anywhere in this file (?? / ?. / -AsPlainText / utf8NoBOM).
@@ -611,7 +624,29 @@ function Get-FileShareUsedGbFromMetrics {
     } catch { }
     $null
 }
+# --- credential circuit breaker ---------------------------------------------------
+# Live failure mode (Don's Cloud Shell run 2026-08-07): mid-run, Cloud Shell's
+# token service started returning garbage ("ManagedIdentityCredential ... invalid:
+# ExpiresOn") when the script's ARM token needed a refresh. The user IS signed in;
+# the shell's token provider glitched - and every later Azure call fails instantly
+# and identically. Without a breaker that meant 72 accounts mislabeled "slow or
+# unreadable" and ~150 identical error dumps. Now: first credential-shaped
+# failure -> short pause -> one cheap probe -> if still broken, ONE honest banner
+# and every remaining Azure call is skipped fast under an accurate label.
+$script:AuthBroken = $false
+function Test-CredError { param([string]$Message) [bool]($Message -match '(?i)credentials have not been set up|Connect-AzAccount|ManagedIdentityCredential') }
+function Confirm-AzureAuthAlive {
+    if ($script:AuthBroken) { return $false }
+    Start-Sleep -Seconds 8
+    try { Invoke-AzRestMethod -Method GET -Path "/subscriptions?api-version=2020-01-01" | Out-Null; return $true }
+    catch {
+        $script:AuthBroken = $true
+        Write-Warn2 "AZURE TOKEN REFRESH IS BROKEN in this shell session - you ARE signed in, but the shell's token service returned a bad response (the Cloud Shell 'ExpiresOn' glitch) when a mid-run token refresh came due. Every remaining Azure call would fail the same way, so they are being skipped fast instead. FIX: restart Cloud Shell (or run Connect-AzAccount), then run this command again - a fresh session completes normally."
+        return $false
+    }
+}
 $storSkipped = [System.Collections.Generic.List[string]]::new()
+$storAuthSkipped = [System.Collections.Generic.List[string]]::new()
 $censusShares = 0; $censusSized = 0
 $storAccts = @()
 try {
@@ -624,6 +659,7 @@ resources
     Write-Warn2 "Storage account inventory failed ($($_.Exception.Message)) - Azure Files profile storage not modeled."
 }
 foreach ($sa in $storAccts) {
+    if ($script:AuthBroken) { $storAuthSkipped.Add($sa.name); continue }
     try {
         # Classification by SKU, not account kind: provisioned-v2 StandardV2/PremiumV2
         # share the FileStorage kind, and each SKU implies its billing basis.
@@ -674,15 +710,25 @@ foreach ($sa in $storAccts) {
                 ServesPools = @(); Notes = ''
             })
         }
-    } catch { $storSkipped.Add($sa.name) }
+    } catch {
+        if (Test-CredError "$($_.Exception.Message)") {
+            if (Confirm-AzureAuthAlive) { $storSkipped.Add("$($sa.name) (transient auth)") }
+            else { $storAuthSkipped.Add($sa.name) }
+        } else { $storSkipped.Add($sa.name) }
+    }
 }
 if ($storSkipped.Count -gt 0) {
     Write-Warn2 "$($storSkipped.Count) storage account(s) skipped (slow or unreadable): $($storSkipped -join ', '). Their shares were NOT checked - they appear nowhere below."
+}
+if ($storAuthSkipped.Count -gt 0) {
+    Write-Warn2 "$($storAuthSkipped.Count) storage account(s) NOT checked because the Azure token broke (see banner above) - nothing wrong with these accounts; a fresh-session re-run reads them: $($storAuthSkipped -join ', ')"
 }
 # ANF is quantified at its BILLING boundary: Azure bills the capacity POOL's
 # provisioned size; volumes only carve quota from it. Pricing per-volume can
 # badly undercount real spend, so candidates here are capacity pools - member
 # SMB volumes listed, pools shared with non-SMB/non-profile volumes flagged.
+if ($script:AuthBroken) { Write-Warn2 "Azure NetApp Files discovery skipped - Azure token broken (see banner above); a fresh-session re-run covers it." }
+else {
 try {
     $anfVols = Invoke-ArgQuery -Query @'
 resources
@@ -744,7 +790,9 @@ resources
         })
     }
 } catch {
-    Write-Warn2 "Azure NetApp Files discovery failed ($($_.Exception.Message)) - ANF profile storage not modeled; Azure Files results above are unaffected."
+    if (Test-CredError "$($_.Exception.Message)") { Confirm-AzureAuthAlive | Out-Null; Write-Warn2 "Azure NetApp Files discovery hit the token failure - ANF not read this run; a fresh-session re-run covers it." }
+    else { Write-Warn2 "Azure NetApp Files discovery failed ($($_.Exception.Message)) - ANF profile storage not modeled; Azure Files results above are unaffected." }
+}
 }
 
 # ---- share -> pool mapping evidence (best effort - the prompt pass decides) ------
@@ -752,7 +800,7 @@ resources
 # All joins happen in POWERSHELL so evidence still lands when storage logs and
 # AVD logs live in different workspaces. Username overlap = fallback evidence.
 $mapEvidence = [System.Collections.Generic.List[object]]::new()
-if ($storageCandidates.Count -gt 0 -and $workspaceIds.Keys.Count -gt 0) {
+if ($storageCandidates.Count -gt 0 -and $workspaceIds.Keys.Count -gt 0 -and -not $script:AuthBroken) {
     Write-Info "      Checking Log Analytics for file-access logs (share -> pool evidence)..."
     # storage accounts may ship StorageFileLogs to workspaces the AVD side never uses
     $mapWorkspaceIds = @{}
@@ -854,7 +902,7 @@ if ($storageCandidates.Count -gt 0) {
     Write-Info "Storage policy: all $($storageCandidates.Count) store(s) recorded in the storage ledger; the Modeler JSON carries host pools only (fsLogix off everywhere)."
 }
 $censusUnsized = $censusShares - $censusSized
-Write-Info "Storage census: $(@($storAccts).Count) account(s) scanned, $($storSkipped.Count) skipped (named above), $censusShares candidate store(s), $censusSized sized, $censusUnsized without a size."
+Write-Info "Storage census: $(@($storAccts).Count) account(s) found, $($storAuthSkipped.Count) blocked by the token failure, $($storSkipped.Count) skipped (slow/unreadable), $censusShares candidate store(s), $censusSized sized, $censusUnsized without a size."
 $gap = 0.0
 foreach ($cand in ($storageCandidates | Where-Object { $_.Classification -in @('Profiles', 'Unknown') })) {
     if ($cand.BillingModel -eq 'Provisioned' -and $null -ne $cand.ProvisionedGb -and $null -ne $cand.UsedGb) { $gap += [Math]::Max(0, $cand.ProvisionedGb - $cand.UsedGb) }
@@ -979,7 +1027,10 @@ Write-Info "[7/8] Writing $OutFile..."
 Write-Utf8NoBom -FilePath $OutFile -Content ($model | ConvertTo-Json -Depth 30 -Compress)
 
 # ---------------------------------------- 7. actual spend (optional, skip-safe)
-if (-not $SkipCosts) {
+if ($script:AuthBroken -and -not $SkipCosts) {
+    Write-Warn2 "[8/8] Cost pull skipped - Azure token broken (see banner above); a fresh-session re-run fills ActualMo in."
+}
+if (-not $SkipCosts -and -not $script:AuthBroken) {
     Write-Info "[8/8] Pulling last month's ACTUAL spend for session-host VMs + disks (skips any scope without cost visibility)..."
     $costByResource = @{}
     $costCurrency = ''
@@ -995,7 +1046,13 @@ if (-not $SkipCosts) {
         if (-not $res.ok) {
             try { $res = Get-ActualCostRows -Scope $scope -CostType 'ActualCost' } catch { $res = @{ ok = $false; status = "error: $($_.Exception.Message)" } }
         }
-        if (-not $res.ok) { $costSkipped += [pscustomobject]@{ RG = $rgScopes[$scope]; Reason = "$($res.status)" }; continue }
+        if (-not $res.ok) {
+            if ((Test-CredError "$($res.status)") -and -not (Confirm-AzureAuthAlive)) {
+                Write-Warn2 "Cost pull stopped at the token failure - remaining scopes untried; a fresh-session re-run fills ActualMo in."
+                break
+            }
+            $costSkipped += [pscustomobject]@{ RG = $rgScopes[$scope]; Reason = "$($res.status)" }; continue
+        }
         $costOk++
         foreach ($row in $res.rows) {
             $costByResource[$row.ResourceId] = (Coalesce $costByResource[$row.ResourceId] 0) + $row.Cost

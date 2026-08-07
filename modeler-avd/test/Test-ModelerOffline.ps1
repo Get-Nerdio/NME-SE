@@ -153,7 +153,7 @@ $checks = [ordered]@{
     'ledger: msix classified appattach' = ($lMsix.Classification -eq 'AppAttach')
     'ledger: anf capacity pool 4096'    = ($lAnf.Classification -eq 'Profiles' -and $lAnf.ProvisionedGb -eq '4096' -and $lAnf.BillingUnit -match 'capacity pool' -and $lAnf.Notes -match 'anfprof')
     'ledger: stprofiles ActualMo 42'    = ($lProf.ActualMo -eq '42')
-    'census line printed'               = ($log -match 'Storage census: 2 account\(s\) scanned, 0 skipped')
+    'census line printed'               = ($log -match 'Storage census: 2 account\(s\) found, 0 blocked by the token failure, 0 skipped')
     'ledger-only policy line printed'   = ($log -match 'Storage policy: all 4 store\(s\) recorded in the storage ledger')
     'ActualMo uniform: PoolA 160.75'    = ($rowPoolA.ActualMo -eq '160.75')
     'admin tasks on pool deployment'    = (@($a.administrative.tasks.'2').Count -eq 16)
@@ -161,7 +161,7 @@ $checks = [ordered]@{
     'console log captured + clean'      = ($log -match 'Assembling deployments' -and $log -notmatch [char]27)
     'no raw-export failure in log'      = ($log -notmatch 'Raw data export failed' -and $log -match 'Raw decision data written')
     'counters exclude storage rows'     = ($log -match 'Usage found for 1 of 1 pool')
-    'rawdata sane + v0.15 + evidence'   = ($null -ne $rawJson -and @($rawJson.pools).Count -eq 1 -and $rawJson.meta.version -eq 'v0.15.1' -and @($rawJson.storageCandidates).Count -eq 4 -and @($rawJson.mapEvidence).Count -ge 1)
+    'rawdata sane + v0.15 + evidence'   = ($null -ne $rawJson -and @($rawJson.pools).Count -eq 1 -and $rawJson.meta.version -eq 'v0.16' -and @($rawJson.storageCandidates).Count -eq 4 -and @($rawJson.mapEvidence).Count -ge 1)
     'usage buckets csv in zip'          = (@($rawBucketsCsv).Count -eq 3 -and $rawBucketsCsv[1].ConcurrentUsers -eq '7')
     'no cmdlet-missing / skip errors'   = ($log -notmatch 'not recognized' -and $log -notmatch 'storage account\(s\) skipped \(slow')
 }
