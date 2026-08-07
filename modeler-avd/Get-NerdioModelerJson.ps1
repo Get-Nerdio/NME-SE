@@ -56,6 +56,12 @@
     ./modeler.ps1 -TimeZone 'America/Chicago' -ModelName 'Contoso - Actuals'
 
 .NOTES
+    v0.15.1 (2026-08-07). Local runs save to DOWNLOADS. The first Windows
+    PowerShell 5.1 run (successful end to end - 5.1 support live-proven)
+    wrote its zip to C:\Windows\System32, because that's where an elevated
+    console starts and the script wrote to the current directory. Default
+    output now lands in the user's Downloads folder on local runs, full path
+    printed at the end. Explicit -OutFile and Cloud Shell are unchanged.
     v0.15 (2026-08-07). TWO RULINGS FROM THE FIRST LIVE v0.14 RUN:
     (1) STORAGE IS LEDGER-ONLY, ALWAYS. The v0.14 interactive triage asked the
     runner to classify stores and type pool names mid-run - unworkable at scale
@@ -232,7 +238,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = 'v0.15'
+$ScriptVersion = 'v0.15.1'
 # Windows PowerShell 5.1 compatibility: force TLS 1.2 (old .NET Framework
 # defaults can be lower and ARM/Log Analytics require 1.2), and no PS7-only
 # syntax anywhere in this file (?? / ?. / -AsPlainText / utf8NoBOM).
@@ -243,7 +249,19 @@ function Write-Utf8NoBom {
     $full = if ([IO.Path]::IsPathRooted($FilePath)) { $FilePath } else { Join-Path (Get-Location).Path $FilePath }
     [IO.File]::WriteAllText($full, $Content, (New-Object System.Text.UTF8Encoding($false)))
 }
-if ([string]::IsNullOrEmpty($OutFile)) { $OutFile = "modeler-import-$(Get-Date -Format 'yyyyMMdd-HHmm').json" }
+# Cloud Shell detection first - the output location depends on it
+$script:IsCloudShell = (-not [string]::IsNullOrEmpty($env:ACC_CLOUD)) -or ($env:AZUREPS_HOST_ENVIRONMENT -like "cloud-shell*")
+if ([string]::IsNullOrEmpty($OutFile)) {
+    $OutFile = "modeler-import-$(Get-Date -Format 'yyyyMMdd-HHmm').json"
+    # Local runs default the whole output set into the user's Downloads folder -
+    # that's where people look, and an elevated console starts in
+    # C:\Windows\System32, where output effectively vanishes. An explicit
+    # -OutFile and Cloud Shell (which auto-downloads) are left untouched.
+    if (-not $script:IsCloudShell) {
+        $dl = Join-Path $HOME 'Downloads'
+        if (Test-Path -LiteralPath $dl) { $OutFile = Join-Path $dl $OutFile }
+    }
+}
 
 function Write-Info { param([string]$m) Write-Host "[i] $m" -ForegroundColor Gray }
 function Write-Ok   { param([string]$m) Write-Host "[+] $m" -ForegroundColor Green }
@@ -255,8 +273,7 @@ $script:TranscriptOn = $false
 try { Start-Transcript -Path $script:TranscriptFile -Force | Out-Null; $script:TranscriptOn = $true }
 catch { Write-Warn2 "Console transcript unavailable ($($_.Exception.Message)) - the zip will omit the run log." }
 
-# --- Cloud Shell detection + auto-download (same pattern as Test-NmeDeploymentReadiness) ---
-$script:IsCloudShell = (-not [string]::IsNullOrEmpty($env:ACC_CLOUD)) -or ($env:AZUREPS_HOST_ENVIRONMENT -like "cloud-shell*")
+# --- Cloud Shell auto-download (same pattern as Test-NmeDeploymentReadiness) ---
 function Invoke-CloudShellDownload {
     param([string]$Path)
     if (-not $script:IsCloudShell) { Write-Info "Not running in Cloud Shell - file saved at: $Path"; return }

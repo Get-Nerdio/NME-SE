@@ -161,7 +161,7 @@ $checks = [ordered]@{
     'console log captured + clean'      = ($log -match 'Assembling deployments' -and $log -notmatch [char]27)
     'no raw-export failure in log'      = ($log -notmatch 'Raw data export failed' -and $log -match 'Raw decision data written')
     'counters exclude storage rows'     = ($log -match 'Usage found for 1 of 1 pool')
-    'rawdata sane + v0.15 + evidence'   = ($null -ne $rawJson -and @($rawJson.pools).Count -eq 1 -and $rawJson.meta.version -eq 'v0.15' -and @($rawJson.storageCandidates).Count -eq 4 -and @($rawJson.mapEvidence).Count -ge 1)
+    'rawdata sane + v0.15 + evidence'   = ($null -ne $rawJson -and @($rawJson.pools).Count -eq 1 -and $rawJson.meta.version -eq 'v0.15.1' -and @($rawJson.storageCandidates).Count -eq 4 -and @($rawJson.mapEvidence).Count -ge 1)
     'usage buckets csv in zip'          = (@($rawBucketsCsv).Count -eq 3 -and $rawBucketsCsv[1].ConcurrentUsers -eq '7')
     'no cmdlet-missing / skip errors'   = ($log -notmatch 'not recognized' -and $log -notmatch 'storage account\(s\) skipped \(slow')
 }

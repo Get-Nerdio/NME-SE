@@ -21,7 +21,7 @@ A cost model is only as credible as the data behind it. This tool feeds the Mode
 4. One zip downloads automatically: `modeler-import-<timestamp>.zip` — the import JSON, the review CSV, the **storage ledger CSV**, the raw observation data, and the run's full console log. If someone asked you to run this, **that zip is the only thing to send back**.
 5. Nerdio Modeler → **Import** → pick the JSON (from the zip). Done.
 
-**Running from a local machine instead:** the **Az.Accounts** module is all it takes (`Install-Module Az.Accounts` once, then `Connect-AzAccount` — add `-TenantId <id>` if you have several tenants). Then paste **the exact same command** — nothing about it changes between Cloud Shell and local. Works in PowerShell 7 (recommended) *and* the built-in Windows PowerShell 5.1. No other Az modules are used — inventory, telemetry, storage, and cost are all reached over REST. The only difference: the zip is written to the current folder instead of auto-downloading (the browser download is Cloud Shell-only).
+**Running from a local machine instead:** the **Az.Accounts** module is all it takes (`Install-Module Az.Accounts` once, then `Connect-AzAccount` — add `-TenantId <id>` if you have several tenants). Then paste **the exact same command** — nothing about it changes between Cloud Shell and local. Works in PowerShell 7 (recommended) *and* the built-in Windows PowerShell 5.1. No other Az modules are used — inventory, telemetry, storage, and cost are all reached over REST. The only difference: instead of a browser auto-download, the zip is saved to your **Downloads** folder (full path printed at the end of the run).
 
 Prefer to read code before running it (you should):
 
