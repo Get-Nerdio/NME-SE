@@ -50,6 +50,36 @@
     ./modeler.ps1 -TimeZone 'America/Chicago' -ModelName 'Contoso - Actuals'
 
 .NOTES
+    v0.14 (2026-08-07). STORAGE OVERHAUL - nothing unconfirmed enters the model:
+    (1) POLICY: a discovered store lands in the Modeler JSON only when it is
+    confirmed as FSLogix profile storage AND mapped to at least one host pool
+    (by log evidence accepted at the prompt, or typed by the person running).
+    Everything discovered - confirmed or not, app attach, non-AVD, unknown -
+    is quantified in a new storage ledger CSV that always ships in the zip.
+    App attach never enters the JSON (no Modeler concept for it).
+    (2) INLINE TRIAGE: one line per store with a smart default (name-matched ->
+    PROFILES, msix -> APP ATTACH, pvcn-/mq/sftp patterns -> NOT AVD, else
+    UNKNOWN). Enter accepts; pool assignment is search-driven - type name or
+    resource-group fragments, the script resolves and echoes matches; * = all.
+    Drops are bulk-confirmed at the end, never silent. -NoPrompts (or any
+    non-interactive session) skips the pass: ledger only, JSON gets no storage.
+    (3) EVIDENCE: mapping now correlates StorageFileLogs caller IPs with
+    WVDConnections session-host IPs (works across split workspaces - joins
+    happen in PowerShell), with username overlap demoted to fallback evidence;
+    each storage account's own diagnostic-settings workspace is discovered and
+    queried, not just the AVD workspaces. All serving pools are kept (the old
+    6-pool cap was display-only in intent, stored in practice - fixed).
+    (4) CLASSIFICATION BY SKU, not account kind: FileStorage no longer implies
+    premium (provisioned-v2 StandardV2/PremiumV2 SKUs share the kind). Billing
+    basis follows the SKU: provisioned models bill provisioned GB, v1 standard
+    bills used. v2 IOPS/throughput recorded in the ledger.
+    (5) SIZE RESILIENCE: share stats retry once, then fall back to the Azure
+    Monitor FileCapacity metric (already computed platform-side - answers fast
+    where on-demand stats on huge shares hit the 100s timeout). ANF used GB
+    from the VolumeLogicalSize metric. ANF is quantified at its BILLING
+    boundary - the capacity pool, priced once, member volumes listed, shared
+    pools flagged. A census line ends the stage: accounts scanned/skipped,
+    shares sized/unsized - gaps are named, never silent.
     v0.13 (2026-08-07). LOCAL POWERSHELL IS NOW FIRST-CLASS - from a prospect's
     local-PS run that lost every usage number:
     (1) Telemetry queries no longer use Invoke-AzOperationalInsightsQuery (the
@@ -175,11 +205,12 @@ param(
     [Parameter(Mandatory = $false)] [string[]] $SubscriptionId = @(),
     [Parameter(Mandatory = $false)] [string]   $OutFile        = "",
     [Parameter(Mandatory = $false)] [switch]   $SkipDownload,
-    [Parameter(Mandatory = $false)] [switch]   $SkipCosts
+    [Parameter(Mandatory = $false)] [switch]   $SkipCosts,
+    [Parameter(Mandatory = $false)] [switch]   $NoPrompts
 )
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = 'v0.13'
+$ScriptVersion = 'v0.14'
 if ([string]::IsNullOrEmpty($OutFile)) { $OutFile = "modeler-import-$(Get-Date -Format 'yyyyMMdd-HHmm').json" }
 
 function Write-Info { param([string]$m) Write-Host "[i] $m" -ForegroundColor Gray }
@@ -499,14 +530,26 @@ foreach ($wsId in $workspaceIds.Keys) {
 # StorageFileLogs to Log Analytics) map shares to pools from observed usernames.
 # Everything here is skip-graceful: no candidates -> model unchanged, note printed.
 Write-Info "[5/8] Discovering FSLogix profile storage (Azure Files + ANF)..."
-$profileStores = [System.Collections.Generic.List[object]]::new()
+$storageCandidates = [System.Collections.Generic.List[object]]::new()
 $profileNameRx = '(?i)prof|fslogix|upd|userdisk|usrprof|msix|app[-_]?attach'
-# One slow account must never abort the rest: a prospect's 100TB share timed the
-# stats call out (fixed 100s HttpClient limit) and the old single try/catch then
-# skipped every remaining account AND all ANF checking - silently. Each account
-# now fails alone, stats failures keep the share (size unreadable), and skips
-# are named in the log.
+# One slow account must never abort the rest, and a skipped size must never be
+# silent: stats retry once, then fall back to the Azure Monitor FileCapacity
+# metric (platform-computed - fast where on-demand stats on huge shares hit the
+# fixed 100s timeout). Whatever still fails is NAMED and counted in the census.
+function Get-FileShareUsedGbFromMetrics {
+    param([string]$AccountId, [string]$ShareName)
+    try {
+        $uri = "$AccountId/fileServices/default/providers/Microsoft.Insights/metrics?api-version=2019-07-01&metricnames=FileCapacity&aggregation=Average&interval=PT1H&timespan=PT2H" + "&`$filter=FileShare eq '$ShareName'"
+        $r = Invoke-AzRestMethod -Method GET -Path $uri
+        if ($r.StatusCode -ne 200) { return $null }
+        $m = @((($r.Content | ConvertFrom-Json).value)) | Select-Object -First 1
+        $pts = @($m.timeseries | ForEach-Object { $_.data } | Where-Object { $null -ne $_.average -and $_.average -gt 0 })
+        if ($pts.Count -gt 0) { return [Math]::Round(@($pts)[-1].average / 1GB, 1) }
+    } catch { }
+    $null
+}
 $storSkipped = [System.Collections.Generic.List[string]]::new()
+$censusShares = 0; $censusSized = 0
 $storAccts = @()
 try {
     $storAccts = Invoke-ArgQuery -Query @'
@@ -519,41 +562,64 @@ resources
 }
 foreach ($sa in $storAccts) {
     try {
-        $isPremiumFiles = $sa.accountKind -match '^(?i)FileStorage$'
+        # Classification by SKU, not account kind: provisioned-v2 StandardV2/PremiumV2
+        # share the FileStorage kind, and each SKU implies its billing basis.
+        $sku = "$($sa.skuName)"
+        $isZrs = $sku -match '(?i)zrs'
+        $isPremium = $sku -match '^(?i)Premium'
+        $isV2 = $sku -match '(?i)V2_'
+        $provisionedModel = $isPremium -or $isV2   # premium (v1/v2) and standardV2 bill PROVISIONED; v1 standard bills USED
         $shResp = Invoke-AzRestMethod -Method GET -Path "$($sa.id)/fileServices/default/shares?api-version=2023-01-01"
         if ($shResp.StatusCode -ne 200) { continue }   # no file service or not visible
         foreach ($sh in @((($shResp.Content | ConvertFrom-Json).value))) {
             $shName = "$($sh.name)"
             $smb = ($null -eq $sh.properties.enabledProtocols) -or ("$($sh.properties.enabledProtocols)" -match '(?i)smb')
             if (-not $smb) { continue }
-            if (-not ($isPremiumFiles -or $shName -match $profileNameRx)) { continue }
-            $usedGb = $null
+            if (-not ($provisionedModel -or $shName -match $profileNameRx)) { continue }
+            $censusShares++
+            $usedGb = $null; $usedSource = ''
             try {
                 $stResp = Invoke-AzRestMethod -Method GET -Path "$($sa.id)/fileServices/default/shares/$($shName)?api-version=2023-01-01&`$expand=stats"
+                if ($stResp.StatusCode -ne 200) { $stResp = Invoke-AzRestMethod -Method GET -Path "$($sa.id)/fileServices/default/shares/$($shName)?api-version=2023-01-01&`$expand=stats" }
                 if ($stResp.StatusCode -eq 200) {
                     $stProps = ($stResp.Content | ConvertFrom-Json).properties
-                    if ($null -ne $stProps.shareUsageBytes) { $usedGb = [Math]::Round($stProps.shareUsageBytes / 1GB, 1) }
+                    if ($null -ne $stProps.shareUsageBytes) { $usedGb = [Math]::Round($stProps.shareUsageBytes / 1GB, 1); $usedSource = 'stats' }
                 }
-            } catch { }   # stats timeout on a huge share - keep the share, size stays unreadable
+            } catch { }
+            if ($null -eq $usedGb) {
+                $usedGb = Get-FileShareUsedGbFromMetrics -AccountId $sa.id -ShareName $shName
+                if ($null -ne $usedGb) { $usedSource = 'metrics' }
+            }
+            if ($null -ne $usedGb) { $censusSized++ }
             $provGb = if ($null -ne $sh.properties.shareQuota) { [int]$sh.properties.shareQuota } else { $null }
+            $tierLabel = if ($isPremium) { "Azure Files Premium$(if ($isV2) { ' v2' }) ($(if ($isZrs) { 'ZRS' } else { 'LRS' }))" }
+                         elseif ($isV2) { 'Azure Files Standard (provisioned v2)' }
+                         else { 'Azure Files Standard' }
             # Modeler storage enum (dropdown order): 1=Files Premium LRS, 2=Files Premium ZRS,
             # 3=ANF Standard, 4=ANF Premium, 5=ANF Ultra. No standard-Files option exists.
-            $isZrs = "$($sa.skuName)" -match '(?i)zrs'
-            $profileStores.Add([pscustomobject]@{
-                Kind = if ($isPremiumFiles) { "Azure Files Premium ($(if ($isZrs) { 'ZRS' } else { 'LRS' }))" } else { 'Azure Files Standard' }
+            $tierNote = if (-not $isPremium) { "the Modeler has no standard Files tier, so this models as Azure Files Premium (LRS) on $(if ($provisionedModel) { 'PROVISIONED' } else { 'USED' }) GB; conservative" } else { '' }
+            $storageCandidates.Add([pscustomobject]@{
+                ResourceId = $sa.id; BillingUnit = "$($sa.name)/$shName"
+                Kind = $tierLabel; Sku = $sku; BillingModel = $(if ($provisionedModel) { 'Provisioned' } else { 'Used' })
                 Account = $sa.name; Share = $shName; RG = $sa.resourceGroup; Region = $sa.location
-                ProvisionedGb = $provGb; UsedGb = $usedGb
+                ProvisionedGb = $provGb; UsedGb = $usedGb; UsedSource = $usedSource
+                ProvisionedIops = $sh.properties.provisionedIops; ThroughputMibps = $sh.properties.provisionedBandwidthMibps
                 NameMatch = [bool]($shName -match $profileNameRx)
-                StorageTypeEnum = if ($isPremiumFiles -and $isZrs) { 2 } else { 1 }
-                TierNote = if (-not $isPremiumFiles) { 'standard file share - the Modeler has no standard Files tier, so this is modeled as Azure Files Premium (LRS) on USED GB; slightly conservative' } else { '' }
-                ServesPools = @()
+                StorageTypeEnum = if ($isPremium -and $isZrs) { 2 } else { 1 }
+                TierNote = $tierNote
+                Classification = ''; Evidence = 'none'; Confidence = ''
+                ServesPools = @(); Notes = ''
             })
         }
     } catch { $storSkipped.Add($sa.name) }
 }
 if ($storSkipped.Count -gt 0) {
-    Write-Warn2 "$($storSkipped.Count) storage account(s) skipped (slow or unreadable): $($storSkipped -join ', '). Their shares were NOT checked; every other account was."
+    Write-Warn2 "$($storSkipped.Count) storage account(s) skipped (slow or unreadable): $($storSkipped -join ', '). Their shares were NOT checked - they appear nowhere below."
 }
+# ANF is quantified at its BILLING boundary: Azure bills the capacity POOL's
+# provisioned size; volumes only carve quota from it. Pricing per-volume can
+# badly undercount real spend, so candidates here are capacity pools - member
+# SMB volumes listed, pools shared with non-SMB/non-profile volumes flagged.
 try {
     $anfVols = Invoke-ArgQuery -Query @'
 resources
@@ -563,69 +629,250 @@ resources
           protocols = properties.protocolTypes,
           serviceLevel = tostring(properties.serviceLevel)
 '@
-    foreach ($v in $anfVols) {
-        $volName = ($v.name -split '/')[-1]
-        $isSmb = ((@($v.protocols) | ForEach-Object { "$_" }) -join ',') -match '(?i)cifs|smb'
-        if (-not $isSmb) { continue }
-        $anfEnum = switch -Regex ("$($v.serviceLevel)") { '^(?i)standard$' { 3; break } '^(?i)premium$' { 4; break } '^(?i)ultra$' { 5; break } default { 4 } }
-        $profileStores.Add([pscustomobject]@{
-            Kind = "Azure NetApp Files $($v.serviceLevel)"
-            Account = ($v.id -split '/')[-5] + '/' + ($v.id -split '/')[-3]
-            Share = $volName; RG = $v.resourceGroup; Region = $v.location
-            ProvisionedGb = [int][Math]::Round($v.provisionedBytes / 1GB); UsedGb = $null
-            NameMatch = [bool]($volName -match $profileNameRx)
+    $anfPools = @()
+    try {
+        $anfPools = Invoke-ArgQuery -Query @'
+resources
+| where type =~ 'microsoft.netapp/netappaccounts/capacitypools'
+| project id, name, poolBytes = tolong(properties.size), serviceLevel = tostring(properties.serviceLevel)
+'@
+    } catch { }
+    $poolInfo = @{}
+    foreach ($cp in $anfPools) { $poolInfo["$($cp.id)".ToLowerInvariant()] = $cp }
+    foreach ($grp in (@($anfVols) | Group-Object { ("$($_.id)" -split '(?i)/volumes/')[0].ToLowerInvariant() })) {
+        $parentId = $grp.Name
+        $volsAll = @($grp.Group)
+        $volsSmb = @($volsAll | Where-Object { ((@($_.protocols) | ForEach-Object { "$_" }) -join ',') -match '(?i)cifs|smb' })
+        if ($volsSmb.Count -eq 0) { continue }   # capacity pool with no SMB volumes - not an FSLogix candidate
+        $censusShares++
+        $cp = $poolInfo[$parentId]
+        $poolGb = if ($cp -and $cp.poolBytes) { [int][Math]::Round($cp.poolBytes / 1GB) }
+                  else { [int][Math]::Round((($volsAll | Measure-Object provisionedBytes -Sum).Sum) / 1GB) }
+        $lvl = if ($cp) { "$($cp.serviceLevel)" } else { "$($volsSmb[0].serviceLevel)" }
+        $anfEnum = switch -Regex ($lvl) { '^(?i)standard$' { 3; break } '^(?i)premium$' { 4; break } '^(?i)ultra$' { 5; break } default { 4 } }
+        # used GB best effort from the VolumeLogicalSize metric per SMB volume
+        $usedSum = $null
+        foreach ($v in $volsSmb) {
+            try {
+                $mr = Invoke-AzRestMethod -Method GET -Path "$($v.id)/providers/Microsoft.Insights/metrics?api-version=2019-07-01&metricnames=VolumeLogicalSize&aggregation=Average&interval=PT1H&timespan=PT2H"
+                if ($mr.StatusCode -eq 200) {
+                    $mm = @((($mr.Content | ConvertFrom-Json).value)) | Select-Object -First 1
+                    $pts = @($mm.timeseries | ForEach-Object { $_.data } | Where-Object { $null -ne $_.average -and $_.average -gt 0 })
+                    if ($pts.Count -gt 0) { $usedSum = [Math]::Round(($usedSum ?? 0) + @($pts)[-1].average / 1GB, 1) }
+                }
+            } catch { }
+        }
+        if ($null -ne $usedSum) { $censusSized++ }
+        $poolName = ($parentId -split '/')[-1]
+        $anfAcct = ($parentId -split '/')[-3]
+        $memberNames = @($volsSmb | ForEach-Object { ("$($_.name)" -split '/')[-1] })
+        $sharedNote = if ($volsAll.Count -gt $volsSmb.Count) { "capacity pool shared with $($volsAll.Count - $volsSmb.Count) non-SMB volume(s) - pool billed as a whole" } else { '' }
+        $storageCandidates.Add([pscustomobject]@{
+            ResourceId = $parentId; BillingUnit = "$anfAcct/$poolName (capacity pool)"
+            Kind = "Azure NetApp Files $lvl (capacity pool)"; Sku = "ANF $lvl"; BillingModel = 'Provisioned'
+            Account = $anfAcct; Share = $poolName; RG = $volsSmb[0].resourceGroup; Region = $volsSmb[0].location
+            ProvisionedGb = $poolGb; UsedGb = $usedSum; UsedSource = $(if ($null -ne $usedSum) { 'metrics' } else { '' })
+            ProvisionedIops = $null; ThroughputMibps = $null
+            NameMatch = [bool](@($memberNames | Where-Object { $_ -match $profileNameRx }).Count -gt 0)
             StorageTypeEnum = $anfEnum
-            TierNote = if ("$($v.serviceLevel)" -notmatch '^(?i)(standard|premium|ultra)$') { "ANF service level '$($v.serviceLevel)' unrecognized - modeled as ANF Premium; verify" } else { '' }
-            ServesPools = @()
+            TierNote = "$(if ($lvl -notmatch '^(?i)(standard|premium|ultra)$') { "ANF service level '$lvl' unrecognized - modeled as ANF Premium; verify" })"
+            Classification = ''; Evidence = 'none'; Confidence = ''
+            ServesPools = @(); Notes = "$("volumes: $($memberNames -join ', ')")$(if ($sharedNote) { "; $sharedNote" })"
         })
     }
 } catch {
     Write-Warn2 "Azure NetApp Files discovery failed ($($_.Exception.Message)) - ANF profile storage not modeled; Azure Files results above are unaffected."
 }
 
-# ---- share -> pool mapping from StorageFileLogs (only when the logs exist) -------
-if ($profileStores.Count -gt 0 -and $workspaceIds.Keys.Count -gt 0) {
-    Write-Info "      Checking Log Analytics for file-access logs (share -> pool mapping)..."
-    $mapKql = @'
+# ---- share -> pool mapping evidence (best effort - the prompt pass decides) ------
+# IP-first: StorageFileLogs caller IPs joined to WVDConnections session-host IPs.
+# All joins happen in POWERSHELL so evidence still lands when storage logs and
+# AVD logs live in different workspaces. Username overlap = fallback evidence.
+$mapEvidence = [System.Collections.Generic.List[object]]::new()
+if ($storageCandidates.Count -gt 0 -and $workspaceIds.Keys.Count -gt 0) {
+    Write-Info "      Checking Log Analytics for file-access logs (share -> pool evidence)..."
+    # storage accounts may ship StorageFileLogs to workspaces the AVD side never uses
+    $mapWorkspaceIds = @{}
+    foreach ($k in $workspaceIds.Keys) { $mapWorkspaceIds[$k] = $true }
+    foreach ($acctId in (@($storageCandidates | Where-Object { $_.Kind -notmatch 'NetApp' } | ForEach-Object { $_.ResourceId }) | Select-Object -Unique)) {
+        try {
+            $dsResp = Invoke-AzRestMethod -Method GET -Path "$acctId/fileServices/default/providers/Microsoft.Insights/diagnosticSettings?api-version=2021-05-01-preview"
+            if ($dsResp.StatusCode -eq 200) {
+                foreach ($ds in ((($dsResp.Content | ConvertFrom-Json).value))) {
+                    if ($ds.properties.workspaceId) { $mapWorkspaceIds[$ds.properties.workspaceId.ToLower()] = $true }
+                }
+            }
+        } catch { }
+    }
+    $mapSharesKql = @'
 let LookbackDays = __LOOKBACK__d;
-let FileOps = union isfuzzy=true (datatable(TimeGenerated:datetime, AccountName:string, ObjectKey:string)[]), (StorageFileLogs | project TimeGenerated, AccountName, ObjectKey);
-let ShareUsers = FileOps | where TimeGenerated > ago(LookbackDays) | extend Parts = split(ObjectKey, '/') | extend Share = tolower(tostring(Parts[2])) | extend U1 = extract(@'(?i)Profiles?[_-]([^/\\.]+)\.vhdx?', 1, ObjectKey) | extend U2 = extract(@'(?i)/([^/]+?)_S-1-[0-9-]+', 1, ObjectKey) | extend UserGuess = tolower(coalesce(U1, U2)) | where isnotempty(UserGuess) and isnotempty(Share) | summarize by AccountName = tolower(AccountName), Share, UserGuess;
-let PoolUsers = union isfuzzy=true (datatable(TimeGenerated:datetime, State:string, UserName:string, _ResourceId:string)[]), (WVDConnections | project TimeGenerated, State, UserName, _ResourceId) | where TimeGenerated > ago(LookbackDays) | where State == 'Connected' | summarize by HostPoolId = tolower(_ResourceId), UserGuess = tolower(tostring(split(UserName, '@')[0]));
-ShareUsers | join kind=inner PoolUsers on UserGuess | summarize Overlap = dcount(UserGuess) by AccountName, Share, HostPoolId
+let FileOps = union isfuzzy=true (datatable(TimeGenerated:datetime, AccountName:string, ObjectKey:string, CallerIpAddress:string)[]), (StorageFileLogs | project TimeGenerated, AccountName, ObjectKey, CallerIpAddress);
+let Ops = FileOps | where TimeGenerated > ago(LookbackDays) | extend Parts = split(ObjectKey, '/') | extend Share = tolower(tostring(Parts[2])) | where isnotempty(Share) | extend AccountName = tolower(AccountName);
+let ShareIps = Ops | extend Ip = tostring(split(CallerIpAddress, ':')[0]) | where isnotempty(Ip) | summarize OpsCount = count() by RowType = 'shareip', AccountName, Share, Ip | extend UserGuess = '';
+let ShareUsers = Ops | extend U1 = extract(@'(?i)Profiles?[_-]([^/\\.]+)\.vhdx?', 1, ObjectKey) | extend U2 = extract(@'(?i)/([^/]+?)_S-1-[0-9-]+', 1, ObjectKey) | extend UserGuess = tolower(coalesce(U1, U2)) | where isnotempty(UserGuess) | summarize OpsCount = count() by RowType = 'shareuser', AccountName, Share, UserGuess | extend Ip = '';
+ShareIps | union ShareUsers | project RowType, AccountName, Share, Ip, UserGuess, OpsCount
 '@
-    $mapKql = $mapKql.Replace('__LOOKBACK__', "$LookbackDays")
-    $mapRows = [System.Collections.Generic.List[object]]::new()
-    foreach ($wsId in $workspaceIds.Keys) {
+    $mapPoolsKql = @'
+let LookbackDays = __LOOKBACK__d;
+let Conn = union isfuzzy=true (datatable(TimeGenerated:datetime, State:string, UserName:string, SessionHostIPAddress:string, _ResourceId:string)[]), (WVDConnections | project TimeGenerated, State, UserName, SessionHostIPAddress, _ResourceId) | where TimeGenerated > ago(LookbackDays) | where State == 'Connected';
+let HostIps = Conn | where isnotempty(SessionHostIPAddress) | summarize by RowType = 'hostip', Ip = tostring(SessionHostIPAddress), HostPoolId = tolower(_ResourceId) | extend UserGuess = '';
+let PoolUsers = Conn | summarize by RowType = 'pooluser', UserGuess = tolower(tostring(split(UserName, '@')[0])), HostPoolId = tolower(_ResourceId) | extend Ip = '';
+HostIps | union PoolUsers | project RowType, Ip, UserGuess, HostPoolId
+'@
+    $mapSharesKql = $mapSharesKql.Replace('__LOOKBACK__', "$LookbackDays")
+    $mapPoolsKql = $mapPoolsKql.Replace('__LOOKBACK__', "$LookbackDays")
+    $shareRows = [System.Collections.Generic.List[object]]::new()
+    $poolRows = [System.Collections.Generic.List[object]]::new()
+    foreach ($wsId in $mapWorkspaceIds.Keys) {
         try {
             $wsResp = Invoke-AzRestMethod -Method GET -Path "$wsId`?api-version=2021-06-01"
             if ($wsResp.StatusCode -ne 200) { continue }
             $customerId = ($wsResp.Content | ConvertFrom-Json).properties.customerId
-            $result = Invoke-LaQuery -WorkspaceCustomerId $customerId -Query $mapKql
-            foreach ($row in @($result.Results)) { $mapRows.Add($row) }
+            foreach ($row in @((Invoke-LaQuery -WorkspaceCustomerId $customerId -Query $mapSharesKql).Results)) { $shareRows.Add($row) }
+            if ($workspaceIds.ContainsKey($wsId)) {
+                foreach ($row in @((Invoke-LaQuery -WorkspaceCustomerId $customerId -Query $mapPoolsKql).Results)) { $poolRows.Add($row) }
+            }
         } catch { }
     }
-    if ($mapRows.Count -gt 0) {
-        $poolNameById = @{}
-        foreach ($p in $pools) { $poolNameById["$($p.id)".ToLowerInvariant()] = $p.name }
-        foreach ($ps in $profileStores) {
-            $hits = @($mapRows | Where-Object { "$($_.AccountName)" -eq $ps.Account.ToLowerInvariant() -and "$($_.Share)" -eq $ps.Share.ToLowerInvariant() -and [int]$_.Overlap -ge 2 } |
-                     Sort-Object { -[int]$_.Overlap })
-            $ps.ServesPools = @($hits | ForEach-Object { $poolNameById["$($_.HostPoolId)".ToLowerInvariant()] } | Where-Object { $_ } | Select-Object -Unique -First 6)
+    $poolNameById = @{}
+    foreach ($p in $pools) { $poolNameById["$($p.id)".ToLowerInvariant()] = $p.name }
+    $ipToPools = @{}
+    foreach ($r in ($poolRows | Where-Object { $_.RowType -eq 'hostip' })) { $ipToPools["$($r.Ip)"] = @(@($ipToPools["$($r.Ip)"]) + @("$($r.HostPoolId)") | Where-Object { $_ } | Select-Object -Unique) }
+    $userToPools = @{}
+    foreach ($r in ($poolRows | Where-Object { $_.RowType -eq 'pooluser' })) { $userToPools["$($r.UserGuess)"] = @(@($userToPools["$($r.UserGuess)"]) + @("$($r.HostPoolId)") | Where-Object { $_ } | Select-Object -Unique) }
+    foreach ($cand in ($storageCandidates | Where-Object { $_.Kind -notmatch 'NetApp' })) {
+        $acct = $cand.Account.ToLowerInvariant(); $shr = $cand.Share.ToLowerInvariant()
+        $mine = @($shareRows | Where-Object { "$($_.AccountName)" -eq $acct -and "$($_.Share)" -eq $shr })
+        # IP evidence first (strong): distinct session-host IPs seen opening this share, per pool
+        $ipHits = @{}
+        foreach ($r in ($mine | Where-Object { $_.RowType -eq 'shareip' })) {
+            foreach ($pid_ in @($ipToPools["$($r.Ip)"])) { $ipHits[$pid_] = 1 + ($ipHits[$pid_] ?? 0) }
         }
-        Write-Ok "File-access logs found - $(@($profileStores | Where-Object { $_.ServesPools.Count -gt 0 }).Count) share(s) mapped to pools by observed users."
-    } else {
-        Write-Info "      No StorageFileLogs data (file-share diagnostics not enabled) - shares reported unmapped; confirm pool assignment with the AVD admin."
+        # username-overlap fallback (weak): distinct extracted usernames per pool, >= 2
+        $userHits = @{}
+        foreach ($r in ($mine | Where-Object { $_.RowType -eq 'shareuser' })) {
+            foreach ($pid_ in @($userToPools["$($r.UserGuess)"])) { $userHits[$pid_] = 1 + ($userHits[$pid_] ?? 0) }
+        }
+        $hitIds = @()
+        if ($ipHits.Keys.Count -gt 0) { $hitIds = @($ipHits.Keys); $cand.Evidence = 'logs-ip'; $cand.Confidence = 'high' }
+        elseif (@($userHits.Keys | Where-Object { $userHits[$_] -ge 2 }).Count -gt 0) { $hitIds = @($userHits.Keys | Where-Object { $userHits[$_] -ge 2 }); $cand.Evidence = 'logs-user'; $cand.Confidence = 'medium' }
+        if ($hitIds.Count -gt 0) {
+            $cand.ServesPools = @($hitIds | ForEach-Object { $poolNameById["$_"] } | Where-Object { $_ } | Select-Object -Unique)   # ALL pools kept - no cap
+            foreach ($pid_ in $hitIds) { $mapEvidence.Add([pscustomobject]@{ Account = $cand.Account; Share = $cand.Share; HostPoolId = $pid_; Evidence = $cand.Evidence; Strength = ($ipHits[$pid_] ?? $userHits[$pid_]) }) }
+        }
     }
+    $mappedCount = @($storageCandidates | Where-Object { $_.ServesPools.Count -gt 0 }).Count
+    if ($mappedCount -gt 0) { Write-Ok "File-access logs found - $mappedCount store(s) have pool evidence (pre-filled at the prompt; you confirm)." }
+    else { Write-Info "      No StorageFileLogs data (file-share diagnostics not enabled) - no automatic pool evidence; the prompt below (or the AVD admin) decides." }
 }
-if ($profileStores.Count -gt 0) {
-    $profileStores | Select-Object Kind, Account, Share, Region, ProvisionedGb, UsedGb, @{n='ServesPools'; e={ $_.ServesPools -join ', ' }} |
+
+# ---- default classification, triage prompts, census ------------------------------
+$junkRx = '(?i)^pvcn?-|^mq(ha|prod|trace)|sftp|backup|tracelog'
+$appAttachRx = '(?i)msix|app[-_]?attach'
+foreach ($cand in $storageCandidates) {
+    $cand.Classification = if ($cand.Share -match $appAttachRx) { 'AppAttach' }
+                           elseif ($cand.NameMatch) { 'Profiles' }
+                           elseif ($cand.Share -match $junkRx) { 'NonAVD' }
+                           else { 'Unknown' }
+    if ($cand.Evidence -eq 'none' -and $cand.NameMatch) { $cand.Evidence = 'name-match'; $cand.Confidence = 'low' }
+}
+if ($storageCandidates.Count -gt 0) {
+    $storageCandidates | Sort-Object Account, Share | Select-Object Kind, Account, Share, Region, ProvisionedGb, UsedGb, Classification, @{n='ServesPools'; e={ @($_.ServesPools | Select-Object -First 6) -join ', ' }} |
         Format-Table -AutoSize | Out-String -Width 220 | Write-Host
-    $gap = 0.0
-    foreach ($ps in $profileStores) { if ($ps.Kind -notmatch 'Standard$' -and $null -ne $ps.ProvisionedGb -and $null -ne $ps.UsedGb) { $gap += [Math]::Max(0, $ps.ProvisionedGb - $ps.UsedGb) } }
-    if ($gap -gt 0) { Write-Info "Provisioned-over-used gap across premium profile storage: $([Math]::Round($gap)) GB - the gap Nerdio storage auto-scale reclaims." }
 } else {
-    Write-Info "No FSLogix profile storage candidates found - fsLogix stays off in the model (add by hand in the Modeler if profiles live outside Azure's view)."
+    Write-Info "No storage candidates found - fsLogix stays off in the model (add by hand in the Modeler if profiles live outside Azure's view)."
 }
+
+function Resolve-PoolFragments {
+    param([string]$Text)
+    $picked = [System.Collections.Generic.List[string]]::new()
+    foreach ($frag in ($Text -split ',')) {
+        $f = $frag.Trim(); if (-not $f) { continue }
+        if ($f -eq '*') { foreach ($p in $pools) { $picked.Add($p.name) }; continue }
+        $m = @($pools | Where-Object { $_.name -match [regex]::Escape($f) -or $_.resourceGroup -match [regex]::Escape($f) })
+        if ($m.Count -eq 0) { Write-Host "        no pool or resource group matches '$f'" -ForegroundColor Yellow; return $null }
+        elseif ($m.Count -eq 1) { $picked.Add($m[0].name); Write-Host "        matched: $($m[0].name)" -ForegroundColor DarkGray }
+        elseif ($m.Count -le 5) {
+            for ($i = 0; $i -lt $m.Count; $i++) { Write-Host ("        {0}) {1}  [{2}]" -f ($i + 1), $m[$i].name, $m[$i].resourceGroup) -ForegroundColor DarkGray }
+            $pick = Read-Host "        pick for '$f' [numbers, a=all]"
+            if ($pick -match '^(?i)a$') { foreach ($x in $m) { $picked.Add($x.name) } }
+            else { foreach ($n in ($pick -split ',')) { $ix = 0; if ([int]::TryParse($n.Trim(), [ref]$ix) -and $ix -ge 1 -and $ix -le $m.Count) { $picked.Add($m[$ix - 1].name) } } }
+        }
+        else {
+            $confirm = Read-Host "        '$f' matches $($m.Count) pools (e.g. $($m[0].name), $($m[1].name)) - assign all $($m.Count)? [y/N]"
+            if ($confirm -match '^(?i)y') { foreach ($x in $m) { $picked.Add($x.name) } } else { return $null }
+        }
+    }
+    if ($picked.Count -eq 0) { return $null }
+    @($picked | Select-Object -Unique)
+}
+
+$triageRan = $false
+if ($storageCandidates.Count -gt 0 -and -not $NoPrompts -and [Environment]::UserInteractive) {
+    $triageBailed = $false
+    Write-Host ""
+    Write-Info "Storage triage - one line per store; Enter accepts the [default]. Only stores confirmed as"
+    Write-Info "PROFILES with at least one pool enter the Modeler JSON; everything lands in the storage ledger."
+    Write-Info "Answers: Enter=default | n=not AVD | a=app attach | u=unknown | y=profiles, pools unknown"
+    Write-Info "         | pool name/RG fragments (comma-separated) = profiles on those pools | * = all pools"
+    $ti = 0
+    foreach ($cand in ($storageCandidates | Sort-Object Account, Share)) {
+        $ti++
+        $sizeTxt = if ($null -ne $cand.ProvisionedGb) { "$($cand.ProvisionedGb)GB" } elseif ($null -ne $cand.UsedGb) { "$($cand.UsedGb)GB used" } else { 'size?' }
+        $defTxt = switch ($cand.Classification) {
+            'Profiles'  { if ($cand.ServesPools.Count -gt 0) { "PROFILES serves: $(@($cand.ServesPools | Select-Object -First 3) -join ', ')$(if ($cand.ServesPools.Count -gt 3) { " +$($cand.ServesPools.Count - 3)" }) -> model" } else { 'PROFILES - pools unknown -> ledger only' } }
+            'AppAttach' { 'APP ATTACH -> ledger only' }
+            'NonAVD'    { 'NOT AVD -> dropped' }
+            default     { 'UNKNOWN -> ledger only' }
+        }
+        $ans = $null
+        try { $ans = Read-Host ("[{0}/{1}] {2}/{3}  {4} {5}  [{6}]" -f $ti, $storageCandidates.Count, $cand.Account, $cand.Share, $cand.Kind, $sizeTxt, $defTxt) } catch { $triageBailed = $true; break }
+        $ans = "$ans".Trim()
+        if ($ans -eq '') { continue }
+        elseif ($ans -match '^(?i)n$') { $cand.Classification = 'NonAVD'; $cand.Evidence = 'admin-confirmed'; $cand.Confidence = 'high'; $cand.ServesPools = @() }
+        elseif ($ans -match '^(?i)a$') { $cand.Classification = 'AppAttach'; $cand.Evidence = 'admin-confirmed'; $cand.Confidence = 'high'; $cand.ServesPools = @() }
+        elseif ($ans -match '^(?i)u$') { $cand.Classification = 'Unknown'; $cand.ServesPools = @() }
+        elseif ($ans -match '^(?i)y$') { $cand.Classification = 'Profiles'; if ($cand.Evidence -eq 'none') { $cand.Evidence = 'admin-confirmed' } }
+        else {
+            $resolved = $null
+            try { $resolved = Resolve-PoolFragments -Text $ans } catch { $triageBailed = $true; break }
+            while ($null -eq $resolved -and -not $triageBailed) {
+                $retry = $null
+                try { $retry = Read-Host "        try again (fragments / n / a / u / y / Enter=keep default)" } catch { $triageBailed = $true; break }
+                $retry = "$retry".Trim()
+                if ($retry -eq '') { break }
+                if ($retry -match '^(?i)[nauy]$') { $ans = $retry; break }
+                try { $resolved = Resolve-PoolFragments -Text $retry } catch { $triageBailed = $true }
+            }
+            if ($resolved) { $cand.Classification = 'Profiles'; $cand.ServesPools = @($resolved); $cand.Evidence = 'admin-confirmed'; $cand.Confidence = 'high' }
+            elseif ($ans -match '^(?i)n$') { $cand.Classification = 'NonAVD'; $cand.ServesPools = @() }
+            elseif ($ans -match '^(?i)a$') { $cand.Classification = 'AppAttach'; $cand.ServesPools = @() }
+            elseif ($ans -match '^(?i)u$') { $cand.Classification = 'Unknown'; $cand.ServesPools = @() }
+            elseif ($ans -match '^(?i)y$') { $cand.Classification = 'Profiles' }
+        }
+    }
+    # drops are never silent - one bulk confirm covers them all
+    if (-not $triageBailed) {
+        $drops = @($storageCandidates | Where-Object { $_.Classification -eq 'NonAVD' })
+        if ($drops.Count -gt 0) {
+            $dropNames = @($drops | Select-Object -First 4 | ForEach-Object { $_.Share }) -join ', '
+            $c = $null
+            try { $c = Read-Host "Dropping $($drops.Count) store(s) classified NOT AVD ($dropNames$(if ($drops.Count -gt 4) { ', ...' })) - confirm? [Y/n]" } catch { $triageBailed = $true }
+            if ("$c" -match '^(?i)n') { foreach ($d in $drops) { $d.Classification = 'Unknown' } ; Write-Info "Kept as Unknown in the ledger instead." }
+        }
+        $triageRan = -not $triageBailed
+    }
+    if ($triageBailed) { Write-Warn2 "Prompts unavailable - storage triage skipped. Everything goes to the ledger; nothing storage enters the JSON. Re-run interactively to confirm profile storage into the model." }
+} elseif ($storageCandidates.Count -gt 0) {
+    Write-Info "Storage triage skipped ($(if ($NoPrompts) { '-NoPrompts' } else { 'non-interactive session' })) - all storage goes to the ledger; none enters the Modeler JSON without confirmation."
+}
+$censusUnsized = $censusShares - $censusSized
+Write-Info "Storage census: $(@($storAccts).Count) account(s) scanned, $($storSkipped.Count) skipped (named above), $censusShares candidate store(s), $censusSized sized, $censusUnsized without a size."
+$gap = 0.0
+foreach ($cand in ($storageCandidates | Where-Object { $_.Classification -in @('Profiles', 'Unknown') })) {
+    if ($cand.BillingModel -eq 'Provisioned' -and $null -ne $cand.ProvisionedGb -and $null -ne $cand.UsedGb) { $gap += [Math]::Max(0, $cand.ProvisionedGb - $cand.UsedGb) }
+}
+if ($gap -gt 0) { Write-Info "Provisioned-over-used gap across provisioned-model profile/unknown storage: $([Math]::Round($gap)) GB - the gap Nerdio storage auto-scale reclaims." }
 
 # --------------------------------------------------------------- 6. assemble the model
 Write-Info "[6/8] Assembling deployments..."
@@ -728,60 +975,50 @@ foreach ($p in $pools) {
         Overtime = "$otPct% x $($otHours)h"; Flags = ($flags -join '; ')
     })
 }
-# ---- FSLogix dummy deployments: one per profile store ----------------------------
-# Priced once per share (never per pool - the same user in two pools would double-
-# count profile GB). users=1 + profileSizeGb=measured keeps license/compute noise
-# at zero; compute floor is a B2s for one hour on Mondays. Import-tested shape.
+# ---- storage -> model, by POLICY: only confirmed profile stores enter the JSON --
+# Confirmed = classified PROFILES with at least one assigned pool (log evidence
+# accepted at the prompt, or typed there). Everything else - unknown, app attach,
+# not-AVD, unmapped - lives in the storage ledger CSV only. The carrier shape is
+# import-tested: users=1 + profileSizeGb=measured GB prices the store exactly
+# once; B2s 1h/week + egress 0 keeps carrier overhead to roughly the stopped
+# disk (~$6-8/mo), which the ledger states rather than hides.
 $shareNameCounts = @{}
-foreach ($ps in $profileStores) { $shareNameCounts[$ps.Share] = 1 + ($shareNameCounts[$ps.Share] ?? 0) }
-foreach ($ps in $profileStores) {
-    # premium/ANF bill provisioned; standard bills used - model what they pay today
-    $gb = if ($ps.Kind -match '(?i)Premium|NetApp') { $ps.ProvisionedGb ?? $ps.UsedGb } else { $ps.UsedGb ?? $ps.ProvisionedGb }
-    $storeLabel = if ($shareNameCounts[$ps.Share] -gt 1) { "$($ps.Account)/$($ps.Share)" } else { $ps.Share }
-    if ($null -eq $gb -or [double]$gb -lt 1) {
-        $review.Add([pscustomobject]@{
-            Pool = "$(if ($ps.Share -match '(?i)msix|app[-_]?attach') { 'AppAttach' } else { 'FSLogix' }): $storeLabel"; RG = $ps.RG; Type = $ps.Kind; Exp = '-'; Region = $ps.Region
-            VmSize = '-'; Limit = '-'; Density = '-'; PerHostPeak = '-'
-            PeakUsers = '-'; MAU = '-'; Window = '-'; Days = '-'; Overtime = '-'
-            Flags = 'profile storage candidate found but size unreadable - not modeled; check access to share stats'
-        })
+foreach ($ps in $storageCandidates) { $shareNameCounts[$ps.Share] = 1 + ($shareNameCounts[$ps.Share] ?? 0) }
+foreach ($ps in $storageCandidates) {
+    $ps | Add-Member -NotePropertyName StoreLabel -NotePropertyValue $(if ($shareNameCounts[$ps.Share] -gt 1) { "$($ps.Account)/$($ps.Share)" } else { $ps.Share })
+    $gb = if ($ps.BillingModel -eq 'Provisioned') { $ps.ProvisionedGb ?? $ps.UsedGb } else { $ps.UsedGb ?? $ps.ProvisionedGb }
+    $ps | Add-Member -NotePropertyName ModelGb -NotePropertyValue $(if ($null -ne $gb -and [double]$gb -ge 1) { [int][Math]::Max(1, [Math]::Round([double]$gb)) } else { $null })
+    $confirmed = ($ps.Classification -eq 'Profiles' -and @($ps.ServesPools).Count -gt 0 -and $null -ne $ps.ModelGb)
+    $ps | Add-Member -NotePropertyName InModelJson -NotePropertyValue $(if ($confirmed) { 'yes' } else { 'no' })
+    if (-not $confirmed) {
+        if ($ps.Classification -eq 'Profiles' -and @($ps.ServesPools).Count -gt 0 -and $null -eq $ps.ModelGb) { $ps.Notes = "$($ps.Notes); confirmed but size unreadable - not modeled".TrimStart('; ') }
         continue
     }
-    $gbInt = [int][Math]::Max(1, [Math]::Round([double]$gb))
-    $isAppAttach = $ps.Share -match '(?i)msix|app[-_]?attach'
-    $storagePrefix = if ($isAppAttach) { 'AppAttach' } else { 'FSLogix' }
-    $servesNote = if ($isAppAttach) { 'MSIX app attach storage, not user profiles - included so the storage cost is modeled; excluded from FSLogix sizing questions' }
-                  elseif ($ps.ServesPools.Count -gt 0) { "serves: $($ps.ServesPools -join ', ')" }
-                  else { 'pools not mapped - confirm with the AVD admin which pools use this share' }
-    $nameServes = if (-not $isAppAttach -and $ps.ServesPools.Count -gt 0) { " ($(@($ps.ServesPools | Select-Object -First 3) -join ', ')$(if ($ps.ServesPools.Count -gt 3) { " +$($ps.ServesPools.Count - 3)" }))" } else { '' }
+    $serves = @($ps.ServesPools)
+    $nameServes = " (serves: $(@($serves | Select-Object -First 3) -join ', ')$(if ($serves.Count -gt 3) { " +$($serves.Count - 3)" }))"
     $deployments.Add([ordered]@{
         mode = 'avd'
-        name = "$storagePrefix - $storeLabel$nameServes"
+        name = "FSLogix storage - $($ps.StoreLabel)$nameServes"
         users = [ordered]@{ total = 1; absentPercent = 0; overtimeEnabled = $false; overtimePercent = 0; overtimeHours = 0 }
         experience = 1
         region = $ps.Region
         workload = [ordered]@{
             type = 5; vmSize = 'Standard_B2s'
             disk = [ordered]@{ isEphemeral = $false; size = 128; type = 'Standard_LRS' }
-            maxUsersPerVCpu = 1; stoppedDiskType = 'Standard_LRS'; rdpEgressGb = 10
+            maxUsersPerVCpu = 1; stoppedDiskType = 'Standard_LRS'; rdpEgressGb = 0
         }
         image = [ordered]@{ type = 1; isCisHardenedImage = $false }
         autoScale = [ordered]@{ type = 0; workDays = @(1); workStartHour = 9; workStartMinutes = 0; workDurationMinutes = 60 }
-        fsLogix = [ordered]@{ enabled = $true; profileSizeGb = $gbInt; storageType = $ps.StorageTypeEnum }
+        fsLogix = [ordered]@{ enabled = $true; profileSizeGb = $ps.ModelGb; storageType = $ps.StorageTypeEnum }
         administrative = [ordered]@{ tasks = $adminTasks; hourlyRate = 100; isEnabled = $false }
         savings = [ordered]@{ reservedInstances = [ordered]@{ count = 0; years = 1 } }
     })
-    $provText = if ($null -ne $ps.ProvisionedGb) { "$($ps.ProvisionedGb)GB prov" } else { 'prov n/a' }
-    $usedText = if ($null -ne $ps.UsedGb) { "$($ps.UsedGb)GB used" } else { 'used n/a' }
-    $review.Add([pscustomobject]@{
-        Pool = "$($storagePrefix): $storeLabel"; RG = $ps.RG; Type = $ps.Kind; Exp = '-'; Region = $ps.Region
-        VmSize = 'Standard_B2s (dummy)'; Limit = '-'; Density = '-'; PerHostPeak = '-'
-        PeakUsers = 1; MAU = '-'; Window = '9:00+1h'; Days = '1'; Overtime = '-'
-        Flags = "profile storage dummy - models $gbInt GB ($provText / $usedText); $servesNote; storage tier: $($ps.Kind) (storageType $($ps.StorageTypeEnum))$(if ($ps.TierNote) { "; $($ps.TierNote)" })"
-    })
 }
-if ($profileStores.Count -gt 0) {
-    Write-Ok "Added $(@($deployments | Where-Object { $_.name -like 'FSLogix - *' -or $_.name -like 'AppAttach - *' }).Count) storage deployment(s) (FSLogix profiles + app attach) - compute noise ~zero (1 user, B2s, 1h/week); pools' own fsLogix stays off so storage is never double-counted."
+if ($storageCandidates.Count -gt 0) {
+    $inModel = @($storageCandidates | Where-Object { $_.InModelJson -eq 'yes' }).Count
+    $ledgerOnly = @($storageCandidates | Where-Object { $_.InModelJson -ne 'yes' -and $_.Classification -ne 'NonAVD' }).Count
+    $dropped = @($storageCandidates | Where-Object { $_.Classification -eq 'NonAVD' }).Count
+    Write-Ok "Storage disposition: $inModel confirmed profile store(s) in the model JSON, $ledgerOnly in the ledger only (unconfirmed/app attach/unknown), $dropped confirmed not-AVD."
 }
 
 $model = [ordered]@{
@@ -803,6 +1040,8 @@ if (-not $SkipCosts) {
     $costCurrency = ''
     $rgScopes = @{}
     foreach ($vmId in $vmSpecs.Keys) { $parts = $vmId -split '/'; $rgScopes["/subscriptions/$($parts[2])/resourcegroups/$($parts[4])"] = $parts[4] }
+    # storage ledger gets actual spend too - add each candidate's resource group scope
+    foreach ($cand in $storageCandidates) { if ($cand.ResourceId) { $parts = $cand.ResourceId -split '/'; $rgScopes["/subscriptions/$($parts[2])/resourcegroups/$($parts[4])"] = $parts[4] } }
     $costOk = 0; $costSkipped = @()
     foreach ($scope in $rgScopes.Keys) {
         # AmortizedCost spreads RI/Savings Plan purchases across usage (honest number for
@@ -855,6 +1094,28 @@ $reviewFile = ($OutFile -replace '\.json$', '') + '-review.csv'
 foreach ($r in $review) { if (-not $r.PSObject.Properties['ActualMo']) { $r | Add-Member -NotePropertyName ActualMo -NotePropertyValue '' } }
 $review | Sort-Object Pool | Export-Csv -Path $reviewFile
 Write-Ok "Review table (including ActualMo when pulled) also written to: $reviewFile"
+# ---- the storage ledger: EVERY discovered store, whatever the model decided ------
+$ledgerFile = $null
+if ($storageCandidates.Count -gt 0) {
+    $ledgerFile = ($OutFile -replace '\.json$', '') + '-storage-ledger.csv'
+    $costLookup = @{}
+    if (Get-Variable -Name costByResource -ErrorAction SilentlyContinue) {
+        foreach ($k in $costByResource.Keys) { $costLookup[$k.ToLowerInvariant()] = $costByResource[$k] }
+    }
+    $storageCandidates | Sort-Object Classification, Account, Share | ForEach-Object {
+        [pscustomobject]@{
+            BillingUnit = $_.BillingUnit; Account = $_.Account; Share = $_.Share
+            Kind = $_.Kind; Sku = $_.Sku; BillingModel = $_.BillingModel; Region = $_.Region; RG = $_.RG
+            ProvisionedGb = $_.ProvisionedGb; UsedGb = $_.UsedGb; UsedSource = $_.UsedSource
+            ProvisionedIops = $_.ProvisionedIops; ThroughputMibps = $_.ThroughputMibps
+            Classification = $_.Classification; Evidence = $_.Evidence; Confidence = $_.Confidence
+            ServesPools = (@($_.ServesPools) -join '; '); InModelJson = $_.InModelJson
+            ActualMo = $(if ($costLookup.ContainsKey("$($_.ResourceId)".ToLowerInvariant())) { [Math]::Round($costLookup["$($_.ResourceId)".ToLowerInvariant()], 2) } else { '' })
+            Notes = "$($_.Notes)$(if ($_.TierNote) { "; $($_.TierNote)" })".TrimStart('; ')
+        }
+    } | Export-Csv -Path $ledgerFile -NoTypeInformation
+    Write-Ok "Storage ledger written: $ledgerFile ($($storageCandidates.Count) store(s) - classification, evidence, pools, sizes, and actual cost where visible)."
+}
 $poolRowsOnly = @($review | Where-Object { $_.Pool -notlike 'FSLogix:*' -and $_.Pool -notlike 'AppAttach:*' })
 $withUsage = @($poolRowsOnly | Where-Object { $_.PeakUsers -gt 0 }).Count
 $flagged   = @($poolRowsOnly | Where-Object { $_.Flags }).Count
@@ -888,8 +1149,9 @@ try {
         workspaces = @($workspaceIds.Keys)
         usageAggregates = @($usage.Values)
         sessionPeaks = @($sessionPeaks.Keys | ForEach-Object { [ordered]@{ poolId = $_; peakSessionsInclDisconnected = $sessionPeaks[$_] } })
-        profileStores = @($profileStores)
-        shareUserOverlaps = @($(if (Get-Variable -Name mapRows -ErrorAction SilentlyContinue) { $mapRows } else { @() }))
+        storageCandidates = @($storageCandidates)
+        mapEvidence = @($(if (Get-Variable -Name mapEvidence -ErrorAction SilentlyContinue) { $mapEvidence } else { @() }))
+        storageTriage = [ordered]@{ ran = [bool]$triageRan; confirmedMappings = @($storageCandidates | Where-Object { $_.Evidence -eq 'admin-confirmed' } | ForEach-Object { [ordered]@{ billingUnit = $_.BillingUnit; classification = $_.Classification; pools = @($_.ServesPools) } }) }
         costByResource = @($(if (Get-Variable -Name costByResource -ErrorAction SilentlyContinue) { $costByResource.Keys | ForEach-Object { [ordered]@{ resourceId = $_; cost = $costByResource[$_] } } } else { @() }))
         costSkipped = @($(if (Get-Variable -Name costSkipped -ErrorAction SilentlyContinue) { $costSkipped } else { @() }))
         costCurrency = $(if (Get-Variable -Name costCurrency -ErrorAction SilentlyContinue) { $costCurrency } else { $null })
@@ -914,10 +1176,10 @@ if ($script:TranscriptOn) {
 }
 $zipOk = $false
 try {
-    $zipItems = @(@($OutFile, $reviewFile, $rawFile, $bucketsFile, $script:TranscriptFile) | Where-Object { $_ -and (Test-Path -LiteralPath $_) })
+    $zipItems = @(@($OutFile, $reviewFile, $ledgerFile, $rawFile, $bucketsFile, $script:TranscriptFile) | Where-Object { $_ -and (Test-Path -LiteralPath $_) })
     Compress-Archive -Path $zipItems -DestinationPath $zipFile -Force
     $zipOk = $true
-    Write-Ok "Packaged into one file: $zipFile (model JSON + review CSV + raw decision data + console log)"
+    Write-Ok "Packaged into one file: $zipFile (model JSON + review CSV + storage ledger + raw decision data + console log)"
     Write-Info "Send that single zip back - it carries the model, the review table, and the full run log."
 } catch {
     Write-Warn2 "Could not build the zip ($($_.Exception.Message)) - files download individually."
