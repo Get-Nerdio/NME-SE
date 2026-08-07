@@ -34,12 +34,18 @@ function Invoke-AzRestMethod {
         if ($q -match 'sessionhosts') {
             $data = @(
                 @{ id = "$poolAId/sessionhosts/sh1"; vmId = '/subscriptions/s1/resourcegroups/rg1/providers/microsoft.compute/virtualmachines/vm1' },
-                @{ id = "$poolAId/sessionhosts/sh2"; vmId = '/subscriptions/s1/resourcegroups/rg1/providers/microsoft.compute/virtualmachines/vm2' }
+                @{ id = "$poolAId/sessionhosts/sh2"; vmId = '/subscriptions/s1/resourcegroups/rg1/providers/microsoft.compute/virtualmachines/vm2' },
+                @{ id = "$poolAId/sessionhosts/sh3"; vmId = '/subscriptions/s1/resourcegroups/rg1/providers/microsoft.compute/virtualmachines/vm3' }
             )
         } elseif ($q -match 'virtualmachines') {
+            # v0.17.2 regression shape: two D8s hosts run DIFFERENT images (the old
+            # vmSize+ephemeral+imageId grouping split them into count-1 groups and
+            # tied with the one-off D4s; 5.1's unstable sort could then pick D4s).
+            # Correct representative: size mode D8s_v5, marketplace image, disk d1.
             $data = @(
                 @{ id = '/subscriptions/s1/resourcegroups/rg1/providers/microsoft.compute/virtualmachines/vm1'; vmSize = 'Standard_D8s_v5'; ephemeral = $false; imageId = ''; osDiskId = '/subscriptions/s1/resourcegroups/rg1/providers/microsoft.compute/disks/d1' },
-                @{ id = '/subscriptions/s1/resourcegroups/rg1/providers/microsoft.compute/virtualmachines/vm2'; vmSize = 'Standard_D8s_v5'; ephemeral = $false; imageId = ''; osDiskId = '/subscriptions/s1/resourcegroups/rg1/providers/microsoft.compute/disks/d2' }
+                @{ id = '/subscriptions/s1/resourcegroups/rg1/providers/microsoft.compute/virtualmachines/vm2'; vmSize = 'Standard_D8s_v5'; ephemeral = $false; imageId = '/subscriptions/s1/resourcegroups/rg-img/providers/microsoft.compute/galleries/g1/images/win11/versions/1.0.0'; osDiskId = '/subscriptions/s1/resourcegroups/rg1/providers/microsoft.compute/disks/d2' },
+                @{ id = '/subscriptions/s1/resourcegroups/rg1/providers/microsoft.compute/virtualmachines/vm3'; vmSize = 'Standard_D4s_v5'; ephemeral = $false; imageId = ''; osDiskId = '/subscriptions/s1/resourcegroups/rg1/providers/microsoft.compute/disks/d3' }
             )
         } elseif ($q -match 'microsoft.compute/disks') {
             $data = @(@{ id = '/subscriptions/s1/resourcegroups/rg1/providers/microsoft.compute/disks/d1'; diskSizeGb = 128; diskSku = 'Premium_LRS' })
@@ -110,7 +116,7 @@ function Invoke-AzRestMethod {
 function Get-AzAccessToken { param([string]$ResourceUrl) [pscustomobject]@{ Token = 'mock-token' } }
 function Invoke-RestMethod {
     param($Method, $Uri, $Headers, $ContentType, $Body, $TimeoutSec)
-    if ("$Uri" -match 'modeler/VERSION') { return 'v0.17.1' }   # stale-copy self-check: report current
+    if ("$Uri" -match 'modeler/VERSION') { return 'v0.17.2' }   # stale-copy self-check: report current
     if ("$Uri" -notmatch 'api\.loganalytics\.io') { throw "unexpected Invoke-RestMethod uri in test: $Uri" }
     $q = ($Body | ConvertFrom-Json).query
     $pid_ = $poolAId.ToLower()
@@ -178,8 +184,9 @@ $checks = [ordered]@{
     'console log captured + clean'      = ($log -match 'Assembling deployments' -and $log -notmatch [char]27)
     'no raw-export failure in log'      = ($log -notmatch 'Raw data export failed' -and $log -match 'Raw decision data written')
     'counters exclude storage rows'     = ($log -match 'Usage found for 1 of 1 pool')
-    'rawdata sane + version + evidence' = ($null -ne $rawJson -and @($rawJson.pools).Count -eq 1 -and $rawJson.meta.version -eq 'v0.17.1' -and @($rawJson.storageCandidates).Count -eq 4 -and @($rawJson.mapEvidence).Count -ge 1)
-    'version is the first output line'  = ($log -match '(?m)^\[i\] Get-NerdioModelerJson v0\.17\.1' -and ($log.IndexOf('Get-NerdioModelerJson v0.17.1') -lt $log.IndexOf('Signed in as')))
+    'rawdata sane + version + evidence' = ($null -ne $rawJson -and @($rawJson.pools).Count -eq 1 -and $rawJson.meta.version -eq 'v0.17.2' -and @($rawJson.storageCandidates).Count -eq 4 -and @($rawJson.mapEvidence).Count -ge 1)
+    'version is the first output line'  = ($log -match '(?m)^\[i\] Get-NerdioModelerJson v0\.17\.2' -and ($log.IndexOf('Get-NerdioModelerJson v0.17.2') -lt $log.IndexOf('Signed in as')))
+    'mixed-size pool: mode wins'        = ($a.workload.vmSize -eq 'Standard_D8s_v5' -and $a.image.type -eq 1 -and $a.workload.disk.size -eq 128 -and $a.workload.disk.type -eq 'Premium_LRS')
     'no stale-copy warning (current)'   = ($log -notmatch 'THIS COPY IS STALE')
     'ARG pinned to enabled subs s1+s2'  = $(
         $ok = (@($global:ArgSubScopes).Count -ge 5)

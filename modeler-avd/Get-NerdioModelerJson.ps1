@@ -59,6 +59,17 @@
     ./modeler.ps1 -TimeZone 'America/Chicago' -ModelName 'Contoso - Actuals'
 
 .NOTES
+    v0.17.2 (2026-08-07). DETERMINISTIC REPRESENTATIVE VM SPEC - found by
+    diffing a Windows PowerShell 5.1 run against a Cloud Shell run of the SAME
+    tenant minutes apart: 119 of 120 pools matched on every field; one pool
+    (4 hosts: D2as x2, D4as, D8as) modeled as D2as from Cloud Shell but D8as
+    from 5.1. Root cause: the representative spec grouped on
+    vmSize+ephemeral+imageId in one key, so two D2as hosts running different
+    images split into separate count-1 groups - a 4-way tie - and tie order
+    under Sort-Object is stable in PowerShell 7 but NOT in 5.1. Now the size
+    is chosen first (true mode over vmSize alone), then the image/ephemeral
+    combo among hosts of that size, with every sort ordered Count desc then
+    name asc - the same input picks the same spec in every shell, every run.
     v0.17.1 (2026-08-07). STALE-COPY SELF-DETECTION - a laptop ran v0.15
     three times in one day (System32 output, warning floods, 18-pool scans)
     while Cloud Shell, minutes apart, pulled current code from the same
@@ -283,7 +294,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = 'v0.17.1'   # RELEASE RULE: bump modeler/VERSION in the same commit
+$ScriptVersion = 'v0.17.2'   # RELEASE RULE: bump modeler/VERSION in the same commit
 # Windows PowerShell 5.1 compatibility: force TLS 1.2 (old .NET Framework
 # defaults can be lower and ARM/Log Analytics require 1.2), and no PS7-only
 # syntax anywhere in this file (?? / ?. / -AsPlainText / utf8NoBOM).
@@ -1069,12 +1080,23 @@ $review = [System.Collections.Generic.List[object]]::new()
 foreach ($p in $pools) {
     $key = $p.id.ToLower()
     $u = $usage[$key]
-    # representative VM spec = most common combo among the pool's hosts
+    # representative VM spec = the pool's most common SIZE first, then the most
+    # common ephemeral/image combo among hosts of that size. The old single
+    # grouping keyed on vmSize+ephemeral+imageId at once, so two same-size hosts
+    # running different images split into count-1 groups: a 4-host pool
+    # (D2as x2 + D4as + D8as) became a 4-way tie, and tie order is not stable in
+    # Windows PowerShell - the same command minutes apart returned D2as from
+    # Cloud Shell (the true mode) and a one-off D8as from 5.1. Every pick now
+    # sorts Count desc THEN name asc, so every shell chooses identically.
     $spec = $null
     if ($poolVmIds.ContainsKey($key)) {
-        $spec = $poolVmIds[$key] | ForEach-Object { $vmSpecs[$_] } | Where-Object { $_ } |
-            Group-Object vmSize, ephemeral, imageId | Sort-Object Count -Descending | Select-Object -First 1 |
-            ForEach-Object { $_.Group[0] }
+        $hostSpecs = @($poolVmIds[$key] | ForEach-Object { $vmSpecs[$_] } | Where-Object { $_ })
+        if ($hostSpecs.Count -gt 0) {
+            $sizeGrp = @($hostSpecs | Group-Object vmSize |
+                Sort-Object @{Expression='Count';Descending=$true}, @{Expression='Name';Descending=$false})[0]
+            $spec = @($sizeGrp.Group | Group-Object ephemeral, imageId |
+                Sort-Object @{Expression='Count';Descending=$true}, @{Expression='Name';Descending=$false})[0].Group[0]
+        }
     }
     $vmSize   = if ($spec -and $spec.vmSize) { $spec.vmSize } else { 'Standard_D4s_v5' }
     $vcpus    = [int]([regex]::Match($vmSize, '_[A-Za-z]+?(\d+)').Groups[1].Value); if ($vcpus -lt 1) { $vcpus = 4 }
