@@ -15,11 +15,10 @@
          (additional-hours applies across all 7 days).
       4. Enriches VM size/disk/image per pool from Resource Graph.
       5. Discovers FSLogix-candidate storage (Azure Files shares + ANF capacity
-         pools) and runs a short interactive TRIAGE - one line per store, Enter
-         accepts the default; pool assignment by name/RG fragment. Only stores
-         confirmed as profile storage AND mapped to a pool enter the JSON;
-         EVERYTHING discovered lands in a storage ledger CSV (-NoPrompts or a
-         non-interactive session = ledger only).
+         pools) and records ALL of it in a storage ledger CSV - classification,
+         sizes, SKU/billing model, log-derived pool evidence, actual cost.
+         STORAGE NEVER ENTERS THE MODELER JSON: the model carries host pools
+         only, and the ledger is the storage deliverable. No prompts.
       6. Prints a per-pool review table + flags, writes the schema-4 import JSON
          and the storage ledger, and packages one zip (Cloud Shell auto-download;
          local runs write it to the current folder).
@@ -45,10 +44,6 @@
     Skip the Cloud Shell auto-download (file still written to the session).
 .PARAMETER SkipCosts
     Skip the Cost Management actual-spend pull entirely.
-.PARAMETER NoPrompts
-    Skip the interactive storage triage. All discovered storage goes to the
-    storage ledger CSV only and none enters the Modeler JSON (the same happens
-    automatically when the session is non-interactive).
 
 .EXAMPLE
     # Quick run (Cloud Shell, defaults):
@@ -61,6 +56,23 @@
     ./modeler.ps1 -TimeZone 'America/Chicago' -ModelName 'Contoso - Actuals'
 
 .NOTES
+    v0.15 (2026-08-07). TWO RULINGS FROM THE FIRST LIVE v0.14 RUN:
+    (1) STORAGE IS LEDGER-ONLY, ALWAYS. The v0.14 interactive triage asked the
+    runner to classify stores and type pool names mid-run - unworkable at scale
+    (100 stores = 100 prompts) and runners should never do data entry. Removed
+    entirely: no prompts, no -NoPrompts switch, no storage deployments in the
+    JSON under any circumstances. The Modeler JSON carries host pools only,
+    fsLogix off everywhere. Everything discovered goes to the storage ledger
+    CSV with automatic classification (name/msix/junk patterns), log-derived
+    pool evidence when StorageFileLogs exist, sizes, SKU/billing model, and
+    actual cost. The run flows straight through with zero stops.
+    (2) WINDOWS POWERSHELL 5.1 SUPPORTED. Removed every PS7-only construct:
+    ?? null-coalescing (Coalesce helper), ConvertFrom-SecureString -AsPlainText
+    (BSTR marshal), -Encoding utf8NoBOM (UTF8Encoding($false) writer), and
+    added TLS 1.2 enforcement plus an IANA->Windows time-zone map (.NET
+    Framework doesn't know IANA ids). Export-Csv everywhere uses
+    -NoTypeInformation so 5.1 doesn't prepend #TYPE lines. PowerShell 7 still
+    recommended; 5.1 is the built-in fallback.
     v0.14 (2026-08-07). STORAGE OVERHAUL - nothing unconfirmed enters the model:
     (1) POLICY: a discovered store lands in the Modeler JSON only when it is
     confirmed as FSLogix profile storage AND mapped to at least one host pool
@@ -185,9 +197,9 @@
     table, JSON, and download are never affected. -SkipCosts disables the pull.
     Review table shows each pool's resource group, and the run ends with the list
     of resource groups holding session-host VMs (the Cost Management filter list).
-    Requires: Azure Cloud Shell (PowerShell), or local PowerShell 7 with the
-    Az.Accounts module + Connect-AzAccount (no other Az modules used - v0.13).
-    Needs Reader on the subscriptions and Log Analytics
+    Requires: Azure Cloud Shell (PowerShell), or local PowerShell 7 or Windows
+    PowerShell 5.1 with the Az.Accounts module + Connect-AzAccount (no other
+    Az modules used). Needs Reader on the subscriptions and Log Analytics
     Reader on the discovered workspaces.
     v0.4 REPORTING RULES (per real Modeler UI bounds):
     - SKUs reported EXACTLY as found, never mapped. workload.type = 5 (Custom),
@@ -216,12 +228,21 @@ param(
     [Parameter(Mandatory = $false)] [string[]] $SubscriptionId = @(),
     [Parameter(Mandatory = $false)] [string]   $OutFile        = "",
     [Parameter(Mandatory = $false)] [switch]   $SkipDownload,
-    [Parameter(Mandatory = $false)] [switch]   $SkipCosts,
-    [Parameter(Mandatory = $false)] [switch]   $NoPrompts
+    [Parameter(Mandatory = $false)] [switch]   $SkipCosts
 )
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = 'v0.14'
+$ScriptVersion = 'v0.15'
+# Windows PowerShell 5.1 compatibility: force TLS 1.2 (old .NET Framework
+# defaults can be lower and ARM/Log Analytics require 1.2), and no PS7-only
+# syntax anywhere in this file (?? / ?. / -AsPlainText / utf8NoBOM).
+try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
+function Coalesce { param($a, $b) if ($null -ne $a) { $a } else { $b } }
+function Write-Utf8NoBom {
+    param([string]$FilePath, [string]$Content)
+    $full = if ([IO.Path]::IsPathRooted($FilePath)) { $FilePath } else { Join-Path (Get-Location).Path $FilePath }
+    [IO.File]::WriteAllText($full, $Content, (New-Object System.Text.UTF8Encoding($false)))
+}
 if ([string]::IsNullOrEmpty($OutFile)) { $OutFile = "modeler-import-$(Get-Date -Format 'yyyyMMdd-HHmm').json" }
 
 function Write-Info { param([string]$m) Write-Host "[i] $m" -ForegroundColor Gray }
@@ -333,8 +354,12 @@ if (-not (Get-AzContext)) {
 function Invoke-LaQuery {
     param([string]$WorkspaceCustomerId, [string]$Query)
     $tok = Get-AzAccessToken -ResourceUrl 'https://api.loganalytics.io'
-    # Az.Accounts 5.x returns the token as a SecureString; older versions a plain string
-    $tokenText = if ($tok.Token -is [securestring]) { ConvertFrom-SecureString -SecureString $tok.Token -AsPlainText } else { "$($tok.Token)" }
+    # Az.Accounts 5.x returns a SecureString token; older versions a plain string.
+    # BSTR marshal, not ConvertFrom-SecureString -AsPlainText (that flag is PS7-only).
+    $tokenText = if ($tok.Token -is [securestring]) {
+        $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($tok.Token)
+        try { [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) } finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
+    } else { "$($tok.Token)" }
     $resp = Invoke-RestMethod -Method Post -Uri "https://api.loganalytics.io/v1/workspaces/$WorkspaceCustomerId/query" `
         -Headers @{ Authorization = "Bearer $tokenText" } -ContentType 'application/json' `
         -Body (@{ query = $Query } | ConvertTo-Json -Depth 4 -Compress)
@@ -477,6 +502,16 @@ Peaks
 # Saturday shift missed the cut by exactly that bias. DowCal[0]=Sunday..[6]=Saturday.
 $tzInfo = $null
 try { $tzInfo = [TimeZoneInfo]::FindSystemTimeZoneById($TimeZone) } catch { }
+if (-not $tzInfo) {
+    # Windows PowerShell 5.1 runs on .NET Framework, which doesn't know IANA ids.
+    # Map the common ones to Windows ids; the KQL side keeps using IANA regardless.
+    $winTz = @{ 'America/New_York' = 'Eastern Standard Time'; 'America/Chicago' = 'Central Standard Time'
+                'America/Denver' = 'Mountain Standard Time'; 'America/Phoenix' = 'US Mountain Standard Time'
+                'America/Los_Angeles' = 'Pacific Standard Time'; 'Europe/London' = 'GMT Standard Time'
+                'Europe/Paris' = 'Romance Standard Time'; 'Europe/Berlin' = 'W. Europe Standard Time'
+                'Asia/Kolkata' = 'India Standard Time'; 'Australia/Sydney' = 'AUS Eastern Standard Time' }
+    if ($winTz.ContainsKey($TimeZone)) { try { $tzInfo = [TimeZoneInfo]::FindSystemTimeZoneById($winTz[$TimeZone]) } catch { } }
+}
 $dowCal = @(0, 0, 0, 0, 0, 0, 0)
 $nowUtcForCal = [DateTime]::UtcNow
 $calStart = if ($tzInfo) { [TimeZoneInfo]::ConvertTimeFromUtc($nowUtcForCal.AddDays(-$LookbackDays), $tzInfo).Date } else { $nowUtcForCal.AddDays(-$LookbackDays).Date }
@@ -669,7 +704,7 @@ resources
                 if ($mr.StatusCode -eq 200) {
                     $mm = @((($mr.Content | ConvertFrom-Json).value)) | Select-Object -First 1
                     $pts = @($mm.timeseries | ForEach-Object { $_.data } | Where-Object { $null -ne $_.average -and $_.average -gt 0 })
-                    if ($pts.Count -gt 0) { $usedSum = [Math]::Round(($usedSum ?? 0) + @($pts)[-1].average / 1GB, 1) }
+                    if ($pts.Count -gt 0) { $usedSum = [Math]::Round((Coalesce $usedSum 0) + @($pts)[-1].average / 1GB, 1) }
                 }
             } catch { }
         }
@@ -757,27 +792,27 @@ HostIps | union PoolUsers | project RowType, Ip, UserGuess, HostPoolId
         # IP evidence first (strong): distinct session-host IPs seen opening this share, per pool
         $ipHits = @{}
         foreach ($r in ($mine | Where-Object { $_.RowType -eq 'shareip' })) {
-            foreach ($pid_ in @($ipToPools["$($r.Ip)"])) { $ipHits[$pid_] = 1 + ($ipHits[$pid_] ?? 0) }
+            foreach ($pid_ in @($ipToPools["$($r.Ip)"])) { $ipHits[$pid_] = 1 + (Coalesce $ipHits[$pid_] 0) }
         }
         # username-overlap fallback (weak): distinct extracted usernames per pool, >= 2
         $userHits = @{}
         foreach ($r in ($mine | Where-Object { $_.RowType -eq 'shareuser' })) {
-            foreach ($pid_ in @($userToPools["$($r.UserGuess)"])) { $userHits[$pid_] = 1 + ($userHits[$pid_] ?? 0) }
+            foreach ($pid_ in @($userToPools["$($r.UserGuess)"])) { $userHits[$pid_] = 1 + (Coalesce $userHits[$pid_] 0) }
         }
         $hitIds = @()
         if ($ipHits.Keys.Count -gt 0) { $hitIds = @($ipHits.Keys); $cand.Evidence = 'logs-ip'; $cand.Confidence = 'high' }
         elseif (@($userHits.Keys | Where-Object { $userHits[$_] -ge 2 }).Count -gt 0) { $hitIds = @($userHits.Keys | Where-Object { $userHits[$_] -ge 2 }); $cand.Evidence = 'logs-user'; $cand.Confidence = 'medium' }
         if ($hitIds.Count -gt 0) {
             $cand.ServesPools = @($hitIds | ForEach-Object { $poolNameById["$_"] } | Where-Object { $_ } | Select-Object -Unique)   # ALL pools kept - no cap
-            foreach ($pid_ in $hitIds) { $mapEvidence.Add([pscustomobject]@{ Account = $cand.Account; Share = $cand.Share; HostPoolId = $pid_; Evidence = $cand.Evidence; Strength = ($ipHits[$pid_] ?? $userHits[$pid_]) }) }
+            foreach ($pid_ in $hitIds) { $mapEvidence.Add([pscustomobject]@{ Account = $cand.Account; Share = $cand.Share; HostPoolId = $pid_; Evidence = $cand.Evidence; Strength = (Coalesce $ipHits[$pid_] $userHits[$pid_]) }) }
         }
     }
     $mappedCount = @($storageCandidates | Where-Object { $_.ServesPools.Count -gt 0 }).Count
-    if ($mappedCount -gt 0) { Write-Ok "File-access logs found - $mappedCount store(s) have pool evidence (pre-filled at the prompt; you confirm)." }
-    else { Write-Info "      No StorageFileLogs data (file-share diagnostics not enabled) - no automatic pool evidence; the prompt below (or the AVD admin) decides." }
+    if ($mappedCount -gt 0) { Write-Ok "File-access logs found - $mappedCount store(s) carry pool evidence in the ledger's ServesPools column." }
+    else { Write-Info "      No StorageFileLogs data (file-share diagnostics not enabled) - ServesPools stays empty in the ledger; the AVD admin can annotate it." }
 }
 
-# ---- default classification, triage prompts, census ------------------------------
+# ---- automatic classification + census -------------------------------------------
 $junkRx = '(?i)^pvcn?-|^mq(ha|prod|trace)|sftp|backup|tracelog'
 $appAttachRx = '(?i)msix|app[-_]?attach'
 foreach ($cand in $storageCandidates) {
@@ -794,88 +829,12 @@ if ($storageCandidates.Count -gt 0) {
     Write-Info "No storage candidates found - fsLogix stays off in the model (add by hand in the Modeler if profiles live outside Azure's view)."
 }
 
-function Resolve-PoolFragments {
-    param([string]$Text)
-    $picked = [System.Collections.Generic.List[string]]::new()
-    foreach ($frag in ($Text -split ',')) {
-        $f = $frag.Trim(); if (-not $f) { continue }
-        if ($f -eq '*') { foreach ($p in $pools) { $picked.Add($p.name) }; continue }
-        $m = @($pools | Where-Object { $_.name -match [regex]::Escape($f) -or $_.resourceGroup -match [regex]::Escape($f) })
-        if ($m.Count -eq 0) { Write-Host "        no pool or resource group matches '$f'" -ForegroundColor Yellow; return $null }
-        elseif ($m.Count -eq 1) { $picked.Add($m[0].name); Write-Host "        matched: $($m[0].name)" -ForegroundColor DarkGray }
-        elseif ($m.Count -le 5) {
-            for ($i = 0; $i -lt $m.Count; $i++) { Write-Host ("        {0}) {1}  [{2}]" -f ($i + 1), $m[$i].name, $m[$i].resourceGroup) -ForegroundColor DarkGray }
-            $pick = Read-Host "        pick for '$f' [numbers, a=all]"
-            if ($pick -match '^(?i)a$') { foreach ($x in $m) { $picked.Add($x.name) } }
-            else { foreach ($n in ($pick -split ',')) { $ix = 0; if ([int]::TryParse($n.Trim(), [ref]$ix) -and $ix -ge 1 -and $ix -le $m.Count) { $picked.Add($m[$ix - 1].name) } } }
-        }
-        else {
-            $confirm = Read-Host "        '$f' matches $($m.Count) pools (e.g. $($m[0].name), $($m[1].name)) - assign all $($m.Count)? [y/N]"
-            if ($confirm -match '^(?i)y') { foreach ($x in $m) { $picked.Add($x.name) } } else { return $null }
-        }
-    }
-    if ($picked.Count -eq 0) { return $null }
-    @($picked | Select-Object -Unique)
-}
-
-$triageRan = $false
-if ($storageCandidates.Count -gt 0 -and -not $NoPrompts -and [Environment]::UserInteractive) {
-    $triageBailed = $false
-    Write-Host ""
-    Write-Info "Storage triage - one line per store; Enter accepts the [default]. Only stores confirmed as"
-    Write-Info "PROFILES with at least one pool enter the Modeler JSON; everything lands in the storage ledger."
-    Write-Info "Answers: Enter=default | n=not AVD | a=app attach | u=unknown | y=profiles, pools unknown"
-    Write-Info "         | pool name/RG fragments (comma-separated) = profiles on those pools | * = all pools"
-    $ti = 0
-    foreach ($cand in ($storageCandidates | Sort-Object Account, Share)) {
-        $ti++
-        $sizeTxt = if ($null -ne $cand.ProvisionedGb) { "$($cand.ProvisionedGb)GB" } elseif ($null -ne $cand.UsedGb) { "$($cand.UsedGb)GB used" } else { 'size?' }
-        $defTxt = switch ($cand.Classification) {
-            'Profiles'  { if ($cand.ServesPools.Count -gt 0) { "PROFILES serves: $(@($cand.ServesPools | Select-Object -First 3) -join ', ')$(if ($cand.ServesPools.Count -gt 3) { " +$($cand.ServesPools.Count - 3)" }) -> model" } else { 'PROFILES - pools unknown -> ledger only' } }
-            'AppAttach' { 'APP ATTACH -> ledger only' }
-            'NonAVD'    { 'NOT AVD -> dropped' }
-            default     { 'UNKNOWN -> ledger only' }
-        }
-        $ans = $null
-        try { $ans = Read-Host ("[{0}/{1}] {2}/{3}  {4} {5}  [{6}]" -f $ti, $storageCandidates.Count, $cand.Account, $cand.Share, $cand.Kind, $sizeTxt, $defTxt) } catch { $triageBailed = $true; break }
-        $ans = "$ans".Trim()
-        if ($ans -eq '') { continue }
-        elseif ($ans -match '^(?i)n$') { $cand.Classification = 'NonAVD'; $cand.Evidence = 'admin-confirmed'; $cand.Confidence = 'high'; $cand.ServesPools = @() }
-        elseif ($ans -match '^(?i)a$') { $cand.Classification = 'AppAttach'; $cand.Evidence = 'admin-confirmed'; $cand.Confidence = 'high'; $cand.ServesPools = @() }
-        elseif ($ans -match '^(?i)u$') { $cand.Classification = 'Unknown'; $cand.ServesPools = @() }
-        elseif ($ans -match '^(?i)y$') { $cand.Classification = 'Profiles'; if ($cand.Evidence -eq 'none') { $cand.Evidence = 'admin-confirmed' } }
-        else {
-            $resolved = $null
-            try { $resolved = Resolve-PoolFragments -Text $ans } catch { $triageBailed = $true; break }
-            while ($null -eq $resolved -and -not $triageBailed) {
-                $retry = $null
-                try { $retry = Read-Host "        try again (fragments / n / a / u / y / Enter=keep default)" } catch { $triageBailed = $true; break }
-                $retry = "$retry".Trim()
-                if ($retry -eq '') { break }
-                if ($retry -match '^(?i)[nauy]$') { $ans = $retry; break }
-                try { $resolved = Resolve-PoolFragments -Text $retry } catch { $triageBailed = $true }
-            }
-            if ($resolved) { $cand.Classification = 'Profiles'; $cand.ServesPools = @($resolved); $cand.Evidence = 'admin-confirmed'; $cand.Confidence = 'high' }
-            elseif ($ans -match '^(?i)n$') { $cand.Classification = 'NonAVD'; $cand.ServesPools = @() }
-            elseif ($ans -match '^(?i)a$') { $cand.Classification = 'AppAttach'; $cand.ServesPools = @() }
-            elseif ($ans -match '^(?i)u$') { $cand.Classification = 'Unknown'; $cand.ServesPools = @() }
-            elseif ($ans -match '^(?i)y$') { $cand.Classification = 'Profiles' }
-        }
-    }
-    # drops are never silent - one bulk confirm covers them all
-    if (-not $triageBailed) {
-        $drops = @($storageCandidates | Where-Object { $_.Classification -eq 'NonAVD' })
-        if ($drops.Count -gt 0) {
-            $dropNames = @($drops | Select-Object -First 4 | ForEach-Object { $_.Share }) -join ', '
-            $c = $null
-            try { $c = Read-Host "Dropping $($drops.Count) store(s) classified NOT AVD ($dropNames$(if ($drops.Count -gt 4) { ', ...' })) - confirm? [Y/n]" } catch { $triageBailed = $true }
-            if ("$c" -match '^(?i)n') { foreach ($d in $drops) { $d.Classification = 'Unknown' } ; Write-Info "Kept as Unknown in the ledger instead." }
-        }
-        $triageRan = -not $triageBailed
-    }
-    if ($triageBailed) { Write-Warn2 "Prompts unavailable - storage triage skipped. Everything goes to the ledger; nothing storage enters the JSON. Re-run interactively to confirm profile storage into the model." }
-} elseif ($storageCandidates.Count -gt 0) {
-    Write-Info "Storage triage skipped ($(if ($NoPrompts) { '-NoPrompts' } else { 'non-interactive session' })) - all storage goes to the ledger; none enters the Modeler JSON without confirmation."
+# Storage is NEVER modeled in the Modeler JSON (Don's ruling, v0.15): every
+# discovered store goes to the storage ledger CSV, with automatic classification
+# and any log-derived pool evidence. No prompts, no runner data entry - the run
+# flows straight through, and the ledger is the storage deliverable.
+if ($storageCandidates.Count -gt 0) {
+    Write-Info "Storage policy: all $($storageCandidates.Count) store(s) recorded in the storage ledger; the Modeler JSON carries host pools only (fsLogix off everywhere)."
 }
 $censusUnsized = $censusShares - $censusSized
 Write-Info "Storage census: $(@($storAccts).Count) account(s) scanned, $($storSkipped.Count) skipped (named above), $censusShares candidate store(s), $censusSized sized, $censusUnsized without a size."
@@ -892,7 +851,7 @@ $adminTasks = @'
 '@ | ConvertFrom-Json
 $globalSettings = '{"enterpriseDiscount":0,"windows365Discount":0,"azureType":1,"nerdioLicenseCost":{"type":0,"perUserCost":null,"windows365PerUserCost":null,"monthMinimumCost":null},"nerdioResourceCost":3}' | ConvertFrom-Json
 $nameCounts = @{}
-foreach ($p in $pools) { $nameCounts[$p.name] = 1 + ($nameCounts[$p.name] ?? 0) }
+foreach ($p in $pools) { $nameCounts[$p.name] = 1 + (Coalesce $nameCounts[$p.name] 0) }
 # Modeler disk-size tiers (from the UI dropdown); actual sizes snap UP to the nearest offered tier
 $diskTiers = @(128, 256, 512, 1024, 2048, 4096)
 $deployments = [System.Collections.Generic.List[object]]::new()
@@ -986,51 +945,9 @@ foreach ($p in $pools) {
         Overtime = "$otPct% x $($otHours)h"; Flags = ($flags -join '; ')
     })
 }
-# ---- storage -> model, by POLICY: only confirmed profile stores enter the JSON --
-# Confirmed = classified PROFILES with at least one assigned pool (log evidence
-# accepted at the prompt, or typed there). Everything else - unknown, app attach,
-# not-AVD, unmapped - lives in the storage ledger CSV only. The carrier shape is
-# import-tested: users=1 + profileSizeGb=measured GB prices the store exactly
-# once; B2s 1h/week + egress 0 keeps carrier overhead to roughly the stopped
-# disk (~$6-8/mo), which the ledger states rather than hides.
-$shareNameCounts = @{}
-foreach ($ps in $storageCandidates) { $shareNameCounts[$ps.Share] = 1 + ($shareNameCounts[$ps.Share] ?? 0) }
-foreach ($ps in $storageCandidates) {
-    $ps | Add-Member -NotePropertyName StoreLabel -NotePropertyValue $(if ($shareNameCounts[$ps.Share] -gt 1) { "$($ps.Account)/$($ps.Share)" } else { $ps.Share })
-    $gb = if ($ps.BillingModel -eq 'Provisioned') { $ps.ProvisionedGb ?? $ps.UsedGb } else { $ps.UsedGb ?? $ps.ProvisionedGb }
-    $ps | Add-Member -NotePropertyName ModelGb -NotePropertyValue $(if ($null -ne $gb -and [double]$gb -ge 1) { [int][Math]::Max(1, [Math]::Round([double]$gb)) } else { $null })
-    $confirmed = ($ps.Classification -eq 'Profiles' -and @($ps.ServesPools).Count -gt 0 -and $null -ne $ps.ModelGb)
-    $ps | Add-Member -NotePropertyName InModelJson -NotePropertyValue $(if ($confirmed) { 'yes' } else { 'no' })
-    if (-not $confirmed) {
-        if ($ps.Classification -eq 'Profiles' -and @($ps.ServesPools).Count -gt 0 -and $null -eq $ps.ModelGb) { $ps.Notes = "$($ps.Notes); confirmed but size unreadable - not modeled".TrimStart('; ') }
-        continue
-    }
-    $serves = @($ps.ServesPools)
-    $nameServes = " (serves: $(@($serves | Select-Object -First 3) -join ', ')$(if ($serves.Count -gt 3) { " +$($serves.Count - 3)" }))"
-    $deployments.Add([ordered]@{
-        mode = 'avd'
-        name = "FSLogix storage - $($ps.StoreLabel)$nameServes"
-        users = [ordered]@{ total = 1; absentPercent = 0; overtimeEnabled = $false; overtimePercent = 0; overtimeHours = 0 }
-        experience = 1
-        region = $ps.Region
-        workload = [ordered]@{
-            type = 5; vmSize = 'Standard_B2s'
-            disk = [ordered]@{ isEphemeral = $false; size = 128; type = 'Standard_LRS' }
-            maxUsersPerVCpu = 1; stoppedDiskType = 'Standard_LRS'; rdpEgressGb = 0
-        }
-        image = [ordered]@{ type = 1; isCisHardenedImage = $false }
-        autoScale = [ordered]@{ type = 0; workDays = @(1); workStartHour = 9; workStartMinutes = 0; workDurationMinutes = 60 }
-        fsLogix = [ordered]@{ enabled = $true; profileSizeGb = $ps.ModelGb; storageType = $ps.StorageTypeEnum }
-        administrative = [ordered]@{ tasks = $adminTasks; hourlyRate = 100; isEnabled = $false }
-        savings = [ordered]@{ reservedInstances = [ordered]@{ count = 0; years = 1 } }
-    })
-}
-if ($storageCandidates.Count -gt 0) {
-    $inModel = @($storageCandidates | Where-Object { $_.InModelJson -eq 'yes' }).Count
-    $ledgerOnly = @($storageCandidates | Where-Object { $_.InModelJson -ne 'yes' -and $_.Classification -ne 'NonAVD' }).Count
-    $dropped = @($storageCandidates | Where-Object { $_.Classification -eq 'NonAVD' }).Count
-    Write-Ok "Storage disposition: $inModel confirmed profile store(s) in the model JSON, $ledgerOnly in the ledger only (unconfirmed/app attach/unknown), $dropped confirmed not-AVD."
-}
+# ---- storage stays OUT of the model: ledger only (v0.15 ruling) ------------------
+# No carrier deployments, no fsLogix blocks, no prompts. The storage ledger CSV
+# (written with the review CSV below) is the complete storage deliverable.
 
 $model = [ordered]@{
     schema = 4
@@ -1042,7 +959,7 @@ $model = [ordered]@{
 
 # ------------------------------------------------------------------- 6. output + download
 Write-Info "[7/8] Writing $OutFile..."
-$model | ConvertTo-Json -Depth 30 -Compress | Out-File -FilePath $OutFile -Encoding utf8NoBOM
+Write-Utf8NoBom -FilePath $OutFile -Content ($model | ConvertTo-Json -Depth 30 -Compress)
 
 # ---------------------------------------- 7. actual spend (optional, skip-safe)
 if (-not $SkipCosts) {
@@ -1064,7 +981,7 @@ if (-not $SkipCosts) {
         if (-not $res.ok) { $costSkipped += [pscustomobject]@{ RG = $rgScopes[$scope]; Reason = "$($res.status)" }; continue }
         $costOk++
         foreach ($row in $res.rows) {
-            $costByResource[$row.ResourceId] = ($costByResource[$row.ResourceId] ?? 0) + $row.Cost
+            $costByResource[$row.ResourceId] = (Coalesce $costByResource[$row.ResourceId] 0) + $row.Cost
             if (-not $costCurrency -and $row.Currency) { $costCurrency = $row.Currency }
         }
     }
@@ -1075,9 +992,9 @@ if (-not $SkipCosts) {
             $sum = 0.0
             if ($poolVmIds.ContainsKey($key)) {
                 foreach ($vmId in $poolVmIds[$key]) {
-                    $sum += ($costByResource[$vmId] ?? 0)
+                    $sum += (Coalesce $costByResource[$vmId] 0)
                     $vmSpec = $vmSpecs[$vmId]
-                    if ($vmSpec -and $vmSpec.osDiskId) { $sum += ($costByResource[$vmSpec.osDiskId] ?? 0) }
+                    if ($vmSpec -and $vmSpec.osDiskId) { $sum += (Coalesce $costByResource[$vmSpec.osDiskId] 0) }
                 }
             }
             $attributed += $sum
@@ -1103,7 +1020,7 @@ $reviewFile = ($OutFile -replace '\.json$', '') + '-review.csv'
 # Export-Csv takes its column set from the FIRST row - make ActualMo uniform so the
 # column survives even when the first pool had no cost attribution (empty = skipped).
 foreach ($r in $review) { if (-not $r.PSObject.Properties['ActualMo']) { $r | Add-Member -NotePropertyName ActualMo -NotePropertyValue '' } }
-$review | Sort-Object Pool | Export-Csv -Path $reviewFile
+$review | Sort-Object Pool | Export-Csv -Path $reviewFile -NoTypeInformation
 Write-Ok "Review table (including ActualMo when pulled) also written to: $reviewFile"
 # ---- the storage ledger: EVERY discovered store, whatever the model decided ------
 $ledgerFile = $null
@@ -1120,7 +1037,7 @@ if ($storageCandidates.Count -gt 0) {
             ProvisionedGb = $_.ProvisionedGb; UsedGb = $_.UsedGb; UsedSource = $_.UsedSource
             ProvisionedIops = $_.ProvisionedIops; ThroughputMibps = $_.ThroughputMibps
             Classification = $_.Classification; Evidence = $_.Evidence; Confidence = $_.Confidence
-            ServesPools = (@($_.ServesPools) -join '; '); InModelJson = $_.InModelJson
+            ServesPools = (@($_.ServesPools) -join '; ')
             ActualMo = $(if ($costLookup.ContainsKey("$($_.ResourceId)".ToLowerInvariant())) { [Math]::Round($costLookup["$($_.ResourceId)".ToLowerInvariant()], 2) } else { '' })
             Notes = "$($_.Notes)$(if ($_.TierNote) { "; $($_.TierNote)" })".TrimStart('; ')
         }
@@ -1162,13 +1079,12 @@ try {
         sessionPeaks = @($sessionPeaks.Keys | ForEach-Object { [ordered]@{ poolId = $_; peakSessionsInclDisconnected = $sessionPeaks[$_] } })
         storageCandidates = @($storageCandidates)
         mapEvidence = @($(if (Get-Variable -Name mapEvidence -ErrorAction SilentlyContinue) { $mapEvidence } else { @() }))
-        storageTriage = [ordered]@{ ran = [bool]$triageRan; confirmedMappings = @($storageCandidates | Where-Object { $_.Evidence -eq 'admin-confirmed' } | ForEach-Object { [ordered]@{ billingUnit = $_.BillingUnit; classification = $_.Classification; pools = @($_.ServesPools) } }) }
         costByResource = @($(if (Get-Variable -Name costByResource -ErrorAction SilentlyContinue) { $costByResource.Keys | ForEach-Object { [ordered]@{ resourceId = $_; cost = $costByResource[$_] } } } else { @() }))
         costSkipped = @($(if (Get-Variable -Name costSkipped -ErrorAction SilentlyContinue) { $costSkipped } else { @() }))
         costCurrency = $(if (Get-Variable -Name costCurrency -ErrorAction SilentlyContinue) { $costCurrency } else { $null })
     }
-    $raw | ConvertTo-Json -Depth 12 | Out-File -FilePath $rawFile -Encoding utf8NoBOM
-    if ($rawBuckets.Count -gt 0) { $rawBuckets | Export-Csv -Path $bucketsFile -NoTypeInformation -Encoding utf8NoBOM }
+    Write-Utf8NoBom -FilePath $rawFile -Content ($raw | ConvertTo-Json -Depth 12)
+    if ($rawBuckets.Count -gt 0) { Write-Utf8NoBom -FilePath $bucketsFile -Content ((@($rawBuckets | ConvertTo-Csv -NoTypeInformation)) -join [Environment]::NewLine) }
     $bucketsNote = if ($rawBuckets.Count -gt 0) { " + $bucketsFile ($($rawBuckets.Count) usage slots)" } else { '' }
     Write-Ok "Raw decision data written: $rawFile$bucketsNote - adjustments can be re-derived from the zip without another customer run."
 } catch {

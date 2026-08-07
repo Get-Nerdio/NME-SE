@@ -17,12 +17,11 @@ A cost model is only as credible as the data behind it. This tool feeds the Mode
    iex (irm 'https://raw.githubusercontent.com/dclawrence003/NME/main/modeler/Get-NerdioModelerJson.ps1')
    ```
 
-3. If storage was discovered, answer the **storage triage** — one line per store, and pressing **Enter accepts the suggested default**. It exists so profile storage lands in the model only when someone confirms which pools use it (details in the FSLogix section below). A minute or less; skippable with `-NoPrompts`.
-4. Read the review table it prints (one row per pool — anything defaulted is spelled out in `Flags`).
-5. One zip downloads automatically: `modeler-import-<timestamp>.zip` — the import JSON, the review CSV, the **storage ledger CSV**, the raw observation data, and the run's full console log. If someone asked you to run this, **that zip is the only thing to send back**.
-6. Nerdio Modeler → **Import** → pick the JSON (from the zip). Done.
+3. Read the review table it prints (one row per pool — anything defaulted is spelled out in `Flags`). The run never stops to ask anything.
+4. One zip downloads automatically: `modeler-import-<timestamp>.zip` — the import JSON, the review CSV, the **storage ledger CSV**, the raw observation data, and the run's full console log. If someone asked you to run this, **that zip is the only thing to send back**.
+5. Nerdio Modeler → **Import** → pick the JSON (from the zip). Done.
 
-**Running from a local machine instead:** PowerShell 7 with the **Az.Accounts** module is all it takes (`Install-Module Az.Accounts` once, then `Connect-AzAccount` — add `-TenantId <id>` if you have several tenants). Then paste **the exact same command** — nothing about it changes between Cloud Shell and local. No other Az modules are used — inventory, telemetry, storage, and cost are all reached over REST. The only difference: the zip is written to the current folder instead of auto-downloading (the browser download is Cloud Shell-only).
+**Running from a local machine instead:** the **Az.Accounts** module is all it takes (`Install-Module Az.Accounts` once, then `Connect-AzAccount` — add `-TenantId <id>` if you have several tenants). Then paste **the exact same command** — nothing about it changes between Cloud Shell and local. Works in PowerShell 7 (recommended) *and* the built-in Windows PowerShell 5.1. No other Az modules are used — inventory, telemetry, storage, and cost are all reached over REST. The only difference: the zip is written to the current folder instead of auto-downloading (the browser download is Cloud Shell-only).
 
 Prefer to read code before running it (you should):
 
@@ -43,7 +42,6 @@ irm 'https://raw.githubusercontent.com/dclawrence003/NME/main/modeler/Get-Nerdio
 | `-OutFile` | timestamped | Output JSON name |
 | `-SkipCosts` | off | Skip the actual-spend pull |
 | `-SkipDownload` | off | Skip the Cloud Shell auto-downloads |
-| `-NoPrompts` | off | Skip the storage triage — all storage goes to the ledger only; none enters the JSON (also automatic in non-interactive sessions) |
 
 Parameters require the two-step (download-then-run) form — `iex (irm ...)` runs with defaults.
 
@@ -100,13 +98,13 @@ The goal is a model of how your pools **actually run**, so the Nerdio number is 
 
 ---
 
-## FSLogix profile storage — the ledger and the triage
+## FSLogix profile storage — the ledger
 
-FSLogix's *configuration* lives in Group Policy or Intune — nothing in Azure says "this pool uses FSLogix," and this tool will not reach inside session hosts to look. What Azure does show, with the same Reader access, is the *storage the profiles could live on*: Azure Files shares and SMB NetApp volumes. The tool discovers all of it and applies one strict policy: **nothing enters the Modeler JSON unless it's confirmed as profile storage and mapped to at least one host pool.** Everything discovered — confirmed or not — lands in a **storage ledger CSV** (`…-storage-ledger.csv`, always in the zip): billing unit, SKU, billing model, provisioned and used GB, classification, evidence, confidence, serving pools, actual last-month cost where visible, and whether it made the model.
+FSLogix's *configuration* lives in Group Policy or Intune — nothing in Azure says "this pool uses FSLogix," and this tool will not reach inside session hosts to look. What Azure does show, with the same Reader access, is the *storage the profiles could live on*: Azure Files shares and SMB NetApp volumes. The tool discovers all of it and applies one simple rule: **storage never enters the Modeler JSON.** The import carries host pools only — an Azure *compute* model — and everything storage lands in the **storage ledger CSV** (`…-storage-ledger.csv`, always in the zip). The run never stops to ask anything.
 
-**The triage** runs inline, one line per store, and Enter accepts a smart default (name-matched → profiles, `msix` → app attach, `pvcn-`/`mq`/`sftp` patterns → not AVD, else unknown). Assigning pools is search-driven: type any fragment of a pool name *or resource group* and the script resolves it — no list to scroll, whether the tenant has 20 pools or 400. `*` means every pool; drops are bulk-confirmed at the end, never silent. When file-share diagnostics exist (`StorageFileLogs`), the tool pre-fills pool evidence by correlating storage caller IPs with session-host IPs (it also checks each storage account's own diagnostics workspace, not just the AVD ones) — you just press Enter to accept. `-NoPrompts` or a non-interactive session skips the pass entirely: everything goes to the ledger, nothing storage enters the JSON.
+Each ledger row is one billing unit with: SKU and billing model (premium and provisioned-v2 bill **provisioned** GB, v1 standard bills **used**), provisioned and used capacity, an automatic classification (name-matched → profiles, `msix` → app attach, `pvcn-`/`mq`/`sftp` patterns → not AVD, else unknown), pool evidence with confidence when file-share diagnostics exist (`StorageFileLogs` caller IPs correlated with session-host IPs — the tool also checks each storage account's own diagnostics workspace, not just the AVD ones), and actual last-month cost where cost visibility allows. **NetApp is quantified at the capacity pool** — the thing Azure actually bills — with member volumes listed and shared pools flagged.
 
-A confirmed store becomes one small **"FSLogix storage — \<share\> (serves: …)"** deployment: 1 user, the store's measured GB, one B2s an hour a week, zero egress — carrier overhead is roughly the stopped disk (~$6–8/mo). Storage is priced **once per billing unit**, never spread across pools. Azure Files bills follow the SKU (premium and provisioned-v2 model **provisioned** GB, v1 standard models **used**); **NetApp is quantified at the capacity pool** — the thing Azure actually bills — with member volumes listed and shared pools flagged. App attach storage is quantified in the ledger but never enters the JSON (the Modeler has no concept for it). Sizes are resilient: share stats retry once, then fall back to Azure Monitor's `FileCapacity` metric (huge shares can time the stats call out; the metric is precomputed), and a census line ends the stage — accounts scanned, skipped (named), stores sized and unsized — so gaps are visible, never silent.
+Sizes are resilient: share stats retry once, then fall back to Azure Monitor's `FileCapacity` metric (huge shares can time the stats call out; the metric is precomputed), and a census line ends the stage — accounts scanned, skipped (named), stores sized and unsized — so gaps are visible, never silent. If profile storage should appear in a Modeler scenario, add it by hand in the Modeler using the ledger's numbers — the ledger is the storage conversation.
 
 ---
 

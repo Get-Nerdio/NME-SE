@@ -8,14 +8,7 @@ $saProf  = '/subscriptions/s1/resourcegroups/rg-stor/providers/microsoft.storage
 $saGen   = '/subscriptions/s1/resourcegroups/rg-stor/providers/microsoft.storage/storageaccounts/stgen'
 $anfPool = '/subscriptions/s1/resourcegroups/rg-anf/providers/microsoft.netapp/netappaccounts/anf1/capacitypools/pool1'
 
-# Triage answers, consumed in candidate order (Sort Account,Share):
-#   anf1/pool1      -> 'y'      profiles, pools unknown  => ledger only (policy test)
-#   stgen/msixapps  -> ''       default APP ATTACH       => ledger only, never JSON
-#   stgen/userprofiles -> 'poola'  fragment match PoolA  => confirmed, JSON
-#   stprofiles/profiles01 -> ''  default PROFILES + logs-ip pre-fill PoolA => confirmed, JSON
-$global:RHQueue = [System.Collections.Generic.Queue[string]]::new()
-'y', '', 'poola', '' | ForEach-Object { $global:RHQueue.Enqueue($_) }
-function Read-Host { param([string]$Prompt) if ($global:RHQueue.Count -gt 0) { $global:RHQueue.Dequeue() } else { '' } }
+# v0.15: storage is ledger-only, no prompts - nothing to mock for input.
 
 function Get-AzContext { [pscustomobject]@{ Name = 'mock' } }
 function Invoke-AzRestMethod {
@@ -128,8 +121,6 @@ $m = Get-Content /tmp/test-model.json -Raw | ConvertFrom-Json
 $csv = Import-Csv /tmp/test-model-review.csv
 $ledger = if (Test-Path /tmp/test-model-storage-ledger.csv) { Import-Csv /tmp/test-model-storage-ledger.csv } else { @() }
 $a = $m.deployments | Where-Object { $_.name -eq 'PoolA' }
-$dProf = $m.deployments | Where-Object { $_.name -like 'FSLogix storage - profiles01*' }
-$dUser = $m.deployments | Where-Object { $_.name -like 'FSLogix storage - userprofiles*' }
 $rowPoolA = $csv | Where-Object { $_.Pool -eq 'PoolA' }
 $lProf = $ledger | Where-Object { $_.Share -eq 'profiles01' }
 $lUser = $ledger | Where-Object { $_.Share -eq 'userprofiles' }
@@ -145,7 +136,7 @@ $log = if (Test-Path $logPath) { Get-Content $logPath -Raw } else { '' }
 
 $checks = [ordered]@{
     'schema=4'                          = ($m.schema -eq 4)
-    '3 deployments (pool + 2 stores)'   = (@($m.deployments).Count -eq 3)
+    '1 deployment (pool only)'          = (@($m.deployments).Count -eq 1)
     'PoolA users=40 abs=0'              = ($a.users.total -eq 40 -and $a.users.absentPercent -eq 0)
     'PoolA density 1.13 (obs 9/8)'      = ($a.workload.maxUsersPerVCpu -eq 1.13)
     'PoolA window 8+10h M-F'            = ($a.autoScale.workStartHour -eq 8 -and $a.autoScale.workDurationMinutes -eq 600)
@@ -153,27 +144,24 @@ $checks = [ordered]@{
     'review: MAU column (PoolA 120)'    = ($rowPoolA.MAU -eq '120')
     'session flag fires (60 vs 40)'     = ($rowPoolA.Flags -match 'sessions incl\. disconnected peaked at 60 vs 40 connected')
     'review has NO storage rows'        = (@($csv | Where-Object { $_.Pool -like 'FSLogix*' -or $_.Pool -like 'AppAttach*' }).Count -eq 0)
-    'profiles01: logs-ip prefill -> JSON' = ($dProf.name -eq 'FSLogix storage - profiles01 (serves: PoolA)' -and $dProf.fsLogix.profileSizeGb -eq 1024 -and $dProf.fsLogix.storageType -eq 2)
-    'userprofiles: typed map -> JSON'   = ($dUser.name -eq 'FSLogix storage - userprofiles (serves: PoolA)' -and $dUser.fsLogix.profileSizeGb -eq 200 -and $dUser.fsLogix.storageType -eq 1)
-    'carrier shape (1 user B2s egress0)' = ($dProf.users.total -eq 1 -and $dProf.workload.vmSize -eq 'Standard_B2s' -and $dProf.workload.rdpEgressGb -eq 0 -and $dProf.autoScale.workDurationMinutes -eq 60 -and $dProf.image.type -eq 1)
-    'msix/appattach NOT in JSON'        = (@($m.deployments | Where-Object { $_.name -like '*msix*' }).Count -eq 0)
-    'anf unmapped NOT in JSON'          = (@($m.deployments | Where-Object { $_.name -like '*pool1*' -or $_.name -like '*anf*' }).Count -eq 0)
+    'NO storage deployments at all'     = (@($m.deployments | Where-Object { $_.name -like '*FSLogix*' -or $_.name -like '*storage*' }).Count -eq 0)
+    'every deployment fsLogix off'      = (@($m.deployments | Where-Object { $_.fsLogix.enabled -eq $true }).Count -eq 0)
     'data share never a candidate'      = (@($ledger | Where-Object { $_.Share -eq 'data' }).Count -eq 0)
     'ledger: 4 rows, all classified'    = (@($ledger).Count -eq 4 -and @($ledger | Where-Object { $_.Classification }).Count -eq 4)
-    'ledger: profiles01 high logs-ip'   = ($lProf.Classification -eq 'Profiles' -and $lProf.Evidence -eq 'logs-ip' -and $lProf.Confidence -eq 'high' -and $lProf.InModelJson -eq 'yes' -and $lProf.ServesPools -eq 'PoolA')
-    'ledger: userprofiles admin-conf'   = ($lUser.Evidence -eq 'admin-confirmed' -and $lUser.InModelJson -eq 'yes' -and $lUser.BillingModel -eq 'Used')
-    'ledger: msix appattach no-JSON'    = ($lMsix.Classification -eq 'AppAttach' -and $lMsix.InModelJson -eq 'no')
-    'ledger: anf capacity pool 4096'    = ($lAnf.Classification -eq 'Profiles' -and $lAnf.InModelJson -eq 'no' -and $lAnf.ProvisionedGb -eq '4096' -and $lAnf.BillingUnit -match 'capacity pool' -and $lAnf.Notes -match 'anfprof')
+    'ledger: profiles01 high logs-ip'   = ($lProf.Classification -eq 'Profiles' -and $lProf.Evidence -eq 'logs-ip' -and $lProf.Confidence -eq 'high' -and $lProf.ServesPools -eq 'PoolA')
+    'ledger: userprofiles used-basis'   = ($lUser.Classification -eq 'Profiles' -and $lUser.BillingModel -eq 'Used' -and $lUser.Evidence -eq 'name-match')
+    'ledger: msix classified appattach' = ($lMsix.Classification -eq 'AppAttach')
+    'ledger: anf capacity pool 4096'    = ($lAnf.Classification -eq 'Profiles' -and $lAnf.ProvisionedGb -eq '4096' -and $lAnf.BillingUnit -match 'capacity pool' -and $lAnf.Notes -match 'anfprof')
     'ledger: stprofiles ActualMo 42'    = ($lProf.ActualMo -eq '42')
     'census line printed'               = ($log -match 'Storage census: 2 account\(s\) scanned, 0 skipped')
-    'disposition line (2 model 2 ledger)' = ($log -match 'Storage disposition: 2 confirmed profile store\(s\) in the model JSON, 2 in the ledger only')
+    'ledger-only policy line printed'   = ($log -match 'Storage policy: all 4 store\(s\) recorded in the storage ledger')
     'ActualMo uniform: PoolA 160.75'    = ($rowPoolA.ActualMo -eq '160.75')
-    'admin tasks on carrier'            = (@($dProf.administrative.tasks.'2').Count -eq 16)
+    'admin tasks on pool deployment'    = (@($a.administrative.tasks.'2').Count -eq 16)
     'zip holds json+csv+ledger+log'     = ($zipOk -and (Test-Path /tmp/zipcheck/test-model.json) -and (Test-Path /tmp/zipcheck/test-model-review.csv) -and (Test-Path /tmp/zipcheck/test-model-storage-ledger.csv) -and (Test-Path $logPath))
     'console log captured + clean'      = ($log -match 'Assembling deployments' -and $log -notmatch [char]27)
     'no raw-export failure in log'      = ($log -notmatch 'Raw data export failed' -and $log -match 'Raw decision data written')
     'counters exclude storage rows'     = ($log -match 'Usage found for 1 of 1 pool')
-    'rawdata sane + v0.14 + triage'     = ($null -ne $rawJson -and @($rawJson.pools).Count -eq 1 -and $rawJson.meta.version -eq 'v0.14' -and @($rawJson.storageCandidates).Count -eq 4 -and $rawJson.storageTriage.ran -eq $true -and @($rawJson.mapEvidence).Count -ge 1)
+    'rawdata sane + v0.15 + evidence'   = ($null -ne $rawJson -and @($rawJson.pools).Count -eq 1 -and $rawJson.meta.version -eq 'v0.15' -and @($rawJson.storageCandidates).Count -eq 4 -and @($rawJson.mapEvidence).Count -ge 1)
     'usage buckets csv in zip'          = (@($rawBucketsCsv).Count -eq 3 -and $rawBucketsCsv[1].ConcurrentUsers -eq '7')
     'no cmdlet-missing / skip errors'   = ($log -notmatch 'not recognized' -and $log -notmatch 'storage account\(s\) skipped \(slow')
 }
