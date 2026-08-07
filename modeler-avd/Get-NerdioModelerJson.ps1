@@ -50,6 +50,22 @@
     ./modeler.ps1 -TimeZone 'America/Chicago' -ModelName 'Contoso - Actuals'
 
 .NOTES
+    v0.13 (2026-08-07). LOCAL POWERSHELL IS NOW FIRST-CLASS - from a prospect's
+    local-PS run that lost every usage number:
+    (1) Telemetry queries no longer use Invoke-AzOperationalInsightsQuery (the
+    Az.OperationalInsights module ships in Cloud Shell but rarely on laptops -
+    all 4 workspaces failed with 'not recognized' and every pool defaulted).
+    Queries now go straight to the Log Analytics REST API with a token from
+    Get-AzAccessToken - both live in Az.Accounts, which anyone who can run
+    Connect-AzAccount already has. Handles the Az.Accounts 5.x SecureString
+    token change. Commercial cloud endpoint; sovereign clouds would need edits.
+    (2) Storage discovery survives slow accounts: one 100-second stats timeout
+    (a 100TB share) used to abort every remaining account AND all ANF checking,
+    then print 'continuing without FSLogix modeling' above a table of modeled
+    shares. Now: per-account catch + per-stats catch, ANF isolated, and the log
+    names exactly which accounts were skipped.
+    (3) Missing/expired sign-in gets a plain message (run Connect-AzAccount,
+    add -TenantId if needed) instead of a wall of red TerminatingErrors.
     v0.12 (2026-08-06). Validated against a live customer's Nerdio Mothership
     telemetry (independent hourly per-pool concurrency); three changes came out:
     (1) DAY RULE NORMALIZATION - a 30-day lookback holds 5 of some weekdays and
@@ -128,8 +144,9 @@
     table, JSON, and download are never affected. -SkipCosts disables the pull.
     Review table shows each pool's resource group, and the run ends with the list
     of resource groups holding session-host VMs (the Cost Management filter list).
-    Requires: Azure Cloud Shell (PowerShell) or local PS7 with Az
-    modules + Connect-AzAccount. Needs Reader on the subscriptions and Log Analytics
+    Requires: Azure Cloud Shell (PowerShell), or local PowerShell 7 with the
+    Az.Accounts module + Connect-AzAccount (no other Az modules used - v0.13).
+    Needs Reader on the subscriptions and Log Analytics
     Reader on the discovered workspaces.
     v0.4 REPORTING RULES (per real Modeler UI bounds):
     - SKUs reported EXACTLY as found, never mapped. workload.type = 5 (Custom),
@@ -162,7 +179,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = 'v0.12'
+$ScriptVersion = 'v0.13'
 if ([string]::IsNullOrEmpty($OutFile)) { $OutFile = "modeler-import-$(Get-Date -Format 'yyyyMMdd-HHmm').json" }
 
 function Write-Info { param([string]$m) Write-Host "[i] $m" -ForegroundColor Gray }
@@ -260,10 +277,41 @@ function Get-ActualCostRows {
     return @{ ok = $true; rows = $rows }
 }
 
-if (-not (Get-AzContext)) { throw "No Azure context. In Cloud Shell this is automatic; locally run Connect-AzAccount first." }
+if (-not (Get-AzContext)) {
+    Write-Warn2 "Not signed in to Azure. Run Connect-AzAccount first (add -TenantId <tenant-id> if you have several tenants), then run this command again. In Azure Cloud Shell sign-in is automatic."
+    if ($script:TranscriptOn) { try { Stop-Transcript | Out-Null } catch { }; $script:TranscriptOn = $false }
+    return
+}
+
+# --- Log Analytics query via REST (no Az.OperationalInsights dependency) ------
+# Invoke-AzOperationalInsightsQuery ships in Cloud Shell but rarely on laptops -
+# a prospect's local-PS run lost ALL telemetry to that missing module. This uses
+# Get-AzAccessToken + Invoke-RestMethod, both in Az.Accounts, which anyone who
+# can Connect-AzAccount already has. Commercial-cloud endpoint.
+function Invoke-LaQuery {
+    param([string]$WorkspaceCustomerId, [string]$Query)
+    $tok = Get-AzAccessToken -ResourceUrl 'https://api.loganalytics.io'
+    # Az.Accounts 5.x returns the token as a SecureString; older versions a plain string
+    $tokenText = if ($tok.Token -is [securestring]) { ConvertFrom-SecureString -SecureString $tok.Token -AsPlainText } else { "$($tok.Token)" }
+    $resp = Invoke-RestMethod -Method Post -Uri "https://api.loganalytics.io/v1/workspaces/$WorkspaceCustomerId/query" `
+        -Headers @{ Authorization = "Bearer $tokenText" } -ContentType 'application/json' `
+        -Body (@{ query = $Query } | ConvertTo-Json -Depth 4 -Compress)
+    $table = @($resp.tables) | Select-Object -First 1
+    $rows = [System.Collections.Generic.List[object]]::new()
+    if ($table) {
+        $colNames = @($table.columns | ForEach-Object { "$($_.name)" })
+        foreach ($r in @($table.rows)) {
+            $o = [ordered]@{}
+            for ($i = 0; $i -lt $colNames.Count; $i++) { $o[$colNames[$i]] = $r[$i] }
+            $rows.Add([pscustomobject]$o)
+        }
+    }
+    [pscustomobject]@{ Results = $rows }
+}
 
 # ------------------------------------------------------------------------- 1. pools
 Write-Info "[1/8] Inventorying host pools via Resource Graph..."
+try {
 $pools = Invoke-ArgQuery -Query @"
 resources
 | where type =~ 'microsoft.desktopvirtualization/hostpools'
@@ -273,6 +321,14 @@ resources
           preferredAppGroupType = tostring(properties.preferredAppGroupType),
           startVMOnConnect = tobool(properties.startVMOnConnect)
 "@
+} catch {
+    if ("$($_.Exception.Message)" -match '(?i)Connect-AzAccount|credential|expired|authentication') {
+        Write-Warn2 "Azure sign-in is missing or expired. Run Connect-AzAccount (add -TenantId <tenant-id> if it mentions tenants), then run this command again."
+        if ($script:TranscriptOn) { try { Stop-Transcript | Out-Null } catch { }; $script:TranscriptOn = $false }
+        return
+    }
+    throw
+}
 if ($pools.Count -eq 0) { throw "No host pools visible. Check subscription access (Reader) or -SubscriptionId scope." }
 Write-Ok "Found $($pools.Count) host pool(s)."
 
@@ -410,7 +466,7 @@ foreach ($wsId in $workspaceIds.Keys) {
         $wsResp = Invoke-AzRestMethod -Method GET -Path "$wsId`?api-version=2021-06-01"
         if ($wsResp.StatusCode -ne 200) { Write-Warn2 "Cannot read workspace $wsId (HTTP $($wsResp.StatusCode)) - skipping."; continue }
         $customerId = ($wsResp.Content | ConvertFrom-Json).properties.customerId
-        $result = Invoke-AzOperationalInsightsQuery -WorkspaceId $customerId -Query $telemetryKql
+        $result = Invoke-LaQuery -WorkspaceCustomerId $customerId -Query $telemetryKql
         foreach ($row in $result.Results) {
             $key = $row.HostPoolId.ToLower()
             $peak = [int]$row.PeakConcurrentUsers
@@ -419,12 +475,12 @@ foreach ($wsId in $workspaceIds.Keys) {
         }
         Write-Ok "Workspace $($wsId.Split('/')[-1]): usage for $(@($result.Results).Count) pool(s)."
         try {
-            $bres = Invoke-AzOperationalInsightsQuery -WorkspaceId $customerId -Query $bucketsKql
+            $bres = Invoke-LaQuery -WorkspaceCustomerId $customerId -Query $bucketsKql
             $wsName = $wsId.Split('/')[-1]
             foreach ($brow in @($bres.Results)) { $rawBuckets.Add([pscustomobject]@{ Workspace = $wsName; HostPoolId = $brow.HostPoolId; SlotUtc = $brow.SlotUtc; ConcurrentUsers = $brow.ConcurrentUsers }) }
         } catch { Write-Warn2 "Raw usage buckets skipped for $($wsId.Split('/')[-1]) ($($_.Exception.Message)) - aggregates unaffected." }
         try {
-            $sres = Invoke-AzOperationalInsightsQuery -WorkspaceId $customerId -Query $sessionsKql
+            $sres = Invoke-LaQuery -WorkspaceCustomerId $customerId -Query $sessionsKql
             foreach ($srow in @($sres.Results)) {
                 $skey = $srow.HostPoolId.ToLower()
                 $sp = [int]$srow.PeakSessions
@@ -445,13 +501,24 @@ foreach ($wsId in $workspaceIds.Keys) {
 Write-Info "[5/8] Discovering FSLogix profile storage (Azure Files + ANF)..."
 $profileStores = [System.Collections.Generic.List[object]]::new()
 $profileNameRx = '(?i)prof|fslogix|upd|userdisk|usrprof|msix|app[-_]?attach'
+# One slow account must never abort the rest: a prospect's 100TB share timed the
+# stats call out (fixed 100s HttpClient limit) and the old single try/catch then
+# skipped every remaining account AND all ANF checking - silently. Each account
+# now fails alone, stats failures keep the share (size unreadable), and skips
+# are named in the log.
+$storSkipped = [System.Collections.Generic.List[string]]::new()
+$storAccts = @()
 try {
     $storAccts = Invoke-ArgQuery -Query @'
 resources
 | where type =~ 'microsoft.storage/storageaccounts'
 | project id, name, resourceGroup, location, accountKind = tostring(kind), skuName = tostring(sku.name)
 '@
-    foreach ($sa in $storAccts) {
+} catch {
+    Write-Warn2 "Storage account inventory failed ($($_.Exception.Message)) - Azure Files profile storage not modeled."
+}
+foreach ($sa in $storAccts) {
+    try {
         $isPremiumFiles = $sa.accountKind -match '^(?i)FileStorage$'
         $shResp = Invoke-AzRestMethod -Method GET -Path "$($sa.id)/fileServices/default/shares?api-version=2023-01-01"
         if ($shResp.StatusCode -ne 200) { continue }   # no file service or not visible
@@ -461,11 +528,13 @@ resources
             if (-not $smb) { continue }
             if (-not ($isPremiumFiles -or $shName -match $profileNameRx)) { continue }
             $usedGb = $null
-            $stResp = Invoke-AzRestMethod -Method GET -Path "$($sa.id)/fileServices/default/shares/$($shName)?api-version=2023-01-01&`$expand=stats"
-            if ($stResp.StatusCode -eq 200) {
-                $stProps = ($stResp.Content | ConvertFrom-Json).properties
-                if ($null -ne $stProps.shareUsageBytes) { $usedGb = [Math]::Round($stProps.shareUsageBytes / 1GB, 1) }
-            }
+            try {
+                $stResp = Invoke-AzRestMethod -Method GET -Path "$($sa.id)/fileServices/default/shares/$($shName)?api-version=2023-01-01&`$expand=stats"
+                if ($stResp.StatusCode -eq 200) {
+                    $stProps = ($stResp.Content | ConvertFrom-Json).properties
+                    if ($null -ne $stProps.shareUsageBytes) { $usedGb = [Math]::Round($stProps.shareUsageBytes / 1GB, 1) }
+                }
+            } catch { }   # stats timeout on a huge share - keep the share, size stays unreadable
             $provGb = if ($null -ne $sh.properties.shareQuota) { [int]$sh.properties.shareQuota } else { $null }
             # Modeler storage enum (dropdown order): 1=Files Premium LRS, 2=Files Premium ZRS,
             # 3=ANF Standard, 4=ANF Premium, 5=ANF Ultra. No standard-Files option exists.
@@ -480,7 +549,12 @@ resources
                 ServesPools = @()
             })
         }
-    }
+    } catch { $storSkipped.Add($sa.name) }
+}
+if ($storSkipped.Count -gt 0) {
+    Write-Warn2 "$($storSkipped.Count) storage account(s) skipped (slow or unreadable): $($storSkipped -join ', '). Their shares were NOT checked; every other account was."
+}
+try {
     $anfVols = Invoke-ArgQuery -Query @'
 resources
 | where type =~ 'microsoft.netapp/netappaccounts/capacitypools/volumes'
@@ -506,7 +580,7 @@ resources
         })
     }
 } catch {
-    Write-Warn2 "Profile storage discovery failed ($($_.Exception.Message)) - continuing without FSLogix modeling."
+    Write-Warn2 "Azure NetApp Files discovery failed ($($_.Exception.Message)) - ANF profile storage not modeled; Azure Files results above are unaffected."
 }
 
 # ---- share -> pool mapping from StorageFileLogs (only when the logs exist) -------
@@ -526,7 +600,7 @@ ShareUsers | join kind=inner PoolUsers on UserGuess | summarize Overlap = dcount
             $wsResp = Invoke-AzRestMethod -Method GET -Path "$wsId`?api-version=2021-06-01"
             if ($wsResp.StatusCode -ne 200) { continue }
             $customerId = ($wsResp.Content | ConvertFrom-Json).properties.customerId
-            $result = Invoke-AzOperationalInsightsQuery -WorkspaceId $customerId -Query $mapKql
+            $result = Invoke-LaQuery -WorkspaceCustomerId $customerId -Query $mapKql
             foreach ($row in @($result.Results)) { $mapRows.Add($row) }
         } catch { }
     }

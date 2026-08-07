@@ -2,7 +2,7 @@
 
 Turns your **actual AVD environment** — every host pool, tenant-wide — into an import file for the Nerdio Modeler, plus a per-pool review of what was found and (where permitted) what those pools **actually cost last month**.
 
-One command in Azure Cloud Shell. Read-only. Nothing in your environment is changed.
+One command in Azure Cloud Shell — or in local PowerShell 7 after `Connect-AzAccount`. Read-only. Nothing in your environment is changed.
 
 A cost model is only as credible as the data behind it. This tool feeds the Modeler reality instead of estimates: real SKUs, real disks, real session limits, observed concurrency and working hours — from every host pool, not a sample. The result is a model that dials in Nerdio's value against how your environment actually runs, so the savings it shows are savings you can expect to keep.
 
@@ -18,6 +18,8 @@ A cost model is only as credible as the data behind it. This tool feeds the Mode
    ```
 
 3. Read the review table it prints (one row per pool — anything defaulted is spelled out in `Flags`).
+
+**Running from a local machine instead:** PowerShell 7 with the **Az.Accounts** module is all it takes (`Install-Module Az.Accounts` once, then `Connect-AzAccount` — add `-TenantId <id>` if you have several tenants). Then paste the same command. No other Az modules are used — inventory, telemetry, storage, and cost are all reached over REST. The zip is written to the current folder (the browser auto-download is Cloud Shell-only).
 4. One zip downloads automatically: `modeler-import-<timestamp>.zip` — the import JSON, the review CSV, the raw observation data, and the run's full console log. If someone asked you to run this, **that zip is the only thing to send back**.
 5. Nerdio Modeler → **Import** → pick the JSON (from the zip). Done.
 

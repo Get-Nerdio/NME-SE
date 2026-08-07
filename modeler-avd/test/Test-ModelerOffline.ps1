@@ -71,28 +71,24 @@ function Invoke-AzRestMethod {
     }
     return [pscustomobject]@{ StatusCode = 404; Content = '{}' }
 }
-function Invoke-AzOperationalInsightsQuery {
-    param([string]$WorkspaceId, [string]$Query)
-    if ($Query -match 'Buckets \| project HostPoolId, SlotUtc') {
-        return [pscustomobject]@{ Results = @(
-            [pscustomobject]@{ HostPoolId = $poolAId.ToLower(); SlotUtc = '2026-08-05T13:00:00Z'; ConcurrentUsers = '5' },
-            [pscustomobject]@{ HostPoolId = $poolAId.ToLower(); SlotUtc = '2026-08-05T13:15:00Z'; ConcurrentUsers = '7' },
-            [pscustomobject]@{ HostPoolId = $poolAId.ToLower(); SlotUtc = '2026-08-05T13:30:00Z'; ConcurrentUsers = '6' }
-        ) }
+# v0.13: the script queries Log Analytics via REST (Get-AzAccessToken +
+# Invoke-RestMethod). Mock BOTH so the tables->objects adapter is exercised.
+function Get-AzAccessToken { param([string]$ResourceUrl) [pscustomobject]@{ Token = 'mock-token' } }
+function Invoke-RestMethod {
+    param($Method, $Uri, $Headers, $ContentType, $Body)
+    if ("$Uri" -notmatch 'api\.loganalytics\.io') { throw "unexpected Invoke-RestMethod uri in test: $Uri" }
+    $q = ($Body | ConvertFrom-Json).query
+    $pid_ = $poolAId.ToLower()
+    if ($q -match 'Buckets \| project HostPoolId, SlotUtc') {
+        return ('{"tables":[{"name":"PrimaryResult","columns":[{"name":"HostPoolId"},{"name":"SlotUtc"},{"name":"ConcurrentUsers"}],"rows":[["PID","2026-08-05T13:00:00Z","5"],["PID","2026-08-05T13:15:00Z","7"],["PID","2026-08-05T13:30:00Z","6"]]}]}'.Replace('PID', $pid_) | ConvertFrom-Json)
     }
-    if ($Query -match 'StorageFileLogs') {
-        return [pscustomobject]@{ Results = @(
-            [pscustomobject]@{ AccountName = 'stprofiles'; Share = 'profiles01'; HostPoolId = $poolAId.ToLower(); Overlap = '12' }
-        ) }
+    if ($q -match 'StorageFileLogs') {
+        return ('{"tables":[{"name":"PrimaryResult","columns":[{"name":"AccountName"},{"name":"Share"},{"name":"HostPoolId"},{"name":"Overlap"}],"rows":[["stprofiles","profiles01","PID","12"]]}]}'.Replace('PID', $pid_) | ConvertFrom-Json)
     }
-    if ($Query -match 'WVDAgentHealthStatus') {
-        return [pscustomobject]@{ Results = @(
-            [pscustomobject]@{ HostPoolId = $poolAId.ToLower(); PeakSessions = '60' }
-        ) }
+    if ($q -match 'WVDAgentHealthStatus') {
+        return ('{"tables":[{"name":"PrimaryResult","columns":[{"name":"HostPoolId"},{"name":"PeakSessions"}],"rows":[["PID","60"]]}]}'.Replace('PID', $pid_) | ConvertFrom-Json)
     }
-    [pscustomobject]@{ Results = @(
-        [pscustomobject]@{ HostPoolId = $poolAId.ToLower(); PeakConcurrentUsers = '40'; StartHour = '8'; WorkDurationMinutes = '600'; WorkDaysJson = '[1,2,3,4,5]'; WeeklyOffUH = '84'; PeakUsersPerHost = '9'; Mau = '120' }
-    ) }
+    return ('{"tables":[{"name":"PrimaryResult","columns":[{"name":"HostPoolId"},{"name":"PeakConcurrentUsers"},{"name":"StartHour"},{"name":"WorkDurationMinutes"},{"name":"WorkDaysJson"},{"name":"WeeklyOffUH"},{"name":"PeakUsersPerHost"},{"name":"Mau"}],"rows":[["PID","40","8","600","[1,2,3,4,5]","84","9","120"]]}]}'.Replace('PID', $pid_) | ConvertFrom-Json)
 }
 
 Remove-Item /tmp/test-model*.* -Force -ErrorAction SilentlyContinue
@@ -143,7 +139,8 @@ $checks = [ordered]@{
     'review: MAU column (PoolA 120)'  = ($rowPoolA.MAU -eq '120' -and $rowProf.MAU -eq '-')
     'session flag fires (60 vs 40)'   = ($rowPoolA.Flags -match 'sessions incl\. disconnected peaked at 60 vs 40 connected')
     'users.total stays peak (40)'     = ($a.users.total -eq 40 -and $a.users.absentPercent -eq 0)
-    'rawdata v0.12 + sessionPeaks'    = ($rawJson.meta.version -eq 'v0.12' -and @($rawJson.sessionPeaks).Count -eq 1 -and [int]$rawJson.sessionPeaks[0].peakSessionsInclDisconnected -eq 60)
+    'rawdata v0.13 + sessionPeaks'    = ($rawJson.meta.version -eq 'v0.13' -and @($rawJson.sessionPeaks).Count -eq 1 -and [int]$rawJson.sessionPeaks[0].peakSessionsInclDisconnected -eq 60)
+    'no cmdlet-missing / skip errors' = ($log -notmatch 'not recognized' -and $log -notmatch 'storage account\(s\) skipped')
 }
 $fail = 0
 foreach ($k in $checks.Keys) {
