@@ -109,7 +109,8 @@ function Invoke-AzRestMethod {
 # adapter is exercised. v0.14 adds the two map queries (share evidence + pool ips).
 function Get-AzAccessToken { param([string]$ResourceUrl) [pscustomobject]@{ Token = 'mock-token' } }
 function Invoke-RestMethod {
-    param($Method, $Uri, $Headers, $ContentType, $Body)
+    param($Method, $Uri, $Headers, $ContentType, $Body, $TimeoutSec)
+    if ("$Uri" -match 'modeler/VERSION') { return 'v0.17.1' }   # stale-copy self-check: report current
     if ("$Uri" -notmatch 'api\.loganalytics\.io') { throw "unexpected Invoke-RestMethod uri in test: $Uri" }
     $q = ($Body | ConvertFrom-Json).query
     $pid_ = $poolAId.ToLower()
@@ -177,12 +178,14 @@ $checks = [ordered]@{
     'console log captured + clean'      = ($log -match 'Assembling deployments' -and $log -notmatch [char]27)
     'no raw-export failure in log'      = ($log -notmatch 'Raw data export failed' -and $log -match 'Raw decision data written')
     'counters exclude storage rows'     = ($log -match 'Usage found for 1 of 1 pool')
-    'rawdata sane + v0.17 + evidence'   = ($null -ne $rawJson -and @($rawJson.pools).Count -eq 1 -and $rawJson.meta.version -eq 'v0.17' -and @($rawJson.storageCandidates).Count -eq 4 -and @($rawJson.mapEvidence).Count -ge 1)
+    'rawdata sane + version + evidence' = ($null -ne $rawJson -and @($rawJson.pools).Count -eq 1 -and $rawJson.meta.version -eq 'v0.17.1' -and @($rawJson.storageCandidates).Count -eq 4 -and @($rawJson.mapEvidence).Count -ge 1)
+    'version is the first output line'  = ($log -match '(?m)^\[i\] Get-NerdioModelerJson v0\.17\.1' -and ($log.IndexOf('Get-NerdioModelerJson v0.17.1') -lt $log.IndexOf('Signed in as')))
+    'no stale-copy warning (current)'   = ($log -notmatch 'THIS COPY IS STALE')
     'ARG pinned to enabled subs s1+s2'  = $(
         $ok = (@($global:ArgSubScopes).Count -ge 5)
         foreach ($sc in $global:ArgSubScopes) { if (@($sc).Count -ne 2 -or @($sc)[0] -ne 's1' -or @($sc)[1] -ne 's2') { $ok = $false } }
         $ok)
-    'identity banner + scope printed'   = ($log -match 'Get-NerdioModelerJson v0\.17' -and $log -match 'Signed in as don@mock\.test - tenant ten-1' -and $log -match 'Scope: 2 enabled subscription\(s\)' -and $log -match 'Sub One  \(s1\)' -and $log -match 'Sub Two  \(s2\)')
+    'identity banner + scope printed'   = ($log -match 'Signed in as don@mock\.test - tenant ten-1' -and $log -match 'Scope: 2 enabled subscription\(s\)' -and $log -match 'Sub One  \(s1\)' -and $log -match 'Sub Two  \(s2\)')
     'other-tenant warning printed'      = ($log -match 'can also reach 1 other tenant' -and $log -match 'Connect-AzAccount -TenantId ten-2')
     'rawdata identity block'            = ($rawJson.meta.identity.account -eq 'don@mock.test' -and $rawJson.meta.identity.tenantId -eq 'ten-1' -and @($rawJson.meta.identity.scopeSubscriptions).Count -eq 2)
     'per-sub pool counts printed'       = ($log -match 'Found 1 host pool\(s\) across 1 subscription\(s\)' -and $log -match 'Sub One : 1 pool\(s\)')

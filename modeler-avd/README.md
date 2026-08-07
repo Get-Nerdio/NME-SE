@@ -143,7 +143,7 @@ Fallback caveats vs. the script: you find the workspace yourself, extra workspac
 | Peak = 1 pools show odd windows | With one observed user, any active hour counts as "working" — noise on near-idle pools, meaningless at real load |
 | Fewer pools than expected | Check the run's opening lines: signed-in account, tenant, and the subscription list. The usual cause is the wrong tenant — `Connect-AzAccount -TenantId <id>` and run again. A run covers one tenant; the script names any others your account can reach |
 | Storage ledger rows have empty `ServesPools` | File-share diagnostics aren't flowing to Log Analytics, so share→pool mapping has no evidence — sizes and costs are still correct; ask the AVD admin which pools use the share |
-| Behavior doesn't match the latest version | `raw.githubusercontent.com` caches ~5 minutes after an update. The first console line prints the version. To fetch an exact commit, put its SHA in place of `main` in the URL |
+| `THIS COPY IS STALE` warning, or an old version number on the first line | The machine is running old code — usually a saved `modeler.ps1` or a replayed command pinned to an old commit. Delete saved copies and re-paste the Quick-start command. (The raw URL also caches ~5 minutes right after an update) |
 | Auto-download didn't fire | Use Cloud Shell's **Manage files → Download** and enter the printed filename |
 
 ---

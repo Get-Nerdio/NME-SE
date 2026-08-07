@@ -59,6 +59,18 @@
     ./modeler.ps1 -TimeZone 'America/Chicago' -ModelName 'Contoso - Actuals'
 
 .NOTES
+    v0.17.1 (2026-08-07). STALE-COPY SELF-DETECTION - a laptop ran v0.15
+    three times in one day (System32 output, warning floods, 18-pool scans)
+    while Cloud Shell, minutes apart, pulled current code from the same
+    repo. CDN lag was ruled out (the fixes were hours old); a saved
+    modeler.ps1 or a replayed SHA-pinned command keeps old code alive
+    forever, and an old copy looks normal until compared against a fresh
+    one. Now: the version prints as the FIRST line of every run (before
+    sign-in), and the script fetches the published version marker
+    (modeler/VERSION on main, cache-busting query, 5s timeout, silent on
+    any failure) and prints a loud three-line warning with the exact
+    re-fetch command when the running copy is old. RELEASE RULE: bump
+    modeler/VERSION and $ScriptVersion together.
     v0.17 (2026-08-07). EXPLICIT SUBSCRIPTION SCOPE ON EVERY QUERY - from two
     same-day runs against the same demo estate: Cloud Shell returned 120 pools,
     local PowerShell returned 18, with ZERO overlap - disjoint subscriptions,
@@ -271,7 +283,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = 'v0.17'
+$ScriptVersion = 'v0.17.1'   # RELEASE RULE: bump modeler/VERSION in the same commit
 # Windows PowerShell 5.1 compatibility: force TLS 1.2 (old .NET Framework
 # defaults can be lower and ARM/Log Analytics require 1.2), and no PS7-only
 # syntax anywhere in this file (?? / ?. / -AsPlainText / utf8NoBOM).
@@ -310,6 +322,25 @@ $script:TranscriptFile = ($OutFile -replace '\.json$', '') + '-console.log'
 $script:TranscriptOn = $false
 try { Start-Transcript -Path $script:TranscriptFile -Force | Out-Null; $script:TranscriptOn = $true }
 catch { Write-Warn2 "Console transcript unavailable ($($_.Exception.Message)) - the zip will omit the run log." }
+
+# The version is the FIRST line of every run - before sign-in, before anything.
+# Three local runs in one day executed a fossilized v0.15 while Cloud Shell,
+# minutes apart, pulled current code: a saved modeler.ps1 or a replayed
+# SHA-pinned command keeps old code alive forever, and an old copy looks fine
+# until its output is compared against a fresh one.
+Write-Info "Get-NerdioModelerJson $ScriptVersion"
+# Stale-copy self-check: compare against the published version marker. Any
+# failure (offline, proxy, repo moved) stays silent - freshness advice must
+# never break a run. The random query defeats CDN/proxy caching.
+try {
+    $verUrl = "https://raw.githubusercontent.com/dclawrence003/NME/main/modeler/VERSION?nocache=$(Get-Random)"
+    $latestVer = ("$(Invoke-RestMethod -Uri $verUrl -TimeoutSec 5)").Trim()
+    if ($latestVer -match '^v[\d.]+$' -and $latestVer -ne $ScriptVersion) {
+        Write-Warn2 "THIS COPY IS STALE: it is $ScriptVersion, but the published version is $latestVer."
+        Write-Warn2 "Fixes shipped since $ScriptVersion are missing from this run. Delete any saved modeler.ps1, then re-paste:"
+        Write-Warn2 "    iex (irm 'https://raw.githubusercontent.com/dclawrence003/NME/main/modeler/Get-NerdioModelerJson.ps1')"
+    }
+} catch { }
 
 # --- Cloud Shell auto-download (same pattern as Test-NmeDeploymentReadiness) ---
 function Invoke-CloudShellDownload {
@@ -428,7 +459,6 @@ if (-not (Get-AzContext)) {
 $azCtx = Get-AzContext
 $script:AcctText = Coalesce $azCtx.Account.Id 'unknown account'
 $script:TenText  = Coalesce $azCtx.Tenant.Id  'unknown tenant'
-Write-Info "Get-NerdioModelerJson $ScriptVersion"
 Write-Info "Signed in as $($script:AcctText) - tenant $($script:TenText)."
 $script:ScopeSubIds = @()
 $script:SubNameById = @{}
