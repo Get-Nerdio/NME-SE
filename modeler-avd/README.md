@@ -17,7 +17,7 @@ A cost model is only as credible as the data behind it. This tool feeds the Mode
    iex (irm 'https://raw.githubusercontent.com/dclawrence003/NME/main/modeler/Get-NerdioModelerJson.ps1')
    ```
 
-3. Read the review table it prints (one row per pool — anything defaulted is spelled out in `Flags`). The run never stops to ask anything.
+3. Read the review table it prints (one row per pool — anything defaulted is spelled out in `Flags`). The run never stops to ask anything. It opens by naming the **signed-in account, tenant, and every subscription in scope** — if a pool you expected is missing, that header is where to look first (a run covers **one tenant**; the script warns when your account can reach others).
 4. One zip downloads automatically: `modeler-import-<timestamp>.zip` — the import JSON, the review CSV, the **storage ledger CSV**, the raw observation data, and the run's full console log. If someone asked you to run this, **that zip is the only thing to send back**.
 5. Nerdio Modeler → **Import** → pick the JSON (from the zip). Done.
 
@@ -38,7 +38,7 @@ irm 'https://raw.githubusercontent.com/dclawrence003/NME/main/modeler/Get-Nerdio
 | `-ModelName` | `AVD Environment - Actuals` | Model name shown in the Modeler |
 | `-LookbackDays` | `30` | Days of usage history analyzed |
 | `-TimeZone` | `America/New_York` | Your environment's local time zone (IANA) for work-hours math — `America/Chicago`, `Europe/London`, etc. |
-| `-SubscriptionId` | all visible | Scope to specific subscription ID(s) |
+| `-SubscriptionId` | all visible | Narrow to specific subscription ID(s). Default: every enabled subscription the sign-in can see, listed at run start |
 | `-OutFile` | timestamped | Output JSON name |
 | `-SkipCosts` | off | Skip the actual-spend pull |
 | `-SkipDownload` | off | Skip the Cloud Shell auto-downloads |
@@ -63,7 +63,7 @@ Nothing needs to be installed: Cloud Shell ships every module the script uses, a
 
 **The review table / CSV** — per pool: resource group, type, SKU, session limit, density used, observed per-host peak, peak concurrent users, `MAU` (distinct users seen in the lookback — informational only, never in the JSON; it answers "the model says 24 users, we have 5,000" and feeds licensing conversations), observed work window and days, overtime fields, actual last-month cost (`ActualMo`, when retrievable), and a `Flags` column that names every default or adjustment applied. If a value was touched, it says so — nothing is changed silently.
 
-**The storage ledger** — `...-storage-ledger.csv`: every discovered Azure Files share and NetApp capacity pool, classified (profiles / app attach / not AVD / unknown) with evidence, confidence, serving pools, sizes, billing model, actual cost where visible, and whether it entered the model. See the FSLogix section below.
+**The storage ledger** — `...-storage-ledger.csv`: every discovered Azure Files share and NetApp capacity pool, classified (profiles / app attach / not AVD / unknown) with evidence, confidence, serving pools, sizes, billing model, and actual cost where visible. Storage never enters the import JSON. See the FSLogix section below.
 
 **The raw observation data** — `...-rawdata.json` (inventory, VM and disk specs, workspaces, usage aggregates, storage findings and confirmed mappings, cost rows, run parameters) and `...-usage-buckets.csv` (per-pool concurrency in 15-minute slots). This is everything the modeling rules were computed *from*, so if the model needs tuning after review, it can be re-derived from the zip — without asking you to run anything again.
 
@@ -73,13 +73,14 @@ Nothing needs to be installed: Cloud Shell ships every module the script uses, a
 
 ## How it reads the environment
 
-1. **Inventory** — every host pool in the tenant via Azure Resource Graph (type, session limit, app group preference, RG, region).
-2. **Session hosts → VMs** — each pool's registered hosts resolved to their VM resource IDs, then VM size, OS disk (size + SKU), image type, ephemeral flag. The most common spec in a pool represents it.
-3. **Workspace discovery** — reads every host pool's diagnostic settings and finds **all** Log Analytics workspaces receiving AVD telemetry. No "which workspace?" hunting; environments that split pools across workspaces are handled automatically.
-4. **Usage** — 30 days of `WVDConnections` per workspace: 15-minute concurrency buckets (distinct users) produce peak concurrent users, observed work days (days whose per-occurrence user-hours reach ≥25% of the busiest day's), the observed work window (hours ≥20% of peak, measured on work days), weekly in-window vs. off-window user-hours, per-pool MAU, and peak concurrent users on any single host. Day and hour averages are zero-inclusive and normalized by each weekday's actual calendar count in the lookback (a 30-day window holds five of some weekdays and four of others — uniform-week math penalized the four-count days ~20%, enough to cost a real call center its Saturday shift). Concurrency counts **connected** sessions; NME's console counts sessions including disconnected and reads higher — sizing is unaffected because peak and per-host density share the same basis, and pools where session counts run ≥15% above connected peaks (from `WVDAgentHealthStatus`, when present) are flagged.
-5. **Assembly** — the modeling rules below, a flag for every default.
-6. **Profile storage** — Azure Files shares and SMB NetApp volumes that hold FSLogix profiles, with provisioned and used capacity — and, when file-access diagnostics flow to Log Analytics, which host pools use each share (see the FSLogix section below).
-7. **Actual spend** — last calendar month's cost for exactly those session-host VMs and OS disks, per resource group, via the Cost Management Query API (see below).
+1. **Scope** — the run enumerates every enabled subscription the sign-in can see, prints the list, and pins it onto every Resource Graph query (`-SubscriptionId` narrows it). Nothing is left to whatever the current context happens to default to — two windows signed into different scopes once produced 120-pool and 18-pool answers for "the same environment" with no way to tell from the logs.
+2. **Inventory** — every host pool across those subscriptions via Azure Resource Graph (type, session limit, app group preference, RG, region), with per-subscription pool counts printed.
+3. **Session hosts → VMs** — each pool's registered hosts resolved to their VM resource IDs, then VM size, OS disk (size + SKU), image type, ephemeral flag. The most common spec in a pool represents it.
+4. **Workspace discovery** — reads every host pool's diagnostic settings and finds **all** Log Analytics workspaces receiving AVD telemetry. No "which workspace?" hunting; environments that split pools across workspaces are handled automatically.
+5. **Usage** — 30 days of `WVDConnections` per workspace: 15-minute concurrency buckets (distinct users) produce peak concurrent users, observed work days (days whose per-occurrence user-hours reach ≥25% of the busiest day's), the observed work window (hours ≥20% of peak, measured on work days), weekly in-window vs. off-window user-hours, per-pool MAU, and peak concurrent users on any single host. Day and hour averages are zero-inclusive and normalized by each weekday's actual calendar count in the lookback (a 30-day window holds five of some weekdays and four of others — uniform-week math penalized the four-count days ~20%, enough to cost a real call center its Saturday shift). Concurrency counts **connected** sessions; NME's console counts sessions including disconnected and reads higher — sizing is unaffected because peak and per-host density share the same basis, and pools where session counts run ≥15% above connected peaks (from `WVDAgentHealthStatus`, when present) are flagged.
+6. **Assembly** — the modeling rules below, a flag for every default.
+7. **Profile storage** — Azure Files shares and SMB NetApp volumes that hold FSLogix profiles, with provisioned and used capacity — and, when file-access diagnostics flow to Log Analytics, which host pools use each share (see the FSLogix section below).
+8. **Actual spend** — last calendar month's cost for exactly those session-host VMs and OS disks, per resource group, via the Cost Management Query API (see below).
 
 ---
 
@@ -140,8 +141,9 @@ Fallback caveats vs. the script: you find the workspace yourself, extra workspac
 | Cost lines skipped with an error message | Billing-side policy or unsupported offer (see cost section); everything else completed |
 | A pool shows defaults with `VM spec defaulted` | Pool has no registered session hosts to sample |
 | Peak = 1 pools show odd windows | With one observed user, any active hour counts as "working" — noise on near-idle pools, meaningless at real load |
-| No `FSLogix - ...` deployments appeared | No premium file shares, profile-named shares, or SMB NetApp volumes are visible to this account — if profiles exist elsewhere, add FSLogix by hand in the Modeler |
-| FSLogix rows say `pools not mapped` | File-share diagnostics aren't flowing to Log Analytics, so share→pool mapping has no evidence — the storage cost is still correct; ask your AVD admin which pools use the share |
+| Fewer pools than expected | Check the run's opening lines: signed-in account, tenant, and the subscription list. The usual cause is the wrong tenant — `Connect-AzAccount -TenantId <id>` and run again. A run covers one tenant; the script names any others your account can reach |
+| Storage ledger rows have empty `ServesPools` | File-share diagnostics aren't flowing to Log Analytics, so share→pool mapping has no evidence — sizes and costs are still correct; ask the AVD admin which pools use the share |
+| Behavior doesn't match the latest version | `raw.githubusercontent.com` caches ~5 minutes after an update. The first console line prints the version. To fetch an exact commit, put its SHA in place of `main` in the URL |
 | Auto-download didn't fire | Use Cloud Shell's **Manage files → Download** and enter the printed filename |
 
 ---

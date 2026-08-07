@@ -10,11 +10,27 @@ $anfPool = '/subscriptions/s1/resourcegroups/rg-anf/providers/microsoft.netapp/n
 
 # v0.15: storage is ledger-only, no prompts - nothing to mock for input.
 
-function Get-AzContext { [pscustomobject]@{ Name = 'mock' } }
+function Get-AzContext { [pscustomobject]@{ Name = 'mock'; Account = [pscustomobject]@{ Id = 'don@mock.test' }; Tenant = [pscustomobject]@{ Id = 'ten-1' } } }
+$global:ArgSubScopes = @()   # v0.17: every ARG payload's subscriptions array, for the scope-pinning check
 function Invoke-AzRestMethod {
     param([string]$Method, [string]$Path, [string]$Payload)
+    if ($Method -eq 'GET' -and $Path.StartsWith('/subscriptions?')) {
+        return [pscustomobject]@{ StatusCode = 200; Content = (@{ value = @(
+            @{ subscriptionId = 's1'; displayName = 'Sub One'; state = 'Enabled' },
+            @{ subscriptionId = 's2'; displayName = 'Sub Two'; state = 'Enabled' },
+            @{ subscriptionId = 's3'; displayName = 'Sub Gone'; state = 'Disabled' }
+        ) } | ConvertTo-Json -Depth 10) }
+    }
+    if ($Method -eq 'GET' -and $Path.StartsWith('/tenants?')) {
+        return [pscustomobject]@{ StatusCode = 200; Content = (@{ value = @(
+            @{ tenantId = 'ten-1'; displayName = 'Mock Tenant' },
+            @{ tenantId = 'ten-2'; displayName = 'Other Tenant' }
+        ) } | ConvertTo-Json -Depth 10) }
+    }
     if ($Method -eq 'POST' -and $Path -like '*Microsoft.ResourceGraph*') {
-        $q = ($Payload | ConvertFrom-Json).query
+        $argBody = $Payload | ConvertFrom-Json
+        $global:ArgSubScopes += , @($argBody.subscriptions)
+        $q = $argBody.query
         if ($q -match 'sessionhosts') {
             $data = @(
                 @{ id = "$poolAId/sessionhosts/sh1"; vmId = '/subscriptions/s1/resourcegroups/rg1/providers/microsoft.compute/virtualmachines/vm1' },
@@ -161,7 +177,15 @@ $checks = [ordered]@{
     'console log captured + clean'      = ($log -match 'Assembling deployments' -and $log -notmatch [char]27)
     'no raw-export failure in log'      = ($log -notmatch 'Raw data export failed' -and $log -match 'Raw decision data written')
     'counters exclude storage rows'     = ($log -match 'Usage found for 1 of 1 pool')
-    'rawdata sane + v0.15 + evidence'   = ($null -ne $rawJson -and @($rawJson.pools).Count -eq 1 -and $rawJson.meta.version -eq 'v0.16' -and @($rawJson.storageCandidates).Count -eq 4 -and @($rawJson.mapEvidence).Count -ge 1)
+    'rawdata sane + v0.17 + evidence'   = ($null -ne $rawJson -and @($rawJson.pools).Count -eq 1 -and $rawJson.meta.version -eq 'v0.17' -and @($rawJson.storageCandidates).Count -eq 4 -and @($rawJson.mapEvidence).Count -ge 1)
+    'ARG pinned to enabled subs s1+s2'  = $(
+        $ok = (@($global:ArgSubScopes).Count -ge 5)
+        foreach ($sc in $global:ArgSubScopes) { if (@($sc).Count -ne 2 -or @($sc)[0] -ne 's1' -or @($sc)[1] -ne 's2') { $ok = $false } }
+        $ok)
+    'identity banner + scope printed'   = ($log -match 'Get-NerdioModelerJson v0\.17' -and $log -match 'Signed in as don@mock\.test - tenant ten-1' -and $log -match 'Scope: 2 enabled subscription\(s\)' -and $log -match 'Sub One  \(s1\)' -and $log -match 'Sub Two  \(s2\)')
+    'other-tenant warning printed'      = ($log -match 'can also reach 1 other tenant' -and $log -match 'Connect-AzAccount -TenantId ten-2')
+    'rawdata identity block'            = ($rawJson.meta.identity.account -eq 'don@mock.test' -and $rawJson.meta.identity.tenantId -eq 'ten-1' -and @($rawJson.meta.identity.scopeSubscriptions).Count -eq 2)
+    'per-sub pool counts printed'       = ($log -match 'Found 1 host pool\(s\) across 1 subscription\(s\)' -and $log -match 'Sub One : 1 pool\(s\)')
     'usage buckets csv in zip'          = (@($rawBucketsCsv).Count -eq 3 -and $rawBucketsCsv[1].ConcurrentUsers -eq '7')
     'no cmdlet-missing / skip errors'   = ($log -notmatch 'not recognized' -and $log -notmatch 'storage account\(s\) skipped \(slow')
 }

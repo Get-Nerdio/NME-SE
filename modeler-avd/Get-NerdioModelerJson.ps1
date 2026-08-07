@@ -37,7 +37,10 @@
     IANA time zone for work-hours math (the environment's local zone), e.g.
     America/New_York, America/Chicago, Europe/London. Default America/New_York.
 .PARAMETER SubscriptionId
-    Optional subscription ID(s) to scope to. Default: every subscription you can see.
+    Optional subscription ID(s) to narrow the scan. Default: every enabled
+    subscription this sign-in can see - enumerated and printed at the start of
+    the run, and pinned onto every discovery query. One run covers ONE tenant;
+    the run says so when the account can reach others.
 .PARAMETER OutFile
     Output file name. Default modeler-import-<timestamp>.json.
 .PARAMETER SkipDownload
@@ -56,6 +59,23 @@
     ./modeler.ps1 -TimeZone 'America/Chicago' -ModelName 'Contoso - Actuals'
 
 .NOTES
+    v0.17 (2026-08-07). EXPLICIT SUBSCRIPTION SCOPE ON EVERY QUERY - from two
+    same-day runs against the same demo estate: Cloud Shell returned 120 pools,
+    local PowerShell returned 18, with ZERO overlap - disjoint subscriptions,
+    disjoint workspaces. Each window was signed into a different scope, and an
+    unscoped Resource Graph query silently answers for whatever the current
+    sign-in happens to reach. Neither console log recorded who was signed in,
+    so the gap was invisible. Now every run: (1) prints the signed-in account
+    and tenant, (2) enumerates the enabled subscriptions that sign-in can see
+    and prints them, (3) pins that explicit list onto every Resource Graph
+    query (chunked at ARG's 1000-subscription request cap), (4) prints
+    per-subscription pool counts after discovery, (5) warns when the account
+    can reach OTHER tenants (a run covers one tenant - pools there need
+    Connect-AzAccount -TenantId <id> and a second run), and (6) records
+    account/tenant/scope in rawdata.json. Also: Az breaking-change warning
+    suppression - older Az.Accounts (4.x) printed an "Upcoming breaking
+    changes in Get-AzAccessToken" block around every Log Analytics query and
+    flooded the 5.1 transcript.
     v0.16 (2026-08-07). CREDENTIAL CIRCUIT BREAKER - from a live Cloud Shell
     run where the shell's token service started returning garbage mid-run
     ("ManagedIdentityCredential ... invalid: ExpiresOn"). The user was signed
@@ -251,11 +271,16 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = 'v0.16'
+$ScriptVersion = 'v0.17'
 # Windows PowerShell 5.1 compatibility: force TLS 1.2 (old .NET Framework
 # defaults can be lower and ARM/Log Analytics require 1.2), and no PS7-only
 # syntax anywhere in this file (?? / ?. / -AsPlainText / utf8NoBOM).
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
+# Older Az.Accounts (4.x) prints an "Upcoming breaking changes in the cmdlet
+# 'Get-AzAccessToken'" warning block on EVERY call - a live 5.1 run drowned its
+# transcript in them. This env var is the Az-supported off switch; it is
+# process-scoped and touches no user configuration.
+$env:SuppressAzurePowerShellBreakingChangeWarnings = 'true'
 function Coalesce { param($a, $b) if ($null -ne $a) { $a } else { $b } }
 function Write-Utf8NoBom {
     param([string]$FilePath, [string]$Content)
@@ -300,20 +325,37 @@ function Invoke-CloudShellDownload {
 }
 
 # --- Resource Graph via REST (no extra modules; pages through results) ---
+# EVERY query is pinned to an explicit subscription list. Two same-day runs of
+# the same estate returned 120 pools (Cloud Shell) vs 18 (local PowerShell)
+# with zero overlap: each window was signed into a different default scope, and
+# an unscoped ARG query silently answers for whatever that happens to be.
+# -SubscriptionId (if given) wins; otherwise the enabled subscriptions
+# enumerated at startup. ARG caps one request at 1000 subscriptions, so the
+# list is chunked and results merged. Empty list (enumeration failed) falls
+# back to unscoped rather than dying - the startup warning already said so.
 function Invoke-ArgQuery {
     param([string]$Query)
+    $scope = @(if ($SubscriptionId.Count -gt 0) { $SubscriptionId } else { $script:ScopeSubIds })
+    $chunkList = New-Object System.Collections.ArrayList
+    if ($scope.Count -gt 0) {
+        for ($i = 0; $i -lt $scope.Count; $i += 1000) {
+            [void]$chunkList.Add(@($scope[$i..([Math]::Min($i + 999, $scope.Count - 1))]))
+        }
+    } else { [void]$chunkList.Add($null) }
     $all = @()
-    $skip = $null
-    do {
-        $body = @{ query = $Query; options = @{ resultFormat = 'objectArray' } }
-        if ($SubscriptionId.Count -gt 0) { $body.subscriptions = $SubscriptionId }
-        if ($skip) { $body.options.'$skipToken' = $skip }
-        $resp = Invoke-AzRestMethod -Method POST -Path "/providers/Microsoft.ResourceGraph/resources?api-version=2022-10-01" -Payload ($body | ConvertTo-Json -Depth 6)
-        if ($resp.StatusCode -ne 200) { throw "Resource Graph query failed (HTTP $($resp.StatusCode)): $($resp.Content)" }
-        $parsed = $resp.Content | ConvertFrom-Json
-        $all += @($parsed.data)
-        $skip = $parsed.'$skipToken'
-    } while ($skip)
+    foreach ($chunk in $chunkList) {
+        $skip = $null
+        do {
+            $body = @{ query = $Query; options = @{ resultFormat = 'objectArray' } }
+            if ($null -ne $chunk) { $body.subscriptions = @($chunk) }
+            if ($skip) { $body.options.'$skipToken' = $skip }
+            $resp = Invoke-AzRestMethod -Method POST -Path "/providers/Microsoft.ResourceGraph/resources?api-version=2022-10-01" -Payload ($body | ConvertTo-Json -Depth 6)
+            if ($resp.StatusCode -ne 200) { throw "Resource Graph query failed (HTTP $($resp.StatusCode)): $($resp.Content)" }
+            $parsed = $resp.Content | ConvertFrom-Json
+            $all += @($parsed.data)
+            $skip = $parsed.'$skipToken'
+        } while ($skip)
+    }
     return $all
 }
 
@@ -376,6 +418,74 @@ if (-not (Get-AzContext)) {
     return
 }
 
+# --- identity + subscription scope: stated on every run ------------------------
+# Two same-day runs against "the same demo environment" produced 120 pools from
+# Cloud Shell and 18 from local PowerShell - zero overlap - because the two
+# windows were signed into different scopes, and neither console log recorded
+# who was signed in or what was reachable. The gap was invisible. Every run now
+# states its identity, lists the subscriptions it can see, and pins discovery
+# to that explicit list.
+$azCtx = Get-AzContext
+$script:AcctText = Coalesce $azCtx.Account.Id 'unknown account'
+$script:TenText  = Coalesce $azCtx.Tenant.Id  'unknown tenant'
+Write-Info "Get-NerdioModelerJson $ScriptVersion"
+Write-Info "Signed in as $($script:AcctText) - tenant $($script:TenText)."
+$script:ScopeSubIds = @()
+$script:SubNameById = @{}
+try {
+    $subsRaw = @()
+    $nextPath = "/subscriptions?api-version=2020-01-01"
+    while ($nextPath) {
+        $resp = Invoke-AzRestMethod -Method GET -Path $nextPath
+        if ($resp.StatusCode -ne 200) { throw "HTTP $($resp.StatusCode): $($resp.Content)" }
+        $parsed = $resp.Content | ConvertFrom-Json
+        $subsRaw += @($parsed.value)
+        $nextPath = if ($parsed.nextLink) { ([uri]$parsed.nextLink).PathAndQuery } else { $null }
+    }
+    foreach ($s in $subsRaw) {
+        if ("$($s.state)" -ne 'Enabled') { continue }
+        $script:ScopeSubIds += "$($s.subscriptionId)"
+        $script:SubNameById["$($s.subscriptionId)".ToLower()] = "$($s.displayName)"
+    }
+} catch {
+    Write-Warn2 "Could not enumerate subscriptions ($($_.Exception.Message)) - discovery will run unscoped against this sign-in's defaults."
+}
+if ($SubscriptionId.Count -gt 0) {
+    $visIds = @{}
+    foreach ($id in $script:ScopeSubIds) { $visIds["$id".ToLower()] = $true }
+    foreach ($want in $SubscriptionId) {
+        if ($script:ScopeSubIds.Count -gt 0 -and -not $visIds["$want".ToLower()]) {
+            Write-Warn2 "-SubscriptionId $want is not visible to this sign-in - it will return nothing. Check the account or tenant above."
+        }
+    }
+    Write-Info "Scope: narrowed by -SubscriptionId to $($SubscriptionId.Count) subscription(s)."
+} elseif ($script:ScopeSubIds.Count -gt 0) {
+    Write-Ok "Scope: $($script:ScopeSubIds.Count) enabled subscription(s) visible to this sign-in:"
+    $shown = 0
+    foreach ($id in $script:ScopeSubIds) {
+        $shown++
+        if ($shown -le 25) { Write-Info "    $($script:SubNameById["$id".ToLower()])  ($id)" }
+    }
+    if ($script:ScopeSubIds.Count -gt 25) { Write-Info "    ...and $($script:ScopeSubIds.Count - 25) more (full list lands in rawdata.json)." }
+} else {
+    Write-Warn2 "No enabled subscriptions are visible to this sign-in - discovery will find nothing. Check the account or tenant above."
+}
+# One run covers ONE tenant. If this sign-in can reach others, say so out loud -
+# "the environment" may be bigger than what this run can see.
+try {
+    $tResp = Invoke-AzRestMethod -Method GET -Path "/tenants?api-version=2020-01-01"
+    if ($tResp.StatusCode -eq 200) {
+        $otherTenants = @((($tResp.Content | ConvertFrom-Json).value) | Where-Object { "$($_.tenantId)" -ne "$($script:TenText)" })
+        if ($otherTenants.Count -gt 0) {
+            Write-Warn2 "This account can also reach $($otherTenants.Count) other tenant(s). A run covers ONE tenant - host pools there are NOT in this output:"
+            foreach ($t in $otherTenants) {
+                $tName = Coalesce $t.displayName "$($t.tenantId)"
+                Write-Warn2 "    $tName ($($t.tenantId)) - to cover it: Connect-AzAccount -TenantId $($t.tenantId), then run this command again."
+            }
+        }
+    }
+} catch { }
+
 # --- Log Analytics query via REST (no Az.OperationalInsights dependency) ------
 # Invoke-AzOperationalInsightsQuery ships in Cloud Shell but rarely on laptops -
 # a prospect's local-PS run lost ALL telemetry to that missing module. This uses
@@ -383,7 +493,7 @@ if (-not (Get-AzContext)) {
 # can Connect-AzAccount already has. Commercial-cloud endpoint.
 function Invoke-LaQuery {
     param([string]$WorkspaceCustomerId, [string]$Query)
-    $tok = Get-AzAccessToken -ResourceUrl 'https://api.loganalytics.io'
+    $tok = Get-AzAccessToken -ResourceUrl 'https://api.loganalytics.io' -WarningAction SilentlyContinue
     # Az.Accounts 5.x returns a SecureString token; older versions a plain string.
     # BSTR marshal, not ConvertFrom-SecureString -AsPlainText (that flag is PS7-only).
     $tokenText = if ($tok.Token -is [securestring]) {
@@ -426,8 +536,13 @@ resources
     }
     throw
 }
-if ($pools.Count -eq 0) { throw "No host pools visible. Check subscription access (Reader) or -SubscriptionId scope." }
-Write-Ok "Found $($pools.Count) host pool(s)."
+if ($pools.Count -eq 0) { throw "No host pools visible in the scanned scope. Check the subscription list printed above, Reader access, the signed-in tenant (Connect-AzAccount -TenantId <id>), or -SubscriptionId." }
+$poolsBySub = @($pools | Group-Object subscriptionId)
+Write-Ok "Found $($pools.Count) host pool(s) across $($poolsBySub.Count) subscription(s):"
+foreach ($g in ($poolsBySub | Sort-Object Count -Descending)) {
+    $subLabel = Coalesce $script:SubNameById["$($g.Name)".ToLower()] "$($g.Name)"
+    Write-Info "    $subLabel : $($g.Count) pool(s)"
+}
 
 # ------------------------------------------------------------- 2. session host -> VM
 Write-Info "[2/8] Mapping session hosts to VMs..."
@@ -1143,6 +1258,10 @@ try {
         meta = [ordered]@{
             tool = 'Get-NerdioModelerJson.ps1'; version = $ScriptVersion; generatedUtc = [DateTime]::UtcNow.ToString('o')
             parameters = [ordered]@{ ModelName = $ModelName; LookbackDays = $LookbackDays; TimeZone = $TimeZone; SubscriptionId = @($SubscriptionId); SkipCosts = [bool]$SkipCosts }
+            identity = [ordered]@{
+                account = "$($script:AcctText)"; tenantId = "$($script:TenText)"
+                scopeSubscriptions = @(foreach ($sid in $script:ScopeSubIds) { [ordered]@{ id = "$sid"; name = "$($script:SubNameById["$sid".ToLower()])" } })
+            }
             notes = 'usage-buckets.csv holds per-pool 15-minute concurrency (UTC slots; convert with meta.parameters.TimeZone). Buckets include every reachable workspace - when a pool logs to several, the aggregates used the max-peak workspace, so filter buckets by Workspace to match. PeakUsersPerHost is an aggregate (per-host slot detail is not exported). Not re-derivable offline: a longer lookback, or telemetry that was not flowing during this run.'
         }
         pools = @($pools)
