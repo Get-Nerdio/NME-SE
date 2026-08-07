@@ -14,11 +14,18 @@
          off-hours + weekend load folded into the Modeler's overtime fields
          (additional-hours applies across all 7 days).
       4. Enriches VM size/disk/image per pool from Resource Graph.
-      5. Prints a per-pool review table + flags, writes the schema-4 import JSON,
-         and triggers a Cloud Shell browser download of the file.
-      6. Pulls last month's ACTUAL spend for those VMs + disks (Cost Management
-         Query API, per resource group) and prints it beside the model inputs —
-         skipped cleanly wherever cost visibility isn't granted.
+      5. Discovers FSLogix-candidate storage (Azure Files shares + ANF capacity
+         pools) and runs a short interactive TRIAGE - one line per store, Enter
+         accepts the default; pool assignment by name/RG fragment. Only stores
+         confirmed as profile storage AND mapped to a pool enter the JSON;
+         EVERYTHING discovered lands in a storage ledger CSV (-NoPrompts or a
+         non-interactive session = ledger only).
+      6. Prints a per-pool review table + flags, writes the schema-4 import JSON
+         and the storage ledger, and packages one zip (Cloud Shell auto-download;
+         local runs write it to the current folder).
+      7. Pulls last month's ACTUAL spend for those VMs + disks + storage (Cost
+         Management Query API, per resource group) and prints it beside the
+         model inputs - skipped cleanly wherever cost visibility isn't granted.
 
     Pools without telemetry still land in the JSON, named "(no usage data)".
     Nothing is modified anywhere - every call is a read.
@@ -38,6 +45,10 @@
     Skip the Cloud Shell auto-download (file still written to the session).
 .PARAMETER SkipCosts
     Skip the Cost Management actual-spend pull entirely.
+.PARAMETER NoPrompts
+    Skip the interactive storage triage. All discovered storage goes to the
+    storage ledger CSV only and none enters the Modeler JSON (the same happens
+    automatically when the session is non-interactive).
 
 .EXAMPLE
     # Quick run (Cloud Shell, defaults):

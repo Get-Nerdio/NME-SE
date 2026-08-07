@@ -17,11 +17,12 @@ A cost model is only as credible as the data behind it. This tool feeds the Mode
    iex (irm 'https://raw.githubusercontent.com/dclawrence003/NME/main/modeler/Get-NerdioModelerJson.ps1')
    ```
 
-3. Read the review table it prints (one row per pool — anything defaulted is spelled out in `Flags`).
+3. If storage was discovered, answer the **storage triage** — one line per store, and pressing **Enter accepts the suggested default**. It exists so profile storage lands in the model only when someone confirms which pools use it (details in the FSLogix section below). A minute or less; skippable with `-NoPrompts`.
+4. Read the review table it prints (one row per pool — anything defaulted is spelled out in `Flags`).
+5. One zip downloads automatically: `modeler-import-<timestamp>.zip` — the import JSON, the review CSV, the **storage ledger CSV**, the raw observation data, and the run's full console log. If someone asked you to run this, **that zip is the only thing to send back**.
+6. Nerdio Modeler → **Import** → pick the JSON (from the zip). Done.
 
-**Running from a local machine instead:** PowerShell 7 with the **Az.Accounts** module is all it takes (`Install-Module Az.Accounts` once, then `Connect-AzAccount` — add `-TenantId <id>` if you have several tenants). Then paste the same command. No other Az modules are used — inventory, telemetry, storage, and cost are all reached over REST. The zip is written to the current folder (the browser auto-download is Cloud Shell-only).
-4. One zip downloads automatically: `modeler-import-<timestamp>.zip` — the import JSON, the review CSV, the raw observation data, and the run's full console log. If someone asked you to run this, **that zip is the only thing to send back**.
-5. Nerdio Modeler → **Import** → pick the JSON (from the zip). Done.
+**Running from a local machine instead:** PowerShell 7 with the **Az.Accounts** module is all it takes (`Install-Module Az.Accounts` once, then `Connect-AzAccount` — add `-TenantId <id>` if you have several tenants). Then paste **the exact same command** — nothing about it changes between Cloud Shell and local. No other Az modules are used — inventory, telemetry, storage, and cost are all reached over REST. The only difference: the zip is written to the current folder instead of auto-downloading (the browser download is Cloud Shell-only).
 
 Prefer to read code before running it (you should):
 
@@ -42,6 +43,7 @@ irm 'https://raw.githubusercontent.com/dclawrence003/NME/main/modeler/Get-Nerdio
 | `-OutFile` | timestamped | Output JSON name |
 | `-SkipCosts` | off | Skip the actual-spend pull |
 | `-SkipDownload` | off | Skip the Cloud Shell auto-downloads |
+| `-NoPrompts` | off | Skip the storage triage — all storage goes to the ledger only; none enters the JSON (also automatic in non-interactive sessions) |
 
 Parameters require the two-step (download-then-run) form — `iex (irm ...)` runs with defaults.
 
