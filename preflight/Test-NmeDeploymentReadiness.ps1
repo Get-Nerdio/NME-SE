@@ -686,6 +686,147 @@ function Get-EgressFingerprint {
     return @{ Ip = $ip; Asn = $org; Org = $org; IsZscaler = $isZscaler }
 }
 
+function Test-SqlOperatorDataPath {
+    # E13: prove THIS machine's own network path to the throwaway SQL server on 1433 actually works -
+    # TCP egress, TLS handshake, and firewall/IP alignment. The existing Kudu connectivity test only
+    # exercises an App Service worker's network path; nothing today ever opens a connection to SQL from
+    # the operator's own machine. Catches: 1433 egress blocked, a TLS-inspecting proxy (e.g. Zscaler)
+    # breaking the encrypted handshake, and split egress (the HTTPS/web path and the SQL path leaving
+    # via different public IPs). $EgressIp is E12's fingerprint - may be $null if egress resolution
+    # failed, or on a Cloud Shell run where it is never attempted; the probe still runs without it,
+    # deriving the real source IP from SQL's own firewall-rejection error when needed. Never throws -
+    # every branch reports via Add-Result.
+    param(
+        [Parameter(Mandatory = $true)][string] $ResourceGroupName,
+        [Parameter(Mandatory = $true)][string] $ServerName,
+        [Parameter(Mandatory = $true)][string] $Fqdn,
+        [string] $EgressIp,
+        [bool] $IsCloudShell = $false
+    )
+    $check = "SQL data path (operator -> 1433)"
+    $pathNote = if ($IsCloudShell) { " (this path is Cloud Shell's egress, not the install machine's - re-run this test from the machine that will actually run the installer)" } else { "" }
+
+    try {
+        # Best-effort: open the SQL firewall to the known egress IP before probing. Child of the server -
+        # torn down with it (same as AllowAllWindowsAzureIps above), so no separate tracker entry.
+        if ($EgressIp) {
+            try {
+                New-AzSqlServerFirewallRule -ResourceGroupName $ResourceGroupName -ServerName $ServerName -FirewallRuleName "nmepf-operator" -StartIpAddress $EgressIp -EndIpAddress $EgressIp -ErrorAction Stop | Out-Null
+            }
+            catch {}
+        }
+
+        # (a) TCP 1433 reachability - a plain socket connect, no TLS yet.
+        $tcpClient = $null
+        $tcpOk = $false
+        try {
+            $tcpClient = New-Object System.Net.Sockets.TcpClient
+            $ar = $tcpClient.BeginConnect($Fqdn, 1433, $null, $null)
+            if ($ar.AsyncWaitHandle.WaitOne(10000)) {
+                try { $tcpClient.EndConnect($ar); $tcpOk = $tcpClient.Connected } catch { $tcpOk = $false }
+            }
+        }
+        catch { $tcpOk = $false }
+        finally { if ($tcpClient) { $tcpClient.Close() } }
+
+        if (-not $tcpOk) {
+            Add-Result -Category "Connectivity" -Check $check -Result "Fail" -Detail "1433 egress blocked$pathNote - could not open a TCP connection to ${Fqdn}:1433 from this machine within 10s. Outbound 1433 is commonly blocked by corporate egress/Zscaler; NME's App Service must reach SQL on 1433."
+            return
+        }
+
+        # (b) TLS + login probe. Prefer System.Data.SqlClient (bundled with PS7) so a real SQL protocol
+        # response also proves the encrypted handshake completed: "Login failed for user" against a
+        # deliberately nonexistent login IS the pass condition (path + TLS + a real SQL response all
+        # worked); a pre-login/handshake failure means the encrypted handshake never completed, which is
+        # the signature of a TLS-inspecting proxy (e.g. Zscaler) sitting on the SQL path.
+        $hasSqlClient = [bool]([System.Management.Automation.PSTypeName]"System.Data.SqlClient.SqlConnection").Type
+        if (-not $hasSqlClient) {
+            # SqlClient unavailable in this session - degrade to a TLS-only handshake probe. Still
+            # catches the TLS-interception signature, just without a SQL protocol-level confirmation.
+            $tcp2 = $null
+            $ssl = $null
+            try {
+                $tcp2 = New-Object System.Net.Sockets.TcpClient
+                $c2 = $tcp2.BeginConnect($Fqdn, 1433, $null, $null)
+                if (-not $c2.AsyncWaitHandle.WaitOne(10000)) { throw "TCP connect timed out" }
+                $tcp2.EndConnect($c2)
+                $ssl = New-Object System.Net.Security.SslStream($tcp2.GetStream(), $false)
+                $sar = $ssl.BeginAuthenticateAsClient($Fqdn, $null, $null)
+                if (-not $sar.AsyncWaitHandle.WaitOne(15000)) { throw "TLS handshake timed out" }
+                $ssl.EndAuthenticateAsClient($sar)
+                Add-Result -Category "Connectivity" -Check $check -Result "Pass" -Detail "TLS handshake to ${Fqdn}:1433 OK$pathNote; login not exercised - System.Data.SqlClient unavailable in this session."
+            }
+            catch {
+                Add-Result -Category "Connectivity" -Check $check -Result "Fail" -Detail "TLS handshake broken on path$pathNote - reached TCP 1433 but the encrypted handshake to ${Fqdn}:1433 did not complete ($(Get-ConciseErrorMessage -RawMessage $_.Exception.Message)). This is the signature of TLS interception/inspection (e.g. Zscaler) sitting on the SQL path."
+            }
+            finally {
+                if ($ssl) { $ssl.Dispose() }
+                if ($tcp2) { $tcp2.Close() }
+            }
+            return
+        }
+
+        # SqlClient path - the login name is deliberately nonexistent so a *successful* auth is
+        # impossible; the only way to "pass" is a real SQL login-failure response.
+        $bogusChars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789".ToCharArray()
+        $bogusPwd = ((1..32 | ForEach-Object { $bogusChars | Get-Random }) -join "") + "aA1!"
+        $connStr = "Server=tcp:$Fqdn,1433;Database=master;User ID=nmepf-doesnotexist;Password=$bogusPwd;Encrypt=True;TrustServerCertificate=False;Connection Timeout=15"
+
+        $maxAttempts = 2
+        for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+            $conn = $null
+            try {
+                $conn = New-Object System.Data.SqlClient.SqlConnection($connStr)
+                $conn.Open()
+                # Should never actually succeed (bogus login) - if it somehow does, the path clearly works.
+                Add-Result -Category "Connectivity" -Check $check -Result "Pass" -Detail "SQL data path OK$pathNote - reached ${Fqdn}:1433, completed TLS, and authenticated (unexpectedly - the dummy login succeeded)."
+                return
+            }
+            catch {
+                $msg = $_.Exception.Message
+                if ($msg -match "Login failed for user") {
+                    Add-Result -Category "Connectivity" -Check $check -Result "Pass" -Detail "SQL data path OK$pathNote - reached ${Fqdn}:1433, completed TLS, and got a SQL login response (login failed as expected for the dummy account). Encryption negotiated successfully."
+                    return
+                }
+                elseif ($msg -match "Client with IP address '([^']+)'|not allowed to access the server") {
+                    $foundIp = if ($Matches -and $Matches[1]) { $Matches[1] } else { $null }
+                    if ($foundIp -and $EgressIp -and $foundIp -ne $EgressIp) {
+                        Add-Result -Category "Connectivity" -Check $check -Result "Fail" -Detail "split egress: web IP != SQL IP$pathNote - your HTTPS egress is $EgressIp but the SQL path left this machine via $foundIp. Your outbound path differs by destination (common with Zscaler); the firewall rule created for $EgressIp does not cover the SQL path."
+                        # Best-effort: allow the IP SQL actually saw and retry once so the rest of the path
+                        # can still be validated.
+                        try { New-AzSqlServerFirewallRule -ResourceGroupName $ResourceGroupName -ServerName $ServerName -FirewallRuleName "nmepf-operator-actual" -StartIpAddress $foundIp -EndIpAddress $foundIp -ErrorAction Stop | Out-Null } catch {}
+                        if ($attempt -lt $maxAttempts) { Start-Sleep -Seconds 5; continue }
+                        return
+                    }
+                    elseif ($foundIp) {
+                        Add-Result -Category "Connectivity" -Check $check -Result "Warn" -Detail "SQL firewall rule for $foundIp not yet effective$pathNote$(if ($attempt -lt $maxAttempts) { '; retrying once.' } else { ' after retrying.' })"
+                        if ($attempt -lt $maxAttempts) { Start-Sleep -Seconds 5; continue }
+                        return
+                    }
+                    else {
+                        Add-Result -Category "Connectivity" -Check $check -Result "Warn" -Detail "SQL rejected the connection by source IP$pathNote but the IP could not be parsed from the error: $(Get-ConciseErrorMessage -RawMessage $msg)"
+                        return
+                    }
+                }
+                elseif ($msg -match "pre-login handshake|SSL Provider|wait operation timed out") {
+                    Add-Result -Category "Connectivity" -Check $check -Result "Fail" -Detail "TLS handshake broken on path$pathNote - reached TCP 1433 but the encrypted pre-login handshake to ${Fqdn}:1433 did not complete ($(Get-ConciseErrorMessage -RawMessage $msg)). This is the signature of TLS interception/inspection (e.g. Zscaler) sitting on the SQL path."
+                    return
+                }
+                else {
+                    Add-Result -Category "Connectivity" -Check $check -Result "Warn" -Detail "Unexpected error probing the SQL data path$pathNote`: $(Get-ConciseErrorMessage -RawMessage $msg)"
+                    return
+                }
+            }
+            finally {
+                if ($conn) { $conn.Dispose() }
+            }
+        }
+    }
+    catch {
+        Add-Result -Category "Connectivity" -Check $check -Result "Warn" -Detail "Could not complete the SQL data-path probe$pathNote`: $(Get-ConciseErrorMessage -RawMessage (Get-DetailedErrorMessage -ErrorRecord $_))"
+    }
+}
+
 function Get-MaskedAccount {
     # Mask the local part of a UPN for display; leave the domain intact. No '@' -> treat the whole
     # string as the local part. Scales with local-part length so short usernames don't leak most of
@@ -2811,6 +2952,20 @@ try {
         }
         # The throwaway server uses SQL auth; the real installer uses Entra-only auth. Flag the gap.
         Add-Result -Category "Deployability" -Check "SQL Entra-only authentication" -Result "Info" -Detail "Not exercised - this test uses SQL authentication for the throwaway server, but the real installer configures Entra-only authentication (azureADOnlyAuthentication=true) with the app's managed identity as SQL admin. A policy requiring or forbidding AAD-only SQL auth is not validated here."
+
+        # Operator-machine SQL data-path probe (E13): everything above proves the SQL server can be
+        # created and firewalled, but never actually opens a connection to it from THIS machine - the
+        # only test that exercises the operator's own network path to 1433. AllowAllWindowsAzureIps
+        # (above) permits Azure services, not the operator's public IP, so without this probe a 1433
+        # block, a TLS-inspecting proxy on the SQL path, or a split-egress mismatch (web IP != SQL IP)
+        # would go undetected until install day. Not applicable under -PrivateEndpointOnly - there is
+        # no public data path to test.
+        if ($PrivateEndpointOnly) {
+            Add-Result -Category "Connectivity" -Check "SQL data path (operator -> 1433)" -Result "Info" -Detail "Not applicable - -PrivateEndpointOnly leaves no public data path to the SQL server to test from this machine."
+        }
+        else {
+            Test-SqlOperatorDataPath -ResourceGroupName $ResourceGroupName -ServerName $sqlName -Fqdn "$sqlName.$SqlSuffix" -EgressIp $script:EgressInfo.Ip -IsCloudShell $script:IsCloudShell
+        }
     }
 
     # --- Dependent deployment steps the installer performs that also get policy-blocked ---
