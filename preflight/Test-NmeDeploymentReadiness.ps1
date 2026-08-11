@@ -2007,6 +2007,34 @@ try {
             Add-Result -Category "Info" -Check "Internet egress" -Result "Warn" -Detail "Could not determine public egress IP (no HTTPS path to an IP-echo service) - this itself may indicate restrictive egress filtering."
         }
     }
+
+    # E14 - database-audience token check: acquire a token for the SQL/database audience with the
+    # install's exact call shape, so a tenant/audience mismatch that would break the installer's SQL
+    # step is surfaced here rather than mid-install. Mirrors the Key Vault audience token model above.
+    # SQL resource-id doesn't have a clean $AzEnv property across clouds (unlike Key Vault's
+    # AzureKeyVaultServiceEndpointResourceId) - fall back to the commercial audience and note the cloud.
+    $SqlAudience = "https://database.windows.net/"
+    $sqlAudienceCloudNote = if ($AzEnv.Name -and $AzEnv.Name -ne "AzureCloud") { " (cloud '$($AzEnv.Name)' - using the commercial database audience; verify this is correct for Gov/China if this check fails)" } else { "" }
+    try {
+        try {
+            Get-AzAccessToken -ResourceUrl $SqlAudience -TenantId $TenantId -AsSecureString -ErrorAction Stop | Out-Null
+        }
+        catch [System.Management.Automation.ParameterBindingException] {
+            # Older Az versions don't have -AsSecureString - fall back to the plain call. The token
+            # value is never inspected either way, only acquisition success/failure matters.
+            Get-AzAccessToken -ResourceUrl $SqlAudience -TenantId $TenantId -ErrorAction Stop | Out-Null
+        }
+        Add-Result -Category "Info" -Check "SQL/database access token" -Result "Pass" -Detail "Acquired a database-audience token for tenant $TenantId.$sqlAudienceCloudNote"
+    }
+    catch {
+        $sqlTokErrMsg = Get-DetailedErrorMessage -ErrorRecord $_
+        Add-Result -Category "Info" -Check "SQL/database access token" -Result "Fail" -Detail "Could not acquire a database-audience ($SqlAudience) token for the subscription's tenant $TenantId. The installer's SQL configuration step will fail. Inner error surfaced below.$sqlAudienceCloudNote" -Message $sqlTokErrMsg -RawMessage $sqlTokErrMsg
+        # Same issuer/tenant-mismatch pattern used by the later Key Vault AKV10032 check (that
+        # classifier isn't defined yet at this point in the script, so it's inlined here).
+        if ($sqlTokErrMsg -and ($sqlTokErrMsg -match "AKV10032" -or $sqlTokErrMsg -match "Invalid issuer" -or $sqlTokErrMsg -match "wrong issuer" -or $sqlTokErrMsg -match "tenant.*mismatch" -or $sqlTokErrMsg -match "AADSTS700016|AADSTS50020")) {
+            $NextSteps.Add("Could not acquire a database-audience token for tenant ${TenantId}: this account has access to multiple Entra tenants (guest/B2B) and the session could not be pinned to the subscription's owning tenant, so the SQL token was minted for/rejected by the wrong tenant. Reconnect to the correct tenant with 'Connect-AzAccount -TenantId $TenantId -UseDeviceAuthentication', then re-run this script to confirm the SQL/database access token check passes.")
+        }
+    }
     #endregion Operator environment pre-checks
 
     # Resource group: existing (must be empty - NME installs only into a new or empty RG), or a
