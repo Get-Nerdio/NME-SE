@@ -659,6 +659,33 @@ function New-RandomString {
     return (-join (1..$Length | ForEach-Object { $chars | Get-Random })).ToLower()
 }
 
+function Get-EgressFingerprint {
+    # Local-only diagnostic (E12): resolves this machine's actual public egress IP and ASN/org so
+    # install-day network context (and Zscaler/SSL-inspection paths) is captured up front. Every
+    # network call is best-effort and short-timeout - never throws, returns nulls on total failure.
+    $ip = $null
+    foreach ($echoUrl in @("https://api.ipify.org", "https://ifconfig.me/ip", "https://checkip.amazonaws.com")) {
+        try {
+            $resp = Invoke-RestMethod -Uri $echoUrl -TimeoutSec 8 -ErrorAction Stop
+            if ($resp) { $ip = "$resp".Trim(); if ($ip) { break } }
+        }
+        catch { continue }
+    }
+    if (-not $ip) { return @{ Ip = $null; Asn = $null; Org = $null; IsZscaler = $false } }
+
+    $org = $null
+    try {
+        $info = Invoke-RestMethod -Uri "https://ipinfo.io/$ip/json" -TimeoutSec 8 -ErrorAction Stop
+        if ($info -and $info.org) { $org = "$($info.org)".Trim() }
+    }
+    catch {}
+
+    $isZscaler = $false
+    if ($org -and ($org -match "AS22616|AS53813|ZSCALER")) { $isZscaler = $true }
+
+    return @{ Ip = $ip; Asn = $org; Org = $org; IsZscaler = $isZscaler }
+}
+
 function Get-MaskedAccount {
     # Mask the local part of a UPN for display; leave the domain intact. No '@' -> treat the whole
     # string as the local part. Scales with local-part length so short usernames don't leak most of
@@ -1821,6 +1848,22 @@ try {
         $ps7ModulePaths = @($env:PSModulePath -split [IO.Path]::PathSeparator | Where-Object { $_ -match '\\PowerShell\\7\\' })
         if ($ps7ModulePaths.Count -gt 0) {
             Add-Result -Category "Info" -Check "PowerShell module path" -Result "Fail" -Detail "mixed 5.1/7 module path - the session is Windows PowerShell 5.1 but PowerShell 7 module paths are present; module resolution is unpredictable. Run this script from a clean PowerShell 7 session. Offending path(s): $($ps7ModulePaths -join '; ')"
+        }
+    }
+
+    # E12 - egress/ASN fingerprint: local runs only. In Cloud Shell the egress is Azure's, not the
+    # customer's install-day machine, so the fingerprint would be misleading - skip it there.
+    if (-not $script:IsCloudShell) {
+        $script:EgressInfo = Get-EgressFingerprint
+        if ($script:EgressInfo.Ip) {
+            $egressDetail = "Egress IP $($script:EgressInfo.Ip) - $($script:EgressInfo.Org)."
+            if ($script:EgressInfo.IsZscaler) {
+                $egressDetail += " Traffic is egressing via ZSCALER (AS22616/AS53813) - expect non-web (SQL/1433) filtering and rotating source IPs; pin firewall rules to the observed IP and see the SQL egress check."
+            }
+            Add-Result -Category "Info" -Check "Internet egress" -Result "Info" -Detail $egressDetail
+        }
+        else {
+            Add-Result -Category "Info" -Check "Internet egress" -Result "Warn" -Detail "Could not determine public egress IP (no HTTPS path to an IP-echo service) - this itself may indicate restrictive egress filtering."
         }
     }
     #endregion Operator environment pre-checks
@@ -3032,6 +3075,9 @@ finally {
         Region          = $Location
         ResourceGroup   = $ResourceGroupName
         PSVersion       = $(if ($script:PsIntegrity) { "$($script:PsIntegrity.Version) ($($script:PsIntegrity.Edition))" } else { "unknown" })
+        HostName        = $(try { [System.Net.Dns]::GetHostName() } catch { "unknown" })
+        EgressIp        = $(if ($script:IsCloudShell) { "Cloud Shell (n/a)" } elseif ($script:EgressInfo -and $script:EgressInfo.Ip) { $script:EgressInfo.Ip } else { "unknown" })
+        EgressAsn       = $(if ($script:IsCloudShell) { "Cloud Shell (n/a)" } elseif ($script:EgressInfo -and $script:EgressInfo.Asn) { $script:EgressInfo.Asn } else { "unknown" })
     }
     $rawJson = $null
     try {
