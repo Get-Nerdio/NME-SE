@@ -686,6 +686,17 @@ function Get-EgressFingerprint {
     return @{ Ip = $ip; Asn = $org; Org = $org; IsZscaler = $isZscaler }
 }
 
+function Test-PublicCaIssuer {
+    # E16 shared classifier: is a TLS certificate's issuer a recognizable public CA? Used by both the
+    # in-worker Kudu probe and the operator-side probe so the two capture points agree on what counts
+    # as "SSL inspection on path". Deliberately a small, documented allowlist (substring match, case-
+    # insensitive) - a false "not a public CA" is acceptable (it only produces a Warn), but the list
+    # should not flag legitimate Microsoft-issued certs.
+    param([string] $Issuer)
+    if ([string]::IsNullOrWhiteSpace($Issuer)) { return $false }
+    return $Issuer -match "Microsoft|DigiCert|Baltimore|GlobalSign|Entrust|GeoTrust|Amazon|Sectigo|Let's Encrypt"
+}
+
 function Test-SqlOperatorDataPath {
     # E13: prove THIS machine's own network path to the throwaway SQL server on 1433 actually works -
     # TCP egress, TLS handshake, and firewall/IP alignment. The existing Kudu connectivity test only
@@ -1730,7 +1741,7 @@ function Test-OutboundConnectivityViaKudu {
     $rawTok = (Get-AzAccessToken -ResourceUrl $AzEnv.ResourceManagerUrl -ErrorAction Stop).Token
     $kuduToken = if ($rawTok -is [System.Security.SecureString]) { [System.Net.NetworkCredential]::new("", $rawTok).Password } else { $rawTok }
     $epList = ($targets | ForEach-Object { "'$($_.Key)|$($_.Port)'" }) -join ","
-    $remoteCmd = "`$ProgressPreference='SilentlyContinue';foreach(`$e in @($epList)){`$pp=`$e -split '\|';`$u=`$pp[0];`$p=[int]`$pp[1];`$ip='';try{`$ip=(([System.Net.Dns]::GetHostAddresses(`$u))|Where-Object{`$_.AddressFamily -eq 'InterNetwork'}|Select-Object -First 1).IPAddressToString}catch{};`$ok=`$false;try{`$c=New-Object System.Net.Sockets.TcpClient;`$ar=`$c.BeginConnect(`$u,`$p,`$null,`$null);if(`$ar.AsyncWaitHandle.WaitOne(10000)){try{`$c.EndConnect(`$ar);`$ok=`$c.Connected}catch{}};`$c.Close()}catch{};`$sub='';if(`$p -eq 443 -and `$ok){try{`$sp=[System.Net.ServicePointManager]::FindServicePoint('https://'+`$u);`$null=Invoke-RestMethod -Uri ('https://'+`$u) -TimeoutSec 15 -ErrorAction SilentlyContinue;`$sub=`$sp.Certificate.Subject}catch{}};`$st=if(`$ok){'OK'}else{'BLOCKED'};Write-Output (`$u+'|'+`$st+'|'+`$ip+'|'+`$sub)}"
+    $remoteCmd = "`$ProgressPreference='SilentlyContinue';foreach(`$e in @($epList)){`$pp=`$e -split '\|';`$u=`$pp[0];`$p=[int]`$pp[1];`$ip='';try{`$ip=(([System.Net.Dns]::GetHostAddresses(`$u))|Where-Object{`$_.AddressFamily -eq 'InterNetwork'}|Select-Object -First 1).IPAddressToString}catch{};`$ok=`$false;try{`$c=New-Object System.Net.Sockets.TcpClient;`$ar=`$c.BeginConnect(`$u,`$p,`$null,`$null);if(`$ar.AsyncWaitHandle.WaitOne(10000)){try{`$c.EndConnect(`$ar);`$ok=`$c.Connected}catch{}};`$c.Close()}catch{};`$sub='';`$iss='';if(`$p -eq 443 -and `$ok){try{`$sp=[System.Net.ServicePointManager]::FindServicePoint('https://'+`$u);`$null=Invoke-RestMethod -Uri ('https://'+`$u) -TimeoutSec 15 -ErrorAction SilentlyContinue;`$sub=`$sp.Certificate.Subject;`$iss=`$sp.Certificate.Issuer}catch{}};`$st=if(`$ok){'OK'}else{'BLOCKED'};Write-Output (`$u+'|'+`$st+'|'+`$ip+'|'+`$sub+'|'+`$iss)}"
     $kbody = @{ command = "powershell -NoProfile -Command `"$remoteCmd`""; dir = "site\wwwroot" } | ConvertTo-Json
     $headers = @{ Authorization = "Bearer $kuduToken"; "Content-Type" = "application/json" }
     try {
@@ -1755,6 +1766,14 @@ function Test-OutboundConnectivityViaKudu {
             else {
                 if ($line -and $line -match "\|OK\|") {
                     Add-Result -Category "Connectivity" -Check $t.Label -Result "Pass" -Detail "$($t.Purpose)."
+                    # E16: also check the TLS issuer captured by the worker - a non-public-CA issuer on
+                    # an otherwise-reachable 443 target is the signature of a TLS-inspecting proxy (e.g.
+                    # Zscaler) sitting on the worker's egress. Additional, non-fatal - the reachability
+                    # Pass row above is unchanged.
+                    $issuer = ($line -split "\|")[4]
+                    if ($issuer -and -not (Test-PublicCaIssuer -Issuer $issuer)) {
+                        Add-Result -Category "Connectivity" -Check $t.Label -Result "Warn" -Detail "SSL inspection on path - the certificate for $($t.Key) was issued by '$issuer', not a public CA. A TLS-inspecting proxy (e.g. Zscaler) is intercepting HTTPS on the worker's egress."
+                    }
                 }
                 elseif ($line -and $line -match "\|BLOCKED\|") {
                     $parts = $line -split "\|"
@@ -2036,6 +2055,54 @@ try {
         }
         else {
             Add-Result -Category "Info" -Check "Internet egress" -Result "Warn" -Detail "Could not determine public egress IP (no HTTPS path to an IP-echo service) - this itself may indicate restrictive egress filtering."
+        }
+    }
+
+    # E16 - operator-side TLS issuer probe: local runs only (in Cloud Shell the path tested would be
+    # Cloud Shell's, not the install machine's - the Kudu-path capture below already covers the
+    # in-VNet worker case). Opens a raw TLS connection to Azure's control-plane host(s) from THIS
+    # machine and inspects the presented certificate's issuer, so a TLS-inspecting proxy (e.g.
+    # Zscaler) sitting in front of the operator's own network is caught before install day. We are
+    # diagnosing, not enforcing, so the validation callback always returns $true - capture must
+    # succeed even when the inspecting proxy's cert would otherwise fail trust.
+    if (-not $script:IsCloudShell) {
+        $tlsProbeHosts = @()
+        try {
+            $armHost = ([Uri]$AzEnv.ResourceManagerUrl).Host
+            if ($armHost) { $tlsProbeHosts += $armHost }
+        }
+        catch {}
+        if (-not $tlsProbeHosts) { $tlsProbeHosts = @("management.azure.com") }
+        $tlsProbeHosts += "login.microsoftonline.com"
+        $tlsProbeHosts = @($tlsProbeHosts | Select-Object -Unique)
+
+        foreach ($tlsHost in $tlsProbeHosts) {
+            $tcpClient = $null
+            $sslStream = $null
+            try {
+                $tcpClient = New-Object System.Net.Sockets.TcpClient
+                $connectTask = $tcpClient.ConnectAsync($tlsHost, 443)
+                if (-not $connectTask.Wait(10000)) { throw "Connection to ${tlsHost}:443 timed out after 10s." }
+                $sslStream = New-Object System.Net.Security.SslStream($tcpClient.GetStream(), $false, ({ param($tlsSender, $certificate, $chain, $sslPolicyErrors) $true }))
+                $sslStream.AuthenticateAsClient($tlsHost)
+                $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($sslStream.RemoteCertificate)
+                $issuer = $cert.Issuer
+                if (Test-PublicCaIssuer -Issuer $issuer) {
+                    Add-Result -Category "Connectivity" -Check "TLS issuer ($tlsHost)" -Result "Pass" -Detail "TLS to $tlsHost presents a public-CA certificate (issuer '$issuer') - no SSL inspection detected on this path."
+                }
+                else {
+                    $zscalerNote = if ($script:EgressInfo -and $script:EgressInfo.IsZscaler) { " This corroborates the ZSCALER egress signal above." } else { "" }
+                    Add-Result -Category "Connectivity" -Check "TLS issuer ($tlsHost)" -Result "Warn" -Detail "SSL inspection on path - $tlsHost presents a certificate issued by '$issuer' (enterprise/private root), i.e. a TLS-inspecting proxy is intercepting HTTPS from this machine. Expect this to also affect the installer's HTTPS and SQL/1433 paths.$zscalerNote"
+                    $script:TlsIssuerFindings = @($script:TlsIssuerFindings) + $issuer
+                }
+            }
+            catch {
+                Add-Result -Category "Connectivity" -Check "TLS issuer ($tlsHost)" -Result "Warn" -Detail "Could not complete a TLS issuer probe to $tlsHost. $($_.Exception.Message)"
+            }
+            finally {
+                if ($sslStream) { $sslStream.Dispose() }
+                if ($tcpClient) { $tcpClient.Dispose() }
+            }
         }
     }
 
@@ -3292,6 +3359,7 @@ finally {
         HostName        = $(try { [System.Net.Dns]::GetHostName() } catch { "unknown" })
         EgressIp        = $(if ($script:IsCloudShell) { "Cloud Shell (n/a)" } elseif ($script:EgressInfo -and $script:EgressInfo.Ip) { $script:EgressInfo.Ip } else { "unknown" })
         EgressAsn       = $(if ($script:IsCloudShell) { "Cloud Shell (n/a)" } elseif ($script:EgressInfo -and $script:EgressInfo.Asn) { $script:EgressInfo.Asn } else { "unknown" })
+        TlsIssuers      = $(if ($script:TlsIssuerFindings) { ($script:TlsIssuerFindings -join "; ") } else { "none (public CA or not probed)" })
     }
     $rawJson = $null
     try {
