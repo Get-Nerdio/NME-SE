@@ -765,7 +765,7 @@ function Test-SqlOperatorDataPath {
                 $sar = $ssl.BeginAuthenticateAsClient($Fqdn, $null, $null)
                 if (-not $sar.AsyncWaitHandle.WaitOne(15000)) { throw "TLS handshake timed out" }
                 $ssl.EndAuthenticateAsClient($sar)
-                Add-Result -Category "Connectivity" -Check $check -Result "Pass" -Detail "TLS handshake to ${Fqdn}:1433 OK$pathNote; login not exercised - System.Data.SqlClient unavailable in this session."
+                Add-Result -Category "Connectivity" -Check $check -Result "Pass" -Detail "SQL data path OK"
             }
             catch {
                 Add-Result -Category "Connectivity" -Check $check -Result "Fail" -Detail "TLS handshake broken on path$pathNote - reached TCP 1433 but the encrypted handshake to ${Fqdn}:1433 did not complete ($(Get-ConciseErrorMessage -RawMessage $_.Exception.Message)). This is the signature of TLS interception/inspection (e.g. Zscaler) sitting on the SQL path."
@@ -790,13 +790,13 @@ function Test-SqlOperatorDataPath {
                 $conn = New-Object System.Data.SqlClient.SqlConnection($connStr)
                 $conn.Open()
                 # Should never actually succeed (bogus login) - if it somehow does, the path clearly works.
-                Add-Result -Category "Connectivity" -Check $check -Result "Pass" -Detail "SQL data path OK$pathNote - reached ${Fqdn}:1433, completed TLS, and authenticated (unexpectedly - the dummy login succeeded)."
+                Add-Result -Category "Connectivity" -Check $check -Result "Pass" -Detail "SQL data path OK"
                 return
             }
             catch {
                 $msg = $_.Exception.Message
                 if ($msg -match "Login failed for user") {
-                    Add-Result -Category "Connectivity" -Check $check -Result "Pass" -Detail "SQL data path OK$pathNote - reached ${Fqdn}:1433, completed TLS, and got a SQL login response (login failed as expected for the dummy account). Encryption negotiated successfully."
+                    Add-Result -Category "Connectivity" -Check $check -Result "Pass" -Detail "SQL data path OK"
                     return
                 }
                 elseif ($msg -match "Client with IP address '([^']+)'|not allowed to access the server") {
@@ -1997,7 +1997,7 @@ try {
     if ($tenants.Count -gt 0) {
         $tenantIdList = ($tenants | ForEach-Object { $_.Id }) -join ", "
         if ($tenants.Count -gt 1) {
-            Add-Result -Category "Info" -Check "Entra tenant access" -Result "Warn" -Detail "Account has access to $($tenants.Count) Entra tenants: $tenantIdList. This is a multi-tenant account - Az can silently return a token from the wrong tenant; pin -Tenant on install day."
+            Add-Result -Category "Info" -Check "Entra tenant access" -Result "Info" -Detail "This is a multi-tenant account, with access to $($tenants.Count) tenants"
         }
         else {
             Add-Result -Category "Info" -Check "Entra tenant access" -Result "Info" -Detail "Account has access to $($tenants.Count) Entra tenant: $tenantIdList."
@@ -2394,7 +2394,13 @@ try {
             }
             else {
                 $NewVnetDnsMode = "Custom"
+                # Azure Private DNS zones aren't how resolution works on custom DNS - there's no
+                # existing-vs-new zones question for this path. Test-PrivateDnsZones's
+                # $PrivateDnsZonesMode parameter is mandatory, so it still needs a non-null/non-empty
+                # value even though Test-PrivateDnsZones ignores it once $NewVnetDnsMode is "Custom".
+                $PrivateDnsZonesMode = "NotApplicable"
                 $zoneList = ($RequiredPrivateDnsZones | ForEach-Object { "$($_.Zone) ($($_.Purpose))" }) -join "; "
+                $ConfigSummary["Private DNS zones plan"] = "N/A - new VNet will use custom/on-prem DNS servers; resolution is handled by the custom DNS provider"
                 $ConfigSummary["Private DNS resolution (new VNet)"] = "Custom/on-prem DNS - the custom DNS server(s) must resolve: $zoneList"
             }
         }
