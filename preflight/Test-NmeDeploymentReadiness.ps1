@@ -1908,6 +1908,14 @@ try {
     elseif ($TenantId) {
         Write-Host -ForegroundColor "Yellow" "Proceeding on tenant '$activeTenant' (not the subscription's owning tenant '$TenantId'); Key Vault checks may report an issuer mismatch."
     }
+    # Promote the pin outcome to a report row (the Write-Host lines above are console-only and never
+    # reach the JSON/HTML) so the SE can see tenant topology after the fact, not just on-screen.
+    if ($TenantId -and $activeTenant -eq $TenantId) {
+        Add-Result -Category "Info" -Check "Tenant context" -Result "Pass" -Detail "Context pinned to the subscription's owning tenant $TenantId."
+    }
+    elseif ($TenantId) {
+        Add-Result -Category "Info" -Check "Tenant context" -Result "Warn" -Detail "Active context tenant '$activeTenant' does not match the subscription's owning tenant '$TenantId'. Key Vault and SQL steps may fail with an issuer mismatch - pin with 'Connect-AzAccount -TenantId $TenantId' on install day."
+    }
 
     # Cloud environment (Commercial / Gov / China) drives Graph endpoint and DNS suffixes.
     $AzEnv = (Get-AzContext).Environment
@@ -1954,6 +1962,29 @@ try {
     }
     elseif ($meUserType -eq "Member") { "Member (native account in the subscription's tenant $TenantId)" }
     else { "Member / home-tenant account (directory user type not confirmed)" }
+
+    # Promote the guest/B2B determination to a report row - a common source of "works for a native
+    # admin but not for this account" install issues.
+    if ($IsGuestAccount) {
+        Add-Result -Category "Info" -Check "Signed-in account type" -Result "Warn" -Detail "$AccountTypeSummary Silent auth to foreign tenants will fail - pin -Tenant on install day."
+    }
+    else {
+        Add-Result -Category "Info" -Check "Signed-in account type" -Result "Pass" -Detail $AccountTypeSummary
+    }
+
+    # Enumerate the account's Entra tenant memberships so multi-tenant/guest operators are warned to
+    # pin -Tenant on install day. Best-effort - Get-AzTenant can be slow or restricted; never fatal.
+    try { $tenants = @(Get-AzTenant -ErrorAction Stop) } catch { $tenants = @() }
+    if ($tenants.Count -gt 0) {
+        $tenantIdList = ($tenants | ForEach-Object { $_.Id }) -join ", "
+        if ($tenants.Count -gt 1) {
+            Add-Result -Category "Info" -Check "Entra tenant access" -Result "Warn" -Detail "Account has access to $($tenants.Count) Entra tenants: $tenantIdList. This is a multi-tenant account - Az can silently return a token from the wrong tenant; pin -Tenant on install day."
+        }
+        else {
+            Add-Result -Category "Info" -Check "Entra tenant access" -Result "Info" -Detail "Account has access to $($tenants.Count) Entra tenant: $tenantIdList."
+        }
+        $ConfigSummary["Entra tenants accessible"] = $tenants.Count
+    }
     $SqlSuffix = $SqlSuffix.TrimStart(".")
 
     # Private DNS zones the installer creates/links for a private deployment (suffixes are
