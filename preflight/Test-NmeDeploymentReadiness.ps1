@@ -150,6 +150,7 @@ $script:StatusStyle = @{
     Fail = @{ Label = "FAIL"; Symbol = "x";           Rgb = @(229, 72, 77); Hex = "#e5484d" }
     Warn = @{ Label = "WARN"; Symbol = "!";           Rgb = @(210, 153, 34); Hex = "#d29922" }
     Info = @{ Label = "INFO"; Symbol = "i";           Rgb = @(59, 130, 246); Hex = "#3b82f6" }
+    Incomplete = @{ Label = "INCOMPLETE"; Symbol = "?"; Rgb = @(210, 153, 34); Hex = "#d29922" }
 }
 
 # Whether we can emit ANSI colour. PowerShell 7 in Cloud Shell supports it; honour NO_COLOR and a
@@ -167,7 +168,9 @@ $script:IsCloudShell = -not [string]::IsNullOrEmpty($env:ACC_CLOUD) -or
 
 function Get-ReadinessVerdict {
     # Overall verdict from the result set: any Fail -> FAIL; else any Warn -> WARN; else PASS.
+    # An empty result set (e.g. an aborted run that never populated $Results) must never read PASS.
     param([System.Collections.IEnumerable] $Results)
+    if (@($Results).Count -eq 0) { return "Incomplete" }
     $hasFail = $false; $hasWarn = $false
     foreach ($r in $Results) {
         if ($r.Result -eq "Fail") { $hasFail = $true }
@@ -249,8 +252,8 @@ font-family:ui-monospace,SFMono-Regular,Menlo,monospace;}
     [void]$sb.AppendLine('<h1>Nerdio Manager for Enterprise deployment readiness report</h1>')
     [void]$sb.AppendLine("<div class=`"sub`">Generated $(ConvertTo-HtmlText $Meta.TimestampUtc)</div>")
 
-    $vColor = @{ Pass = "var(--pass)"; Fail = "var(--fail)"; Warn = "var(--warn)" }[$verdict]
-    $vText = @{ Pass = "READY: all checks passed"; Fail = "NOT READY: one or more checks failed"; Warn = "READY WITH WARNINGS: review the items below" }[$verdict]
+    $vColor = @{ Pass = "var(--pass)"; Fail = "var(--fail)"; Warn = "var(--warn)"; Incomplete = "var(--warn)" }[$verdict]
+    $vText = @{ Pass = "READY: all checks passed"; Fail = "NOT READY: one or more checks failed"; Warn = "READY WITH WARNINGS: review the items below"; Incomplete = "INCOMPLETE: the readiness run did not produce any results — re-run and send the full output." }[$verdict]
     [void]$sb.AppendLine("<div class=`"banner`" style=`"background:$vColor`"><span>$($vStyle.Symbol)</span><span>$vText</span></div>")
 
     [void]$sb.AppendLine('<div class="chips">')
@@ -2987,6 +2990,12 @@ try {
         Write-Host ""
     }
     #endregion
+}
+catch {
+    # A throw anywhere above would otherwise skip straight to `finally` with $Results possibly empty
+    # or partial - record it as a Fail row so the report (and verdict) reflect an aborted run rather
+    # than rendering green on whatever little was collected before the throw.
+    Add-Result -Category "Info" -Check "Preflight run" -Result "Fail" -Detail "Script aborted before completion: $($_.Exception.Message)" -RawMessage (Get-DetailedErrorMessage -ErrorRecord $_)
 }
 finally {
     #region Reporting ----------------------------------------------------------------------------
