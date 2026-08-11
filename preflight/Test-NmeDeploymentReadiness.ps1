@@ -1799,6 +1799,32 @@ try {
         @{ Purpose = "Automation"; Zone = (Get-EnvSuffix -AzEnvName $AzEnv.Name -Kind PrivateDnsAutomation) }
     )
 
+    #region Operator environment pre-checks ---------------------------------------------------------
+    # Operator-machine / local-PowerShell diagnostics that matter even if the deployability phase
+    # below never runs, so they land high in the report. Runs after the tenant pin ($TenantId) and
+    # cloud environment ($AzEnv) are resolved, before any test resources are created. Later Batch-2
+    # items (E12/E14/E15/E16) append further checks to this same region.
+
+    # E11 - PowerShell integrity check: wrong PS version/edition, and a mixed Windows PowerShell
+    # 5.1 / PowerShell 7 module path both silently break Az/installer behavior.
+    $script:PsIntegrity = @{ Version = $PSVersionTable.PSVersion; Edition = $PSVersionTable.PSEdition }
+    $psVersionResult = if ($PSVersionTable.PSVersion.Major -ge 7) { "Pass" } else { "Warn" }
+    $psVersionDetail = "PSVersion=$($PSVersionTable.PSVersion), PSEdition=$($PSVersionTable.PSEdition)"
+    if ($psVersionResult -eq "Warn") { $psVersionDetail += ". PowerShell 7+ recommended; Az behavior on 5.1 is not validated by this test." }
+    Add-Result -Category "Info" -Check "PowerShell version" -Result $psVersionResult -Detail $psVersionDetail
+
+    try { Import-Module Microsoft.PowerShell.Security -ErrorAction Stop }
+    catch { Add-Result -Category "Info" -Check "PowerShell module import" -Result "Warn" -Detail "Microsoft.PowerShell.Security failed to import - a corrupted/locked module state; Az cmdlets may misbehave. $($_.Exception.Message)" }
+
+    if ($PSVersionTable.PSEdition -eq "Desktop") {
+        # PS7's module directory leaking into a 5.1 session makes module resolution unpredictable.
+        $ps7ModulePaths = @($env:PSModulePath -split [IO.Path]::PathSeparator | Where-Object { $_ -match '\\PowerShell\\7\\' })
+        if ($ps7ModulePaths.Count -gt 0) {
+            Add-Result -Category "Info" -Check "PowerShell module path" -Result "Fail" -Detail "mixed 5.1/7 module path - the session is Windows PowerShell 5.1 but PowerShell 7 module paths are present; module resolution is unpredictable. Run this script from a clean PowerShell 7 session. Offending path(s): $($ps7ModulePaths -join '; ')"
+        }
+    }
+    #endregion Operator environment pre-checks
+
     # Resource group: existing (must be empty - NME installs only into a new or empty RG), or a
     # temporary one this script creates (after the naming/tag confirmation below).
     $PendingRgCreate = $false
@@ -3005,6 +3031,7 @@ finally {
         Cloud           = $(try { (Get-AzContext).Environment.Name } catch { "unknown" })
         Region          = $Location
         ResourceGroup   = $ResourceGroupName
+        PSVersion       = $(if ($script:PsIntegrity) { "$($script:PsIntegrity.Version) ($($script:PsIntegrity.Edition))" } else { "unknown" })
     }
     $rawJson = $null
     try {
