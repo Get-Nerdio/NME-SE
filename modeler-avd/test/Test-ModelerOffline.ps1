@@ -4,6 +4,7 @@
 # Run on any pwsh 7+: pwsh -File Test-ModelerOffline.ps1
 $poolAId = '/subscriptions/s1/resourcegroups/rg1/providers/microsoft.desktopvirtualization/hostpools/PoolA'
 $wsId    = '/subscriptions/s1/resourcegroups/rg1/providers/microsoft.operationalinsights/workspaces/ws1'
+$wsId2   = '/subscriptions/s1/resourcegroups/rg1/providers/microsoft.operationalinsights/workspaces/ws2'   # v0.17.3: network-blocked (NSP)
 $saProf  = '/subscriptions/s1/resourcegroups/rg-stor/providers/microsoft.storage/storageaccounts/stprofiles'
 $saGen   = '/subscriptions/s1/resourcegroups/rg-stor/providers/microsoft.storage/storageaccounts/stgen'
 $anfPool = '/subscriptions/s1/resourcegroups/rg-anf/providers/microsoft.netapp/netappaccounts/anf1/capacitypools/pool1'
@@ -12,6 +13,7 @@ $anfPool = '/subscriptions/s1/resourcegroups/rg-anf/providers/microsoft.netapp/n
 
 function Get-AzContext { [pscustomobject]@{ Name = 'mock'; Account = [pscustomobject]@{ Id = 'don@mock.test' }; Tenant = [pscustomobject]@{ Id = 'ten-1' } } }
 $global:ArgSubScopes = @()   # v0.17: every ARG payload's subscriptions array, for the scope-pinning check
+$global:CostAnfCalls = 0     # v0.17.3: rg-anf cost scope always answers 429 - proves 3 attempts + polite skip
 function Invoke-AzRestMethod {
     param([string]$Method, [string]$Path, [string]$Payload)
     if ($Method -eq 'GET' -and $Path.StartsWith('/subscriptions?')) {
@@ -73,9 +75,12 @@ function Invoke-AzRestMethod {
     }
     if ($Method -eq 'GET' -and $Path -like '*diagnosticSettings*') {
         if ($Path -like "$poolAId*") {
-            return [pscustomobject]@{ StatusCode = 200; Content = (@{ value = @(@{ properties = @{ workspaceId = $wsId } }) } | ConvertTo-Json -Depth 10) }
+            return [pscustomobject]@{ StatusCode = 200; Content = (@{ value = @(@{ properties = @{ workspaceId = $wsId } }, @{ properties = @{ workspaceId = $wsId2 } }) } | ConvertTo-Json -Depth 10) }
         }
         return [pscustomobject]@{ StatusCode = 200; Content = (@{ value = @() } | ConvertTo-Json -Depth 10) }
+    }
+    if ($Method -eq 'GET' -and $Path -like "$wsId2*") {
+        return [pscustomobject]@{ StatusCode = 200; Content = (@{ properties = @{ customerId = '22222222-2222-4222-8222-222222222222' } } | ConvertTo-Json -Depth 10) }
     }
     if ($Method -eq 'GET' -and $Path -like "$wsId*") {
         return [pscustomobject]@{ StatusCode = 200; Content = (@{ properties = @{ customerId = '11111111-2222-3333-4444-555555555555' } } | ConvertTo-Json -Depth 10) }
@@ -98,9 +103,12 @@ function Invoke-AzRestMethod {
     }
     if ($Method -eq 'POST' -and $Path -like '*Microsoft.CostManagement/query*') {
         $rows = @()
+        if ($Path -like '*resourcegroups/rg-anf*') {
+            $global:CostAnfCalls++
+            return [pscustomobject]@{ StatusCode = 429; Content = '{"error":{"message":"Too many requests. Please retry."}}' }
+        }
         if ($Path -like '*resourcegroups/rg-stor*') {
             $rows += ,@(42.00, $saProf.ToLower(), 'USD')
-        } elseif ($Path -like '*resourcegroups/rg-anf*') {
         } else {
             $rows += ,@(100.50, '/subscriptions/s1/resourcegroups/rg1/providers/microsoft.compute/virtualmachines/vm1', 'USD')
             $rows += ,@(50.25,  '/subscriptions/s1/resourcegroups/rg1/providers/microsoft.compute/virtualmachines/vm2', 'USD')
@@ -116,8 +124,9 @@ function Invoke-AzRestMethod {
 function Get-AzAccessToken { param([string]$ResourceUrl) [pscustomobject]@{ Token = 'mock-token' } }
 function Invoke-RestMethod {
     param($Method, $Uri, $Headers, $ContentType, $Body, $TimeoutSec)
-    if ("$Uri" -match 'modeler/VERSION') { return 'v0.17.2' }   # stale-copy self-check: report current
+    if ("$Uri" -match 'modeler/VERSION') { return 'v0.17.3' }   # stale-copy self-check: report current
     if ("$Uri" -notmatch 'api\.loganalytics\.io') { throw "unexpected Invoke-RestMethod uri in test: $Uri" }
+    if ("$Uri" -match '22222222') { throw 'Response status code does not indicate success: 403 (Forbidden). NspValidationFailedError: Access to workspace ws2 from 1.2.3.4 is denied. To allow access from public networks, change the workspace Networking settings or add it to a Network Security Perimeter.' }
     $q = ($Body | ConvertFrom-Json).query
     $pid_ = $poolAId.ToLower()
     if ($q -match 'Buckets \| project HostPoolId, SlotUtc') {
@@ -137,7 +146,9 @@ function Invoke-RestMethod {
 }
 
 Remove-Item /tmp/test-model*.* -Force -ErrorAction SilentlyContinue
+$env:MODELER_FAST_RETRY = '1'   # v0.17.3: skip the 20s/60s cost-429 waits in the harness
 & "$PSScriptRoot/../Get-NerdioModelerJson.ps1" -SkipDownload -OutFile /tmp/test-model.json -ModelName 'TEST'
+Remove-Item Env:MODELER_FAST_RETRY -ErrorAction SilentlyContinue
 
 Write-Host "`n--- VALIDATION ---"
 $m = Get-Content /tmp/test-model.json -Raw | ConvertFrom-Json
@@ -184,10 +195,13 @@ $checks = [ordered]@{
     'console log captured + clean'      = ($log -match 'Assembling deployments' -and $log -notmatch [char]27)
     'no raw-export failure in log'      = ($log -notmatch 'Raw data export failed' -and $log -match 'Raw decision data written')
     'counters exclude storage rows'     = ($log -match 'Usage found for 1 of 1 pool')
-    'rawdata sane + version + evidence' = ($null -ne $rawJson -and @($rawJson.pools).Count -eq 1 -and $rawJson.meta.version -eq 'v0.17.2' -and @($rawJson.storageCandidates).Count -eq 4 -and @($rawJson.mapEvidence).Count -ge 1)
-    'version is the first output line'  = ($log -match '(?m)^\[i\] Get-NerdioModelerJson v0\.17\.2' -and ($log.IndexOf('Get-NerdioModelerJson v0.17.2') -lt $log.IndexOf('Signed in as')))
+    'rawdata sane + version + evidence' = ($null -ne $rawJson -and @($rawJson.pools).Count -eq 1 -and $rawJson.meta.version -eq 'v0.17.3' -and @($rawJson.storageCandidates).Count -eq 4 -and @($rawJson.mapEvidence).Count -ge 1)
+    'version is the first output line'  = ($log -match '(?m)^\[i\] Get-NerdioModelerJson v0\.17\.3' -and ($log.IndexOf('Get-NerdioModelerJson v0.17.3') -lt $log.IndexOf('Signed in as')))
     'mixed-size pool: mode wins'        = ($a.workload.vmSize -eq 'Standard_D8s_v5' -and $a.image.type -eq 1 -and $a.workload.disk.size -eq 128 -and $a.workload.disk.type -eq 'Premium_LRS')
     'no stale-copy warning (current)'   = ($log -notmatch 'THIS COPY IS STALE')
+    'NSP workspace named + fix given'   = ($log -match 'BLOCKED BY ITS NETWORK SETTINGS' -and $log -match 'inside the customer network')
+    'cost 429: three attempts made'     = ($global:CostAnfCalls -eq 3)
+    'cost 429: throttle msg, no causes' = ($log -match 'throttling that outlasted 3 attempts' -and $log -match 'Cost query skipped for rg-anf' -and $log -notmatch 'Common causes')
     'ARG pinned to enabled subs s1+s2'  = $(
         $ok = (@($global:ArgSubScopes).Count -ge 5)
         foreach ($sc in $global:ArgSubScopes) { if (@($sc).Count -ne 2 -or @($sc)[0] -ne 's1' -or @($sc)[1] -ne 's2') { $ok = $false } }

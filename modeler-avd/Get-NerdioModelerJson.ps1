@@ -59,6 +59,19 @@
     ./modeler.ps1 -TimeZone 'America/Chicago' -ModelName 'Contoso - Actuals'
 
 .NOTES
+    v0.17.3 (2026-08-12). FIELD HARDENING FROM THE FIRST ENTERPRISE-SCALE
+    RUN (144 pools / 65 subscriptions / 562 storage accounts):
+    (1) Log Analytics 403s caused by workspace NETWORK settings (Network
+    Security Perimeter / public query access off / private link) are named
+    as such - the warning says it is a location problem, not permissions,
+    and gives the fix (run from inside the customer network, or allow the
+    runner's IP on the workspace). Previously they printed as a generic
+    query failure, and the evidence stage mislabeled them as "file-share
+    diagnostics not enabled".
+    (2) Cost Management 429s get three attempts (20s + 60s waits - one 20s
+    retry was not enough at 18-scope scale) and a throttle-specific skip
+    message; the offer-type "common causes" list no longer prints for pure
+    throttling, where it was misleading.
     v0.17.2 (2026-08-07). DETERMINISTIC REPRESENTATIVE VM SPEC - found by
     diffing a Windows PowerShell 5.1 run against a Cloud Shell run of the SAME
     tenant minutes apart: 119 of 120 pools matched on every field; one pool
@@ -294,7 +307,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = 'v0.17.2'   # RELEASE RULE: bump modeler/VERSION in the same commit
+$ScriptVersion = 'v0.17.3'   # RELEASE RULE: bump modeler/VERSION in the same commit
 # Windows PowerShell 5.1 compatibility: force TLS 1.2 (old .NET Framework
 # defaults can be lower and ARM/Log Analytics require 1.2), and no PS7-only
 # syntax anywhere in this file (?? / ?. / -AsPlainText / utf8NoBOM).
@@ -426,11 +439,16 @@ function Get-ActualCostRows {
     $rows = @(); $nextUri = $null; $first = $true
     while ($first -or $nextUri) {
         $resp = $null
-        foreach ($try in 1..2) {
+        # Cost Management throttles hard at enterprise scale: an 18-scope run
+        # lost one RG to back-to-back 429s with a single 20s retry. Three
+        # attempts now, waiting 20s then 60s. (MODELER_FAST_RETRY=1 skips the
+        # waits - dev harness only.)
+        $retryWaits = @(20, 60)
+        foreach ($try in 0..$retryWaits.Count) {
             $resp = if ($nextUri) { Invoke-AzRestMethod -Method POST -Uri $nextUri -Payload $body }
                     else { Invoke-AzRestMethod -Method POST -Path "$Scope/providers/Microsoft.CostManagement/query?api-version=2023-03-01" -Payload $body }
             if ($resp.StatusCode -ne 429) { break }
-            Start-Sleep -Seconds 20   # Cost Management throttles aggressively; one polite retry
+            if ($try -lt $retryWaits.Count -and $env:MODELER_FAST_RETRY -ne '1') { Start-Sleep -Seconds $retryWaits[$try] }
         }
         if ($resp.StatusCode -ne 200) {
             $msg = ''
@@ -555,6 +573,18 @@ function Invoke-LaQuery {
         }
     }
     [pscustomobject]@{ Results = $rows }
+}
+
+# Workspace network lockdowns (Network Security Perimeter / public query access
+# off / private link) reject the QUERY with a 403 even though RBAC is fine -
+# seen live: a customer's two production AVD workspaces refused Cloud Shell's
+# egress IP ("NspValidationFailedError ... allow access from public networks").
+# The fix is LOCATION, not permissions - so say that, not a generic failure.
+$script:NetBlockedWs = @{}
+function Test-LaNetworkBlocked {
+    param($ErrorRecord)
+    $txt = "$($ErrorRecord.Exception.Message) $($ErrorRecord.ErrorDetails.Message)"
+    return [bool]($txt -match '(?i)NspValidationFailed|Network Security Perimeter|public network|private link|access to workspace .+ is denied')
 }
 
 # ------------------------------------------------------------------------- 1. pools
@@ -751,7 +781,12 @@ foreach ($wsId in $workspaceIds.Keys) {
             }
         } catch { }   # informational only - missing table/columns just means no session flag
     } catch {
-        Write-Warn2 "Workspace $($wsId.Split('/')[-1]) query failed ($($_.Exception.Message)) - pools that only log there will show as no-telemetry."
+        if (Test-LaNetworkBlocked $_) {
+            $script:NetBlockedWs[$wsId] = $true
+            Write-Warn2 "Workspace $($wsId.Split('/')[-1]) BLOCKED BY ITS NETWORK SETTINGS (Network Security Perimeter / public query access off) - this runner's IP is not allowed in. Not a permissions problem. Fix: run this same command from inside the customer network (local PowerShell on a VPN/corp machine usually passes), or allow this runner's IP on the workspace. Pools that only log there show as no-telemetry in THIS run."
+        } else {
+            Write-Warn2 "Workspace $($wsId.Split('/')[-1]) query failed ($($_.Exception.Message)) - pools that only log there will show as no-telemetry."
+        }
     }
 }
 
@@ -999,7 +1034,7 @@ HostIps | union PoolUsers | project RowType, Ip, UserGuess, HostPoolId
             if ($workspaceIds.ContainsKey($wsId)) {
                 foreach ($row in @((Invoke-LaQuery -WorkspaceCustomerId $customerId -Query $mapPoolsKql).Results)) { $poolRows.Add($row) }
             }
-        } catch { }
+        } catch { if (Test-LaNetworkBlocked $_) { $script:NetBlockedWs[$wsId] = $true } }
     }
     $poolNameById = @{}
     foreach ($p in $pools) { $poolNameById["$($p.id)".ToLowerInvariant()] = $p.name }
@@ -1030,6 +1065,7 @@ HostIps | union PoolUsers | project RowType, Ip, UserGuess, HostPoolId
     }
     $mappedCount = @($storageCandidates | Where-Object { $_.ServesPools.Count -gt 0 }).Count
     if ($mappedCount -gt 0) { Write-Ok "File-access logs found - $mappedCount store(s) carry pool evidence in the ledger's ServesPools column." }
+    elseif ($script:NetBlockedWs.Count -gt 0) { Write-Warn2 "      Share->pool evidence unavailable: $($script:NetBlockedWs.Count) workspace(s) rejected the query at the NETWORK layer (see the workspace warnings above) - not missing diagnostics. ServesPools stays empty in THIS run; an inside-the-network run fills it." }
     else { Write-Info "      No StorageFileLogs data (file-share diagnostics not enabled) - ServesPools stays empty in the ledger; the AVD admin can annotate it." }
 }
 
@@ -1209,8 +1245,10 @@ if (-not $SkipCosts -and -not $script:AuthBroken) {
     foreach ($scope in $rgScopes.Keys) {
         # AmortizedCost spreads RI/Savings Plan purchases across usage (honest number for
         # reserved customers); PAYG-type offers reject it, so fall back to ActualCost.
+        # EXCEPT on 429: throttling is rate-based, not cost-type-specific - retrying the
+        # other type just doubles the hammering (and the wait) for the same answer.
         try { $res = Get-ActualCostRows -Scope $scope -CostType 'AmortizedCost' } catch { $res = @{ ok = $false; status = "error: $($_.Exception.Message)" } }
-        if (-not $res.ok) {
+        if (-not $res.ok -and "$($res.status)" -notmatch '^HTTP 429') {
             try { $res = Get-ActualCostRows -Scope $scope -CostType 'ActualCost' } catch { $res = @{ ok = $false; status = "error: $($_.Exception.Message)" } }
         }
         if (-not $res.ok) {
@@ -1251,7 +1289,10 @@ if (-not $SkipCosts -and -not $script:AuthBroken) {
         foreach ($g in ($costSkipped | Group-Object Reason)) {
             Write-Warn2 "Cost query skipped for $(@($g.Group.RG) -join ', '): $($g.Name)"
         }
-        Write-Warn2 "Common causes: subscription offer type without cost API support (sponsored/internal/MSDN - typical in demo and lab tenants), CSP without customer cost visibility, or an EA where 'view charges' is disabled. Skipped cleanly - nothing else is affected."
+        $throttledSkips = @($costSkipped | Where-Object { "$($_.Reason)" -match '^HTTP 429' })
+        $otherSkips = @($costSkipped | Where-Object { "$($_.Reason)" -notmatch '^HTTP 429' })
+        if ($throttledSkips.Count -gt 0) { Write-Warn2 "HTTP 429 = Cost Management throttling that outlasted 3 attempts (20s + 60s waits) - not a permissions or offer problem. A re-run later usually fills these scopes' ActualMo; nothing else is affected." }
+        if ($otherSkips.Count -gt 0) { Write-Warn2 "Common causes: subscription offer type without cost API support (sponsored/internal/MSDN - typical in demo and lab tenants), CSP without customer cost visibility, or an EA where 'view charges' is disabled. Skipped cleanly - nothing else is affected." }
     }
 }
 Write-Host ""
