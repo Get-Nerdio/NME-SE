@@ -59,6 +59,17 @@
     ./modeler.ps1 -TimeZone 'America/Chicago' -ModelName 'Contoso - Actuals'
 
 .NOTES
+    v0.18 (2026-08-17). EMPTY HOST POOLS STAY OUT OF THE JSON - SE field
+    feedback: a 114-pool tenant carried 38 pool objects with no session
+    hosts and no activity, and each exported as a fake 1-user 9:00+9h
+    deployment (a third of the model was noise that skewed the numbers).
+    A pool is EMPTY when no session host resolves to a VM, AND no
+    connection appeared in the lookback, AND no session was ever counted.
+    Empty pools: excluded from the Modeler JSON, kept in the review table
+    with Flags=EMPTY and dashed columns, listed in rawdata.json
+    (emptyPools), counted in the console and on the Model-written line.
+    Pools WITH session hosts but no users still export flagged - that is
+    real idle compute worth modeling.
     v0.17.3 (2026-08-12). FIELD HARDENING FROM THE FIRST ENTERPRISE-SCALE
     RUN (144 pools / 65 subscriptions / 562 storage accounts):
     (1) Log Analytics 403s caused by workspace NETWORK settings (Network
@@ -307,7 +318,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = 'v0.17.3'   # RELEASE RULE: bump modeler/VERSION in the same commit
+$ScriptVersion = 'v0.18'   # RELEASE RULE: bump modeler/VERSION in the same commit
 # Windows PowerShell 5.1 compatibility: force TLS 1.2 (old .NET Framework
 # defaults can be lower and ARM/Log Analytics require 1.2), and no PS7-only
 # syntax anywhere in this file (?? / ?. / -AsPlainText / utf8NoBOM).
@@ -1113,6 +1124,7 @@ foreach ($p in $pools) { $nameCounts[$p.name] = 1 + (Coalesce $nameCounts[$p.nam
 $diskTiers = @(128, 256, 512, 1024, 2048, 4096)
 $deployments = [System.Collections.Generic.List[object]]::new()
 $review = [System.Collections.Generic.List[object]]::new()
+$emptyPools = [System.Collections.Generic.List[object]]::new()
 foreach ($p in $pools) {
     $key = $p.id.ToLower()
     $u = $usage[$key]
@@ -1144,6 +1156,27 @@ foreach ($p in $pools) {
     $experience = if ($p.hostPoolType -eq 'Personal') { 2 }
                   elseif ($p.preferredAppGroupType -eq 'RailApplications') { 4 }
                   elseif ($limit -eq 1) { 3 } else { 1 }
+    # EMPTY POOL = the pool object exists but nothing is behind it: no session
+    # host resolves to a VM, no connection appeared in the lookback, no session
+    # was ever counted. Field feedback (a 114-pool tenant carried 38 such
+    # shells): each used to export as a fake 1-user 9:00+9h deployment - a
+    # third of that model was noise. Shells stay OUT of the JSON; they remain
+    # in the review table flagged EMPTY, land in rawdata.json (emptyPools),
+    # and are counted out loud. Pools WITH hosts but no users still export -
+    # that is real, idle compute worth modeling. NOTE: the review table keeps
+    # exactly one row per pool IN POOL ORDER (cost attribution indexes on it).
+    $hasSessions = $sessionPeaks.ContainsKey($key) -and ([int]$sessionPeaks[$key] -gt 0)
+    if ((-not $spec) -and (-not $u) -and (-not $hasSessions)) {
+        $emptyPools.Add([ordered]@{ id = $p.id; name = $p.name })
+        $emptyDisplay = if ($nameCounts[$p.name] -gt 1) { "$($p.name) ($($p.resourceGroup))" } else { $p.name }
+        $review.Add([pscustomobject]@{
+            Pool = $emptyDisplay; RG = $p.resourceGroup; Type = $p.hostPoolType; Exp = $experience; Region = $p.location
+            VmSize = '-'; Limit = $limit; Density = '-'; PerHostPeak = 0
+            PeakUsers = 0; MAU = ''; Window = '-'; Days = '-'
+            Overtime = '-'; Flags = 'EMPTY - excluded from the Modeler JSON (no session hosts, no activity in the lookback)'
+        })
+        continue
+    }
     $limitSane = ($limit -ge 1 -and $limit -lt 100)
     $obsPerHost = if ($u -and $u.PSObject.Properties['PeakUsersPerHost'] -and "$($u.PeakUsersPerHost)" -ne '') { [int]$u.PeakUsersPerHost } else { 0 }
     $density = 1.0
@@ -1213,6 +1246,12 @@ foreach ($p in $pools) {
         Overtime = "$otPct% x $($otHours)h"; Flags = ($flags -join '; ')
     })
 }
+if ($emptyPools.Count -gt 0) {
+    $emptyNames = @($emptyPools | ForEach-Object { $_.name })
+    $shownNames = if ($emptyNames.Count -gt 12) { (@($emptyNames | Select-Object -First 10) -join ', ') + ", ...and $($emptyNames.Count - 10) more" } else { $emptyNames -join ', ' }
+    Write-Warn2 "$($emptyPools.Count) EMPTY host pool(s) excluded from the Modeler JSON - the pool object exists but has no session hosts and no activity in the lookback, so a defaulted 1-user deployment would only be noise. Marked EMPTY in the review table, listed in rawdata.json: $shownNames"
+}
+
 # ---- storage stays OUT of the model: ledger only (v0.15 ruling) ------------------
 # No carrier deployments, no fsLogix blocks, no prompts. The storage ledger CSV
 # (written with the review CSV below) is the complete storage deliverable.
@@ -1335,7 +1374,7 @@ if ($usageRows -eq 0) {
     Write-Ok "Usage found for $withUsage of $($pools.Count) pool(s)."
 }
 if ($flagged -gt 0) { Write-Warn2 "$flagged pool(s) carry flags - see the Flags column above." }
-Write-Ok "Model written: $OutFile ($($deployments.Count) deployments)"
+Write-Ok "Model written: $OutFile ($($deployments.Count) deployments$(if ($emptyPools.Count -gt 0) { "; $($emptyPools.Count) empty pool(s) excluded" }))"
 $vmRgGroups = @($vmSpecs.Keys | ForEach-Object { ($_ -split '/')[4] } | Group-Object | Sort-Object Count -Descending)
 if ($vmRgGroups.Count -gt 0) {
     Write-Host ""
@@ -1358,6 +1397,7 @@ try {
             notes = 'usage-buckets.csv holds per-pool 15-minute concurrency (UTC slots; convert with meta.parameters.TimeZone). Buckets include every reachable workspace - when a pool logs to several, the aggregates used the max-peak workspace, so filter buckets by Workspace to match. PeakUsersPerHost is an aggregate (per-host slot detail is not exported). Not re-derivable offline: a longer lookback, or telemetry that was not flowing during this run.'
         }
         pools = @($pools)
+        emptyPools = @($emptyPools)
         poolVmIds = @($poolVmIds.Keys | ForEach-Object { [ordered]@{ poolId = $_; vmIds = @($poolVmIds[$_]) } })
         vmSpecs = @($vmSpecs.Keys | ForEach-Object { [ordered]@{ vmId = $_; spec = $vmSpecs[$_] } })
         workspaces = @($workspaceIds.Keys)

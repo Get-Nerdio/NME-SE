@@ -51,7 +51,7 @@ Parameters require the two-step (download-then-run) form — `iex (irm ...)` run
 
 - **Reader** on the subscription(s) holding the AVD host pools and session hosts.
 - Access to the Log Analytics workspace(s) receiving AVD diagnostics (Reader there too).
-- AVD diagnostic settings feeding `WVDConnections` somewhere, if you want usage numbers. Pools without telemetry still land in the JSON — flagged, with 1 user and defaulted hours, named `... (no usage data)`.
+- AVD diagnostic settings feeding `WVDConnections` somewhere, if you want usage numbers. Pools **with session hosts** but no telemetry still land in the JSON — flagged, with 1 user and defaulted hours, named `... (no usage data)`. Pools with **neither hosts nor activity** are excluded from the JSON and flagged `EMPTY` in the review table.
 
 Nothing needs to be installed: Cloud Shell ships every module the script uses, and Resource Graph is reached over REST.
 
@@ -59,7 +59,7 @@ Nothing needs to be installed: Cloud Shell ships every module the script uses, a
 
 ## What it produces
 
-**The import JSON** — schema-4 Nerdio Modeler format, one deployment per host pool, every pool in the tenant.
+**The import JSON** — schema-4 Nerdio Modeler format, one deployment per host pool that has real compute or activity behind it. **Empty shells** — a pool object with no session hosts and no activity in the lookback — are excluded from the JSON (a defaulted 1-user deployment would only skew the model), flagged `EMPTY` in the review table, and counted in the console.
 
 **The review table / CSV** — per pool: resource group, type, SKU, session limit, density used, observed per-host peak, peak concurrent users, `MAU` (distinct users seen in the lookback — informational only, never in the JSON; it answers "the model says 24 users, we have 5,000" and feeds licensing conversations), observed work window and days, overtime fields, actual last-month cost (`ActualMo`, when retrievable), and a `Flags` column that names every default or adjustment applied. If a value was touched, it says so — nothing is changed silently.
 

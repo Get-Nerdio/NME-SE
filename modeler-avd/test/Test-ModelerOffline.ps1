@@ -63,7 +63,10 @@ function Invoke-AzRestMethod {
         } elseif ($q -match 'capacitypools') {
             $data = @(@{ id = $anfPool; name = 'anf1/pool1'; poolBytes = 4398046511104; serviceLevel = 'Premium' })
         } else {
-            $data = @(@{ id = $poolAId; name = 'PoolA'; resourceGroup = 'rg1'; location = 'eastus'; subscriptionId = 's1'; hostPoolType = 'Pooled'; maxSessionLimit = 10; preferredAppGroupType = 'Desktop'; startVMOnConnect = $true })
+            $data = @(
+                @{ id = $poolAId; name = 'PoolA'; resourceGroup = 'rg1'; location = 'eastus'; subscriptionId = 's1'; hostPoolType = 'Pooled'; maxSessionLimit = 10; preferredAppGroupType = 'Desktop'; startVMOnConnect = $true },
+                @{ id = '/subscriptions/s1/resourcegroups/rg1/providers/microsoft.desktopvirtualization/hostpools/PoolEmpty'; name = 'PoolEmpty'; resourceGroup = 'rg1'; location = 'eastus'; subscriptionId = 's1'; hostPoolType = 'Pooled'; maxSessionLimit = 5; preferredAppGroupType = 'Desktop'; startVMOnConnect = $false }
+            )   # v0.18: PoolEmpty has no session hosts and no telemetry - must be excluded from the JSON
         }
         return [pscustomobject]@{ StatusCode = 200; Content = (@{ data = $data } | ConvertTo-Json -Depth 10) }
     }
@@ -124,7 +127,7 @@ function Invoke-AzRestMethod {
 function Get-AzAccessToken { param([string]$ResourceUrl) [pscustomobject]@{ Token = 'mock-token' } }
 function Invoke-RestMethod {
     param($Method, $Uri, $Headers, $ContentType, $Body, $TimeoutSec)
-    if ("$Uri" -match 'modeler/VERSION') { return 'v0.17.3' }   # stale-copy self-check: report current
+    if ("$Uri" -match 'modeler/VERSION') { return 'v0.18' }   # stale-copy self-check: report current
     if ("$Uri" -notmatch 'api\.loganalytics\.io') { throw "unexpected Invoke-RestMethod uri in test: $Uri" }
     if ("$Uri" -match '22222222') { throw 'Response status code does not indicate success: 403 (Forbidden). NspValidationFailedError: Access to workspace ws2 from 1.2.3.4 is denied. To allow access from public networks, change the workspace Networking settings or add it to a Network Security Perimeter.' }
     $q = ($Body | ConvertFrom-Json).query
@@ -156,6 +159,7 @@ $csv = Import-Csv /tmp/test-model-review.csv
 $ledger = if (Test-Path /tmp/test-model-storage-ledger.csv) { Import-Csv /tmp/test-model-storage-ledger.csv } else { @() }
 $a = $m.deployments | Where-Object { $_.name -eq 'PoolA' }
 $rowPoolA = $csv | Where-Object { $_.Pool -eq 'PoolA' }
+$rowEmpty = $csv | Where-Object { $_.Pool -eq 'PoolEmpty' }
 $lProf = $ledger | Where-Object { $_.Share -eq 'profiles01' }
 $lUser = $ledger | Where-Object { $_.Share -eq 'userprofiles' }
 $lMsix = $ledger | Where-Object { $_.Share -eq 'msixapps' }
@@ -194,11 +198,12 @@ $checks = [ordered]@{
     'zip holds json+csv+ledger+log'     = ($zipOk -and (Test-Path /tmp/zipcheck/test-model.json) -and (Test-Path /tmp/zipcheck/test-model-review.csv) -and (Test-Path /tmp/zipcheck/test-model-storage-ledger.csv) -and (Test-Path $logPath))
     'console log captured + clean'      = ($log -match 'Assembling deployments' -and $log -notmatch [char]27)
     'no raw-export failure in log'      = ($log -notmatch 'Raw data export failed' -and $log -match 'Raw decision data written')
-    'counters exclude storage rows'     = ($log -match 'Usage found for 1 of 1 pool')
-    'rawdata sane + version + evidence' = ($null -ne $rawJson -and @($rawJson.pools).Count -eq 1 -and $rawJson.meta.version -eq 'v0.17.3' -and @($rawJson.storageCandidates).Count -eq 4 -and @($rawJson.mapEvidence).Count -ge 1)
-    'version is the first output line'  = ($log -match '(?m)^\[i\] Get-NerdioModelerJson v0\.17\.3' -and ($log.IndexOf('Get-NerdioModelerJson v0.17.3') -lt $log.IndexOf('Signed in as')))
+    'counters exclude storage rows'     = ($log -match 'Usage found for 1 of 2 pool')
+    'rawdata sane + version + evidence' = ($null -ne $rawJson -and @($rawJson.pools).Count -eq 2 -and $rawJson.meta.version -eq 'v0.18' -and @($rawJson.storageCandidates).Count -eq 4 -and @($rawJson.mapEvidence).Count -ge 1)
+    'version is the first output line'  = ($log -match '(?m)^\[i\] Get-NerdioModelerJson v0\.18' -and ($log.IndexOf('Get-NerdioModelerJson v0.18') -lt $log.IndexOf('Signed in as')))
     'mixed-size pool: mode wins'        = ($a.workload.vmSize -eq 'Standard_D8s_v5' -and $a.image.type -eq 1 -and $a.workload.disk.size -eq 128 -and $a.workload.disk.type -eq 'Premium_LRS')
     'no stale-copy warning (current)'   = ($log -notmatch 'THIS COPY IS STALE')
+    'empty pool: out of JSON, reported' = (@($m.deployments | Where-Object { $_.name -like 'PoolEmpty*' }).Count -eq 0 -and @($m.deployments).Count -eq 1 -and $rowEmpty.Flags -match '^EMPTY - excluded' -and $rowEmpty.VmSize -eq '-' -and $rowEmpty.Window -eq '-' -and $rowEmpty.ActualMo -eq '0' -and @($rawJson.emptyPools).Count -eq 1 -and $rawJson.emptyPools[0].name -eq 'PoolEmpty' -and $log -match '1 EMPTY host pool\(s\) excluded' -and $log -match '1 deployments; 1 empty pool\(s\) excluded')
     'NSP workspace named + fix given'   = ($log -match 'BLOCKED BY ITS NETWORK SETTINGS' -and $log -match 'inside the customer network')
     'cost 429: three attempts made'     = ($global:CostAnfCalls -eq 3)
     'cost 429: throttle msg, no causes' = ($log -match 'throttling that outlasted 3 attempts' -and $log -match 'Cost query skipped for rg-anf' -and $log -notmatch 'Common causes')
@@ -209,7 +214,7 @@ $checks = [ordered]@{
     'identity banner + scope printed'   = ($log -match 'Signed in as don@mock\.test - tenant ten-1' -and $log -match 'Scope: 2 enabled subscription\(s\)' -and $log -match 'Sub One  \(s1\)' -and $log -match 'Sub Two  \(s2\)')
     'other-tenant warning printed'      = ($log -match 'can also reach 1 other tenant' -and $log -match 'Connect-AzAccount -TenantId ten-2')
     'rawdata identity block'            = ($rawJson.meta.identity.account -eq 'don@mock.test' -and $rawJson.meta.identity.tenantId -eq 'ten-1' -and @($rawJson.meta.identity.scopeSubscriptions).Count -eq 2)
-    'per-sub pool counts printed'       = ($log -match 'Found 1 host pool\(s\) across 1 subscription\(s\)' -and $log -match 'Sub One : 1 pool\(s\)')
+    'per-sub pool counts printed'       = ($log -match 'Found 2 host pool\(s\) across 1 subscription\(s\)' -and $log -match 'Sub One : 2 pool\(s\)')
     'usage buckets csv in zip'          = (@($rawBucketsCsv).Count -eq 3 -and $rawBucketsCsv[1].ConcurrentUsers -eq '7')
     'no cmdlet-missing / skip errors'   = ($log -notmatch 'not recognized' -and $log -notmatch 'storage account\(s\) skipped \(slow')
 }
