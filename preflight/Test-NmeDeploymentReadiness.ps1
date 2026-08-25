@@ -3451,20 +3451,40 @@ finally {
         # prints after the wave completes.
         $removeOne = {
             param($t, $Location)
+            # Remove-AzResourceLock returning success doesn't mean the lock is gone yet - ARM's
+            # CanNotDelete enforcement on the SQL/KeyVault/Storage RPs has an observed eventual-
+            # consistency lag (up to ~1-2 min) after the lock-removal call returns. The "locks" wave's
+            # barrier only waits for that call to return, so the very next wave's delete of the
+            # previously-locked resource (or a private endpoint against it) can still race the lag and
+            # get back "ScopeLocked" even though the lock is already gone. Retry only that specific
+            # error, on only the resource types that sit behind a lock removed in the prior wave -
+            # every other error (policy blocks, permissions) still fails immediately.
+            $invokeWithLockRetry = {
+                param([scriptblock]$Action)
+                $maxAttempts = 8
+                for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+                    try { & $Action; return }
+                    catch {
+                        $scopeLocked = $_.Exception.Message -match "ScopeLocked|scope\(s\) are locked"
+                        if (-not $scopeLocked -or $attempt -eq $maxAttempts) { throw }
+                        Start-Sleep -Seconds 15
+                    }
+                }
+            }
             try {
                 switch ($t.Type) {
                     "lock" { Remove-AzResourceLock -LockId $t.Id -Force -ErrorAction Stop | Out-Null }
-                    "privateendpoint" { Remove-AzPrivateEndpoint -ResourceGroupName $t.ResourceGroupName -Name $t.Name -Force -ErrorAction Stop | Out-Null }
+                    "privateendpoint" { & $invokeWithLockRetry { Remove-AzPrivateEndpoint -ResourceGroupName $t.ResourceGroupName -Name $t.Name -Force -ErrorAction Stop | Out-Null } }
                     "webapp" { Remove-AzWebApp -ResourceGroupName $t.ResourceGroupName -Name $t.Name -Force -ErrorAction Stop | Out-Null }
                     "asp" { Remove-AzAppServicePlan -ResourceGroupName $t.ResourceGroupName -Name $t.Name -Force -ErrorAction Stop | Out-Null }
                     "automation" { Remove-AzAutomationAccount -ResourceGroupName $t.ResourceGroupName -Name $t.Name -Force -ErrorAction Stop | Out-Null }
                     "kv" {
-                        Remove-AzKeyVault -ResourceGroupName $t.ResourceGroupName -VaultName $t.Name -Force -ErrorAction Stop | Out-Null
+                        & $invokeWithLockRetry { Remove-AzKeyVault -ResourceGroupName $t.ResourceGroupName -VaultName $t.Name -Force -ErrorAction Stop | Out-Null }
                         try { Remove-AzKeyVault -VaultName $t.Name -Location $Location -InRemovedState -Force -ErrorAction Stop | Out-Null } catch {}
                     }
-                    "sqldatabase" { Remove-AzSqlDatabase -ResourceGroupName $t.ResourceGroupName -ServerName $t.Note -DatabaseName $t.Name -Force -ErrorAction Stop | Out-Null }
+                    "sqldatabase" { & $invokeWithLockRetry { Remove-AzSqlDatabase -ResourceGroupName $t.ResourceGroupName -ServerName $t.Note -DatabaseName $t.Name -Force -ErrorAction Stop | Out-Null } }
                     "sqlserver" { Remove-AzSqlServer -ResourceGroupName $t.ResourceGroupName -ServerName $t.Name -Force -ErrorAction Stop | Out-Null }
-                    "storage" { Remove-AzStorageAccount -ResourceGroupName $t.ResourceGroupName -Name $t.Name -Force -ErrorAction Stop | Out-Null }
+                    "storage" { & $invokeWithLockRetry { Remove-AzStorageAccount -ResourceGroupName $t.ResourceGroupName -Name $t.Name -Force -ErrorAction Stop | Out-Null } }
                     "law" { Remove-AzOperationalInsightsWorkspace -ResourceGroupName $t.ResourceGroupName -Name $t.Name -Force -ForceDelete -ErrorAction Stop | Out-Null }
                     "vnet" { Remove-AzVirtualNetwork -ResourceGroupName $t.ResourceGroupName -Name $t.Name -Force -ErrorAction Stop | Out-Null }
                     "privatednszone" { Remove-AzPrivateDnsZone -ResourceGroupName $t.ResourceGroupName -Name $t.Name -Confirm:$false -ErrorAction Stop | Out-Null }
