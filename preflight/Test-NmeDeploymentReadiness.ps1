@@ -150,6 +150,7 @@ $script:StatusStyle = @{
     Fail = @{ Label = "FAIL"; Symbol = "x";           Rgb = @(229, 72, 77); Hex = "#e5484d" }
     Warn = @{ Label = "WARN"; Symbol = "!";           Rgb = @(210, 153, 34); Hex = "#d29922" }
     Info = @{ Label = "INFO"; Symbol = "i";           Rgb = @(59, 130, 246); Hex = "#3b82f6" }
+    Incomplete = @{ Label = "INCOMPLETE"; Symbol = "?"; Rgb = @(210, 153, 34); Hex = "#d29922" }
 }
 
 # Whether we can emit ANSI colour. PowerShell 7 in Cloud Shell supports it; honour NO_COLOR and a
@@ -167,7 +168,9 @@ $script:IsCloudShell = -not [string]::IsNullOrEmpty($env:ACC_CLOUD) -or
 
 function Get-ReadinessVerdict {
     # Overall verdict from the result set: any Fail -> FAIL; else any Warn -> WARN; else PASS.
+    # An empty result set (e.g. an aborted run that never populated $Results) must never read PASS.
     param([System.Collections.IEnumerable] $Results)
+    if (@($Results).Count -eq 0) { return "Incomplete" }
     $hasFail = $false; $hasWarn = $false
     foreach ($r in $Results) {
         if ($r.Result -eq "Fail") { $hasFail = $true }
@@ -249,8 +252,8 @@ font-family:ui-monospace,SFMono-Regular,Menlo,monospace;}
     [void]$sb.AppendLine('<h1>Nerdio Manager for Enterprise deployment readiness report</h1>')
     [void]$sb.AppendLine("<div class=`"sub`">Generated $(ConvertTo-HtmlText $Meta.TimestampUtc)</div>")
 
-    $vColor = @{ Pass = "var(--pass)"; Fail = "var(--fail)"; Warn = "var(--warn)" }[$verdict]
-    $vText = @{ Pass = "READY: all checks passed"; Fail = "NOT READY: one or more checks failed"; Warn = "READY WITH WARNINGS: review the items below" }[$verdict]
+    $vColor = @{ Pass = "var(--pass)"; Fail = "var(--fail)"; Warn = "var(--warn)"; Incomplete = "var(--warn)" }[$verdict]
+    $vText = @{ Pass = "READY: all checks passed"; Fail = "NOT READY: one or more checks failed"; Warn = "READY WITH WARNINGS: review the items below"; Incomplete = "INCOMPLETE: the readiness run did not produce any results — re-run and send the full output." }[$verdict]
     [void]$sb.AppendLine("<div class=`"banner`" style=`"background:$vColor`"><span>$($vStyle.Symbol)</span><span>$vText</span></div>")
 
     [void]$sb.AppendLine('<div class="chips">')
@@ -654,6 +657,185 @@ function New-RandomString {
     param([int] $Length = 8)
     $chars = "abcdefghijklmnopqrstuvwxyz0123456789".ToCharArray()
     return (-join (1..$Length | ForEach-Object { $chars | Get-Random })).ToLower()
+}
+
+function Get-EgressFingerprint {
+    # Local-only diagnostic (E12): resolves this machine's actual public egress IP and ASN/org so
+    # install-day network context (and Zscaler/SSL-inspection paths) is captured up front. Every
+    # network call is best-effort and short-timeout - never throws, returns nulls on total failure.
+    $ip = $null
+    foreach ($echoUrl in @("https://api.ipify.org", "https://ifconfig.me/ip", "https://checkip.amazonaws.com")) {
+        try {
+            $resp = Invoke-RestMethod -Uri $echoUrl -TimeoutSec 8 -ErrorAction Stop
+            if ($resp) { $ip = "$resp".Trim(); if ($ip) { break } }
+        }
+        catch { continue }
+    }
+    if (-not $ip) { return @{ Ip = $null; Asn = $null; Org = $null; IsZscaler = $false } }
+
+    $org = $null
+    try {
+        $info = Invoke-RestMethod -Uri "https://ipinfo.io/$ip/json" -TimeoutSec 8 -ErrorAction Stop
+        if ($info -and $info.org) { $org = "$($info.org)".Trim() }
+    }
+    catch {}
+
+    $isZscaler = $false
+    if ($org -and ($org -match "AS22616|AS53813|ZSCALER")) { $isZscaler = $true }
+
+    return @{ Ip = $ip; Asn = $org; Org = $org; IsZscaler = $isZscaler }
+}
+
+function Test-PublicCaIssuer {
+    # E16 shared classifier: is a TLS certificate's issuer a recognizable public CA? Used by both the
+    # in-worker Kudu probe and the operator-side probe so the two capture points agree on what counts
+    # as "SSL inspection on path". Deliberately a small, documented allowlist (substring match, case-
+    # insensitive) - a false "not a public CA" is acceptable (it only produces a Warn), but the list
+    # should not flag legitimate Microsoft-issued certs.
+    param([string] $Issuer)
+    if ([string]::IsNullOrWhiteSpace($Issuer)) { return $false }
+    return $Issuer -match "Microsoft|DigiCert|Baltimore|GlobalSign|Entrust|GeoTrust|Amazon|Sectigo|Let's Encrypt"
+}
+
+function Test-SqlOperatorDataPath {
+    # E13: prove THIS machine's own network path to the throwaway SQL server on 1433 actually works -
+    # TCP egress, TLS handshake, and firewall/IP alignment. The existing Kudu connectivity test only
+    # exercises an App Service worker's network path; nothing today ever opens a connection to SQL from
+    # the operator's own machine. Catches: 1433 egress blocked, a TLS-inspecting proxy (e.g. Zscaler)
+    # breaking the encrypted handshake, and split egress (the HTTPS/web path and the SQL path leaving
+    # via different public IPs). $EgressIp is E12's fingerprint - may be $null if egress resolution
+    # failed, or on a Cloud Shell run where it is never attempted; the probe still runs without it,
+    # deriving the real source IP from SQL's own firewall-rejection error when needed. Never throws -
+    # every branch reports via Add-Result.
+    param(
+        [Parameter(Mandatory = $true)][string] $ResourceGroupName,
+        [Parameter(Mandatory = $true)][string] $ServerName,
+        [Parameter(Mandatory = $true)][string] $Fqdn,
+        [string] $EgressIp,
+        [bool] $IsCloudShell = $false
+    )
+    $check = "SQL data path (operator -> 1433)"
+    $pathNote = if ($IsCloudShell) { " (this path is Cloud Shell's egress, not the install machine's - re-run this test from the machine that will actually run the installer)" } else { "" }
+
+    try {
+        # Best-effort: open the SQL firewall to the known egress IP before probing. Child of the server -
+        # torn down with it (same as AllowAllWindowsAzureIps above), so no separate tracker entry.
+        if ($EgressIp) {
+            try {
+                New-AzSqlServerFirewallRule -ResourceGroupName $ResourceGroupName -ServerName $ServerName -FirewallRuleName "nmepf-operator" -StartIpAddress $EgressIp -EndIpAddress $EgressIp -ErrorAction Stop | Out-Null
+            }
+            catch {}
+        }
+
+        # (a) TCP 1433 reachability - a plain socket connect, no TLS yet.
+        $tcpClient = $null
+        $tcpOk = $false
+        try {
+            $tcpClient = New-Object System.Net.Sockets.TcpClient
+            $ar = $tcpClient.BeginConnect($Fqdn, 1433, $null, $null)
+            if ($ar.AsyncWaitHandle.WaitOne(10000)) {
+                try { $tcpClient.EndConnect($ar); $tcpOk = $tcpClient.Connected } catch { $tcpOk = $false }
+            }
+        }
+        catch { $tcpOk = $false }
+        finally { if ($tcpClient) { $tcpClient.Close() } }
+
+        if (-not $tcpOk) {
+            Add-Result -Category "Connectivity" -Check $check -Result "Fail" -Detail "1433 egress blocked$pathNote - could not open a TCP connection to ${Fqdn}:1433 from this machine within 10s. Outbound 1433 is commonly blocked by corporate egress/Zscaler; NME's App Service must reach SQL on 1433."
+            return
+        }
+
+        # (b) TLS + login probe. Prefer System.Data.SqlClient (bundled with PS7) so a real SQL protocol
+        # response also proves the encrypted handshake completed: "Login failed for user" against a
+        # deliberately nonexistent login IS the pass condition (path + TLS + a real SQL response all
+        # worked); a pre-login/handshake failure means the encrypted handshake never completed, which is
+        # the signature of a TLS-inspecting proxy (e.g. Zscaler) sitting on the SQL path.
+        $hasSqlClient = [bool]([System.Management.Automation.PSTypeName]"System.Data.SqlClient.SqlConnection").Type
+        if (-not $hasSqlClient) {
+            # SqlClient unavailable in this session - degrade to a TLS-only handshake probe. Still
+            # catches the TLS-interception signature, just without a SQL protocol-level confirmation.
+            $tcp2 = $null
+            $ssl = $null
+            try {
+                $tcp2 = New-Object System.Net.Sockets.TcpClient
+                $c2 = $tcp2.BeginConnect($Fqdn, 1433, $null, $null)
+                if (-not $c2.AsyncWaitHandle.WaitOne(10000)) { throw "TCP connect timed out" }
+                $tcp2.EndConnect($c2)
+                $ssl = New-Object System.Net.Security.SslStream($tcp2.GetStream(), $false)
+                $sar = $ssl.BeginAuthenticateAsClient($Fqdn, $null, $null)
+                if (-not $sar.AsyncWaitHandle.WaitOne(15000)) { throw "TLS handshake timed out" }
+                $ssl.EndAuthenticateAsClient($sar)
+                Add-Result -Category "Connectivity" -Check $check -Result "Pass" -Detail "SQL data path OK"
+            }
+            catch {
+                Add-Result -Category "Connectivity" -Check $check -Result "Fail" -Detail "TLS handshake broken on path$pathNote - reached TCP 1433 but the encrypted handshake to ${Fqdn}:1433 did not complete ($(Get-ConciseErrorMessage -RawMessage $_.Exception.Message)). This is the signature of TLS interception/inspection (e.g. Zscaler) sitting on the SQL path."
+            }
+            finally {
+                if ($ssl) { $ssl.Dispose() }
+                if ($tcp2) { $tcp2.Close() }
+            }
+            return
+        }
+
+        # SqlClient path - the login name is deliberately nonexistent so a *successful* auth is
+        # impossible; the only way to "pass" is a real SQL login-failure response.
+        $bogusChars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789".ToCharArray()
+        $bogusPwd = ((1..32 | ForEach-Object { $bogusChars | Get-Random }) -join "") + "aA1!"
+        $connStr = "Server=tcp:$Fqdn,1433;Database=master;User ID=nmepf-doesnotexist;Password=$bogusPwd;Encrypt=True;TrustServerCertificate=False;Connection Timeout=15"
+
+        $maxAttempts = 2
+        for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+            $conn = $null
+            try {
+                $conn = New-Object System.Data.SqlClient.SqlConnection($connStr)
+                $conn.Open()
+                # Should never actually succeed (bogus login) - if it somehow does, the path clearly works.
+                Add-Result -Category "Connectivity" -Check $check -Result "Pass" -Detail "SQL data path OK"
+                return
+            }
+            catch {
+                $msg = $_.Exception.Message
+                if ($msg -match "Login failed for user") {
+                    Add-Result -Category "Connectivity" -Check $check -Result "Pass" -Detail "SQL data path OK"
+                    return
+                }
+                elseif ($msg -match "Client with IP address '([^']+)'|not allowed to access the server") {
+                    $foundIp = if ($Matches -and $Matches[1]) { $Matches[1] } else { $null }
+                    if ($foundIp -and $EgressIp -and $foundIp -ne $EgressIp) {
+                        Add-Result -Category "Connectivity" -Check $check -Result "Fail" -Detail "split egress: web IP != SQL IP$pathNote - your HTTPS egress is $EgressIp but the SQL path left this machine via $foundIp. Your outbound path differs by destination (common with Zscaler); the firewall rule created for $EgressIp does not cover the SQL path."
+                        # Best-effort: allow the IP SQL actually saw and retry once so the rest of the path
+                        # can still be validated.
+                        try { New-AzSqlServerFirewallRule -ResourceGroupName $ResourceGroupName -ServerName $ServerName -FirewallRuleName "nmepf-operator-actual" -StartIpAddress $foundIp -EndIpAddress $foundIp -ErrorAction Stop | Out-Null } catch {}
+                        if ($attempt -lt $maxAttempts) { Start-Sleep -Seconds 5; continue }
+                        return
+                    }
+                    elseif ($foundIp) {
+                        Add-Result -Category "Connectivity" -Check $check -Result "Warn" -Detail "SQL firewall rule for $foundIp not yet effective$pathNote$(if ($attempt -lt $maxAttempts) { '; retrying once.' } else { ' after retrying.' })"
+                        if ($attempt -lt $maxAttempts) { Start-Sleep -Seconds 5; continue }
+                        return
+                    }
+                    else {
+                        Add-Result -Category "Connectivity" -Check $check -Result "Warn" -Detail "SQL rejected the connection by source IP$pathNote but the IP could not be parsed from the error: $(Get-ConciseErrorMessage -RawMessage $msg)"
+                        return
+                    }
+                }
+                elseif ($msg -match "pre-login handshake|SSL Provider|wait operation timed out") {
+                    Add-Result -Category "Connectivity" -Check $check -Result "Fail" -Detail "TLS handshake broken on path$pathNote - reached TCP 1433 but the encrypted pre-login handshake to ${Fqdn}:1433 did not complete ($(Get-ConciseErrorMessage -RawMessage $msg)). This is the signature of TLS interception/inspection (e.g. Zscaler) sitting on the SQL path."
+                    return
+                }
+                else {
+                    Add-Result -Category "Connectivity" -Check $check -Result "Warn" -Detail "Unexpected error probing the SQL data path$pathNote`: $(Get-ConciseErrorMessage -RawMessage $msg)"
+                    return
+                }
+            }
+            finally {
+                if ($conn) { $conn.Dispose() }
+            }
+        }
+    }
+    catch {
+        Add-Result -Category "Connectivity" -Check $check -Result "Warn" -Detail "Could not complete the SQL data-path probe$pathNote`: $(Get-ConciseErrorMessage -RawMessage (Get-DetailedErrorMessage -ErrorRecord $_))"
+    }
 }
 
 function Get-MaskedAccount {
@@ -1559,7 +1741,7 @@ function Test-OutboundConnectivityViaKudu {
     $rawTok = (Get-AzAccessToken -ResourceUrl $AzEnv.ResourceManagerUrl -ErrorAction Stop).Token
     $kuduToken = if ($rawTok -is [System.Security.SecureString]) { [System.Net.NetworkCredential]::new("", $rawTok).Password } else { $rawTok }
     $epList = ($targets | ForEach-Object { "'$($_.Key)|$($_.Port)'" }) -join ","
-    $remoteCmd = "`$ProgressPreference='SilentlyContinue';foreach(`$e in @($epList)){`$pp=`$e -split '\|';`$u=`$pp[0];`$p=[int]`$pp[1];`$ip='';try{`$ip=(([System.Net.Dns]::GetHostAddresses(`$u))|Where-Object{`$_.AddressFamily -eq 'InterNetwork'}|Select-Object -First 1).IPAddressToString}catch{};`$ok=`$false;try{`$c=New-Object System.Net.Sockets.TcpClient;`$ar=`$c.BeginConnect(`$u,`$p,`$null,`$null);if(`$ar.AsyncWaitHandle.WaitOne(10000)){try{`$c.EndConnect(`$ar);`$ok=`$c.Connected}catch{}};`$c.Close()}catch{};`$sub='';if(`$p -eq 443 -and `$ok){try{`$sp=[System.Net.ServicePointManager]::FindServicePoint('https://'+`$u);`$null=Invoke-RestMethod -Uri ('https://'+`$u) -TimeoutSec 15 -ErrorAction SilentlyContinue;`$sub=`$sp.Certificate.Subject}catch{}};`$st=if(`$ok){'OK'}else{'BLOCKED'};Write-Output (`$u+'|'+`$st+'|'+`$ip+'|'+`$sub)}"
+    $remoteCmd = "`$ProgressPreference='SilentlyContinue';foreach(`$e in @($epList)){`$pp=`$e -split '\|';`$u=`$pp[0];`$p=[int]`$pp[1];`$ip='';try{`$ip=(([System.Net.Dns]::GetHostAddresses(`$u))|Where-Object{`$_.AddressFamily -eq 'InterNetwork'}|Select-Object -First 1).IPAddressToString}catch{};`$ok=`$false;try{`$c=New-Object System.Net.Sockets.TcpClient;`$ar=`$c.BeginConnect(`$u,`$p,`$null,`$null);if(`$ar.AsyncWaitHandle.WaitOne(10000)){try{`$c.EndConnect(`$ar);`$ok=`$c.Connected}catch{}};`$c.Close()}catch{};`$sub='';`$iss='';if(`$p -eq 443 -and `$ok){try{`$sp=[System.Net.ServicePointManager]::FindServicePoint('https://'+`$u);`$null=Invoke-RestMethod -Uri ('https://'+`$u) -TimeoutSec 15 -ErrorAction SilentlyContinue;`$sub=`$sp.Certificate.Subject;`$iss=`$sp.Certificate.Issuer}catch{}};`$st=if(`$ok){'OK'}else{'BLOCKED'};Write-Output (`$u+'|'+`$st+'|'+`$ip+'|'+`$sub+'|'+`$iss)}"
     $kbody = @{ command = "powershell -NoProfile -Command `"$remoteCmd`""; dir = "site\wwwroot" } | ConvertTo-Json
     $headers = @{ Authorization = "Bearer $kuduToken"; "Content-Type" = "application/json" }
     try {
@@ -1584,6 +1766,14 @@ function Test-OutboundConnectivityViaKudu {
             else {
                 if ($line -and $line -match "\|OK\|") {
                     Add-Result -Category "Connectivity" -Check $t.Label -Result "Pass" -Detail "$($t.Purpose)."
+                    # E16: also check the TLS issuer captured by the worker - a non-public-CA issuer on
+                    # an otherwise-reachable 443 target is the signature of a TLS-inspecting proxy (e.g.
+                    # Zscaler) sitting on the worker's egress. Additional, non-fatal - the reachability
+                    # Pass row above is unchanged.
+                    $issuer = ($line -split "\|")[4]
+                    if ($issuer -and -not (Test-PublicCaIssuer -Issuer $issuer)) {
+                        Add-Result -Category "Connectivity" -Check $t.Label -Result "Warn" -Detail "SSL inspection on path - the certificate for $($t.Key) was issued by '$issuer', not a public CA. A TLS-inspecting proxy (e.g. Zscaler) is intercepting HTTPS on the worker's egress."
+                    }
                 }
                 elseif ($line -and $line -match "\|BLOCKED\|") {
                     $parts = $line -split "\|"
@@ -1737,6 +1927,14 @@ try {
     elseif ($TenantId) {
         Write-Host -ForegroundColor "Yellow" "Proceeding on tenant '$activeTenant' (not the subscription's owning tenant '$TenantId'); Key Vault checks may report an issuer mismatch."
     }
+    # Promote the pin outcome to a report row (the Write-Host lines above are console-only and never
+    # reach the JSON/HTML) so the SE can see tenant topology after the fact, not just on-screen.
+    if ($TenantId -and $activeTenant -eq $TenantId) {
+        Add-Result -Category "Info" -Check "Tenant context" -Result "Pass" -Detail "Context pinned to the subscription's owning tenant $TenantId."
+    }
+    elseif ($TenantId) {
+        Add-Result -Category "Info" -Check "Tenant context" -Result "Warn" -Detail "Active context tenant '$activeTenant' does not match the subscription's owning tenant '$TenantId'. Key Vault and SQL steps may fail with an issuer mismatch - pin with 'Connect-AzAccount -TenantId $TenantId' on install day."
+    }
 
     # Cloud environment (Commercial / Gov / China) drives Graph endpoint and DNS suffixes.
     $AzEnv = (Get-AzContext).Environment
@@ -1757,17 +1955,55 @@ try {
     # already a valid UPN/object id.
     $meObjectId = $null
     $meUpn = $null
+    $meUserType = $null
     try {
-        $meResp = Invoke-AzRestMethod -Uri "$GraphBase/v1.0/me`?`$select=id,userPrincipalName" -Method GET -ErrorAction Stop
+        $meResp = Invoke-AzRestMethod -Uri "$GraphBase/v1.0/me`?`$select=id,userPrincipalName,userType" -Method GET -ErrorAction Stop
         if ($meResp.StatusCode -eq 200) {
             $meJson = $meResp.Content | ConvertFrom-Json
             $meObjectId = $meJson.id
             $meUpn = $meJson.userPrincipalName
+            $meUserType = $meJson.userType
         }
     }
     catch { }
     $SignedInAccount = if ($meUpn) { $meUpn } else { (Get-AzContext).Account.Id }
     $SignedInAccountMasked = Get-MaskedAccount $SignedInAccount
+
+    # Is the signed-in account a guest / external (B2B) user in the subscription's owning tenant? The SE
+    # needs to know this: a guest's Entra roles are granted by B2B invitation, which is a common source
+    # of "works for a native admin but not for this account" install issues (and is why the tenant-pin
+    # step above matters). Two signals, either sufficient: Graph userType == "Guest" (authoritative,
+    # evaluated in the subscription's tenant since we pinned to it), or a UPN containing the B2B "#EXT#"
+    # marker (for when the directory query is unavailable).
+    $IsGuestAccount = ($meUserType -eq "Guest") -or ($SignedInAccount -match "#EXT#")
+    $AccountTypeSummary = if ($IsGuestAccount) {
+        "Guest / external (B2B) user - signed in to the tenant as a guest."
+    }
+    elseif ($meUserType -eq "Member") { "Member (native account in the subscription's tenant $TenantId)" }
+    else { "Member / home-tenant account (directory user type not confirmed)" }
+
+    # Promote the guest/B2B determination to a report row - a common source of "works for a native
+    # admin but not for this account" install issues.
+    if ($IsGuestAccount) {
+        Add-Result -Category "Info" -Check "Signed-in account type" -Result "Warn" -Detail "$AccountTypeSummary Silent auth to foreign tenants will fail - pin -Tenant on install day."
+    }
+    else {
+        Add-Result -Category "Info" -Check "Signed-in account type" -Result "Pass" -Detail $AccountTypeSummary
+    }
+
+    # Enumerate the account's Entra tenant memberships so multi-tenant/guest operators are warned to
+    # pin -Tenant on install day. Best-effort - Get-AzTenant can be slow or restricted; never fatal.
+    try { $tenants = @(Get-AzTenant -ErrorAction Stop) } catch { $tenants = @() }
+    if ($tenants.Count -gt 0) {
+        $tenantIdList = ($tenants | ForEach-Object { $_.Id }) -join ", "
+        if ($tenants.Count -gt 1) {
+            Add-Result -Category "Info" -Check "Entra tenant access" -Result "Info" -Detail "This is a multi-tenant account, with access to $($tenants.Count) tenants"
+        }
+        else {
+            Add-Result -Category "Info" -Check "Entra tenant access" -Result "Info" -Detail "Account has access to $($tenants.Count) Entra tenant: $tenantIdList."
+        }
+        $ConfigSummary["Entra tenants accessible"] = $tenants.Count
+    }
     $SqlSuffix = $SqlSuffix.TrimStart(".")
 
     # Private DNS zones the installer creates/links for a private deployment (suffixes are
@@ -1780,6 +2016,124 @@ try {
         @{ Purpose = "Blob storage"; Zone = "privatelink.blob.$StorageSuffix" },
         @{ Purpose = "Automation"; Zone = (Get-EnvSuffix -AzEnvName $AzEnv.Name -Kind PrivateDnsAutomation) }
     )
+
+    #region Operator environment pre-checks ---------------------------------------------------------
+    # Operator-machine / local-PowerShell diagnostics that matter even if the deployability phase
+    # below never runs, so they land high in the report. Runs after the tenant pin ($TenantId) and
+    # cloud environment ($AzEnv) are resolved, before any test resources are created. Later Batch-2
+    # items (E12/E14/E15/E16) append further checks to this same region.
+
+    # E11 - PowerShell integrity check: wrong PS version/edition, and a mixed Windows PowerShell
+    # 5.1 / PowerShell 7 module path both silently break Az/installer behavior.
+    $script:PsIntegrity = @{ Version = $PSVersionTable.PSVersion; Edition = $PSVersionTable.PSEdition }
+    $psVersionResult = if ($PSVersionTable.PSVersion.Major -ge 7) { "Pass" } else { "Warn" }
+    $psVersionDetail = "PSVersion=$($PSVersionTable.PSVersion), PSEdition=$($PSVersionTable.PSEdition)"
+    if ($psVersionResult -eq "Warn") { $psVersionDetail += ". PowerShell 7+ recommended; Az behavior on 5.1 is not validated by this test." }
+    Add-Result -Category "Info" -Check "PowerShell version" -Result $psVersionResult -Detail $psVersionDetail
+
+    try { Import-Module Microsoft.PowerShell.Security -ErrorAction Stop }
+    catch { Add-Result -Category "Info" -Check "PowerShell module import" -Result "Warn" -Detail "Microsoft.PowerShell.Security failed to import - a corrupted/locked module state; Az cmdlets may misbehave. $($_.Exception.Message)" }
+
+    if ($PSVersionTable.PSEdition -eq "Desktop") {
+        # PS7's module directory leaking into a 5.1 session makes module resolution unpredictable.
+        $ps7ModulePaths = @($env:PSModulePath -split [IO.Path]::PathSeparator | Where-Object { $_ -match '\\PowerShell\\7\\' })
+        if ($ps7ModulePaths.Count -gt 0) {
+            Add-Result -Category "Info" -Check "PowerShell module path" -Result "Fail" -Detail "mixed 5.1/7 module path - the session is Windows PowerShell 5.1 but PowerShell 7 module paths are present; module resolution is unpredictable. Run this script from a clean PowerShell 7 session. Offending path(s): $($ps7ModulePaths -join '; ')"
+        }
+    }
+
+    # E12 - egress/ASN fingerprint: local runs only. In Cloud Shell the egress is Azure's, not the
+    # customer's install-day machine, so the fingerprint would be misleading - skip it there.
+    if (-not $script:IsCloudShell) {
+        $script:EgressInfo = Get-EgressFingerprint
+        if ($script:EgressInfo.Ip) {
+            $egressDetail = "Egress IP $($script:EgressInfo.Ip) - $($script:EgressInfo.Org)."
+            if ($script:EgressInfo.IsZscaler) {
+                $egressDetail += " Traffic is egressing via ZSCALER (AS22616/AS53813) - expect non-web (SQL/1433) filtering and rotating source IPs; pin firewall rules to the observed IP and see the SQL egress check."
+            }
+            Add-Result -Category "Info" -Check "Internet egress" -Result "Info" -Detail $egressDetail
+        }
+        else {
+            Add-Result -Category "Info" -Check "Internet egress" -Result "Warn" -Detail "Could not determine public egress IP (no HTTPS path to an IP-echo service) - this itself may indicate restrictive egress filtering."
+        }
+    }
+
+    # E16 - operator-side TLS issuer probe: local runs only (in Cloud Shell the path tested would be
+    # Cloud Shell's, not the install machine's - the Kudu-path capture below already covers the
+    # in-VNet worker case). Opens a raw TLS connection to Azure's control-plane host(s) from THIS
+    # machine and inspects the presented certificate's issuer, so a TLS-inspecting proxy (e.g.
+    # Zscaler) sitting in front of the operator's own network is caught before install day. We are
+    # diagnosing, not enforcing, so the validation callback always returns $true - capture must
+    # succeed even when the inspecting proxy's cert would otherwise fail trust.
+    if (-not $script:IsCloudShell) {
+        $tlsProbeHosts = @()
+        try {
+            $armHost = ([Uri]$AzEnv.ResourceManagerUrl).Host
+            if ($armHost) { $tlsProbeHosts += $armHost }
+        }
+        catch {}
+        if (-not $tlsProbeHosts) { $tlsProbeHosts = @("management.azure.com") }
+        $tlsProbeHosts += "login.microsoftonline.com"
+        $tlsProbeHosts = @($tlsProbeHosts | Select-Object -Unique)
+
+        foreach ($tlsHost in $tlsProbeHosts) {
+            $tcpClient = $null
+            $sslStream = $null
+            try {
+                $tcpClient = New-Object System.Net.Sockets.TcpClient
+                $connectTask = $tcpClient.ConnectAsync($tlsHost, 443)
+                if (-not $connectTask.Wait(10000)) { throw "Connection to ${tlsHost}:443 timed out after 10s." }
+                $sslStream = New-Object System.Net.Security.SslStream($tcpClient.GetStream(), $false, ({ param($tlsSender, $certificate, $chain, $sslPolicyErrors) $true }))
+                $sslStream.AuthenticateAsClient($tlsHost)
+                $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($sslStream.RemoteCertificate)
+                $issuer = $cert.Issuer
+                if (Test-PublicCaIssuer -Issuer $issuer) {
+                    Add-Result -Category "Connectivity" -Check "TLS issuer ($tlsHost)" -Result "Pass" -Detail "TLS to $tlsHost presents a public-CA certificate (issuer '$issuer') - no SSL inspection detected on this path."
+                }
+                else {
+                    $zscalerNote = if ($script:EgressInfo -and $script:EgressInfo.IsZscaler) { " This corroborates the ZSCALER egress signal above." } else { "" }
+                    Add-Result -Category "Connectivity" -Check "TLS issuer ($tlsHost)" -Result "Warn" -Detail "SSL inspection on path - $tlsHost presents a certificate issued by '$issuer' (enterprise/private root), i.e. a TLS-inspecting proxy is intercepting HTTPS from this machine. Expect this to also affect the installer's HTTPS and SQL/1433 paths.$zscalerNote"
+                    $script:TlsIssuerFindings = @($script:TlsIssuerFindings) + $issuer
+                }
+            }
+            catch {
+                Add-Result -Category "Connectivity" -Check "TLS issuer ($tlsHost)" -Result "Warn" -Detail "Could not complete a TLS issuer probe to $tlsHost. $($_.Exception.Message)"
+            }
+            finally {
+                if ($sslStream) { $sslStream.Dispose() }
+                if ($tcpClient) { $tcpClient.Dispose() }
+            }
+        }
+    }
+
+    # E14 - database-audience token check: acquire a token for the SQL/database audience with the
+    # install's exact call shape, so a tenant/audience mismatch that would break the installer's SQL
+    # step is surfaced here rather than mid-install. Mirrors the Key Vault audience token model above.
+    # SQL resource-id doesn't have a clean $AzEnv property across clouds (unlike Key Vault's
+    # AzureKeyVaultServiceEndpointResourceId) - fall back to the commercial audience and note the cloud.
+    $SqlAudience = "https://database.windows.net/"
+    $sqlAudienceCloudNote = if ($AzEnv.Name -and $AzEnv.Name -ne "AzureCloud") { " (cloud '$($AzEnv.Name)' - using the commercial database audience; verify this is correct for Gov/China if this check fails)" } else { "" }
+    try {
+        try {
+            Get-AzAccessToken -ResourceUrl $SqlAudience -TenantId $TenantId -AsSecureString -ErrorAction Stop | Out-Null
+        }
+        catch [System.Management.Automation.ParameterBindingException] {
+            # Older Az versions don't have -AsSecureString - fall back to the plain call. The token
+            # value is never inspected either way, only acquisition success/failure matters.
+            Get-AzAccessToken -ResourceUrl $SqlAudience -TenantId $TenantId -ErrorAction Stop | Out-Null
+        }
+        Add-Result -Category "Info" -Check "SQL/database access token" -Result "Pass" -Detail "Acquired a database-audience token for tenant $TenantId.$sqlAudienceCloudNote"
+    }
+    catch {
+        $sqlTokErrMsg = Get-DetailedErrorMessage -ErrorRecord $_
+        Add-Result -Category "Info" -Check "SQL/database access token" -Result "Fail" -Detail "Could not acquire a database-audience ($SqlAudience) token for the subscription's tenant $TenantId. The installer's SQL configuration step will fail. Inner error surfaced below.$sqlAudienceCloudNote" -Message $sqlTokErrMsg -RawMessage $sqlTokErrMsg
+        # Same issuer/tenant-mismatch pattern used by the later Key Vault AKV10032 check (that
+        # classifier isn't defined yet at this point in the script, so it's inlined here).
+        if ($sqlTokErrMsg -and ($sqlTokErrMsg -match "AKV10032" -or $sqlTokErrMsg -match "Invalid issuer" -or $sqlTokErrMsg -match "wrong issuer" -or $sqlTokErrMsg -match "tenant.*mismatch" -or $sqlTokErrMsg -match "AADSTS700016|AADSTS50020")) {
+            $NextSteps.Add("Could not acquire a database-audience token for tenant ${TenantId}: this account has access to multiple Entra tenants (guest/B2B) and the session could not be pinned to the subscription's owning tenant, so the SQL token was minted for/rejected by the wrong tenant. Reconnect to the correct tenant with 'Connect-AzAccount -TenantId $TenantId -UseDeviceAuthentication', then re-run this script to confirm the SQL/database access token check passes.")
+        }
+    }
+    #endregion Operator environment pre-checks
 
     # Resource group: existing (must be empty - NME installs only into a new or empty RG), or a
     # temporary one this script creates (after the naming/tag confirmation below).
@@ -2040,7 +2394,13 @@ try {
             }
             else {
                 $NewVnetDnsMode = "Custom"
+                # Azure Private DNS zones aren't how resolution works on custom DNS - there's no
+                # existing-vs-new zones question for this path. Test-PrivateDnsZones's
+                # $PrivateDnsZonesMode parameter is mandatory, so it still needs a non-null/non-empty
+                # value even though Test-PrivateDnsZones ignores it once $NewVnetDnsMode is "Custom".
+                $PrivateDnsZonesMode = "NotApplicable"
                 $zoneList = ($RequiredPrivateDnsZones | ForEach-Object { "$($_.Zone) ($($_.Purpose))" }) -join "; "
+                $ConfigSummary["Private DNS zones plan"] = "N/A - new VNet will use custom/on-prem DNS servers; resolution is handled by the custom DNS provider"
                 $ConfigSummary["Private DNS resolution (new VNet)"] = "Custom/on-prem DNS - the custom DNS server(s) must resolve: $zoneList"
             }
         }
@@ -2209,6 +2569,7 @@ try {
             # We return before the ConfigSummary is normally populated, so record enough here that the
             # report still shows the SE what was attempted.
             $ConfigSummary["Run by (signed-in account)"] = $SignedInAccountMasked
+            $ConfigSummary["Signed-in account type"] = $AccountTypeSummary
             $ConfigSummary["Subscription"] = "$($Context.Subscription.Name) ($SubscriptionId)"
             $ConfigSummary["Cloud"] = $AzEnv.Name
             $ConfigSummary["Region"] = $Location
@@ -2241,6 +2602,7 @@ try {
     # Record every input/response so the SE has a confirmed-working configuration to refer back to
     # once it's time to actually install NME.
     $ConfigSummary["Run by (signed-in account)"] = $SignedInAccountMasked
+    $ConfigSummary["Signed-in account type"] = $AccountTypeSummary
     $ConfigSummary["Subscription"] = "$($Context.Subscription.Name) ($SubscriptionId)"
     $ConfigSummary["Cloud"] = $AzEnv.Name
     $ConfigSummary["Region"] = $Location
@@ -2722,6 +3084,20 @@ try {
         }
         # The throwaway server uses SQL auth; the real installer uses Entra-only auth. Flag the gap.
         Add-Result -Category "Deployability" -Check "SQL Entra-only authentication" -Result "Info" -Detail "Not exercised - this test uses SQL authentication for the throwaway server, but the real installer configures Entra-only authentication (azureADOnlyAuthentication=true) with the app's managed identity as SQL admin. A policy requiring or forbidding AAD-only SQL auth is not validated here."
+
+        # Operator-machine SQL data-path probe (E13): everything above proves the SQL server can be
+        # created and firewalled, but never actually opens a connection to it from THIS machine - the
+        # only test that exercises the operator's own network path to 1433. AllowAllWindowsAzureIps
+        # (above) permits Azure services, not the operator's public IP, so without this probe a 1433
+        # block, a TLS-inspecting proxy on the SQL path, or a split-egress mismatch (web IP != SQL IP)
+        # would go undetected until install day. Not applicable under -PrivateEndpointOnly - there is
+        # no public data path to test.
+        if ($PrivateEndpointOnly) {
+            Add-Result -Category "Connectivity" -Check "SQL data path (operator -> 1433)" -Result "Info" -Detail "Not applicable - -PrivateEndpointOnly leaves no public data path to the SQL server to test from this machine."
+        }
+        else {
+            Test-SqlOperatorDataPath -ResourceGroupName $ResourceGroupName -ServerName $sqlName -Fqdn "$sqlName.$SqlSuffix" -EgressIp $script:EgressInfo.Ip -IsCloudShell $script:IsCloudShell
+        }
     }
 
     # --- Dependent deployment steps the installer performs that also get policy-blocked ---
@@ -2971,6 +3347,12 @@ try {
     }
     #endregion
 }
+catch {
+    # A throw anywhere above would otherwise skip straight to `finally` with $Results possibly empty
+    # or partial - record it as a Fail row so the report (and verdict) reflect an aborted run rather
+    # than rendering green on whatever little was collected before the throw.
+    Add-Result -Category "Info" -Check "Preflight run" -Result "Fail" -Detail "Script aborted before completion: $($_.Exception.Message)" -RawMessage (Get-DetailedErrorMessage -ErrorRecord $_)
+}
 finally {
     #region Reporting ----------------------------------------------------------------------------
     $summaryMeta = [pscustomobject]@{
@@ -2979,6 +3361,11 @@ finally {
         Cloud           = $(try { (Get-AzContext).Environment.Name } catch { "unknown" })
         Region          = $Location
         ResourceGroup   = $ResourceGroupName
+        PSVersion       = $(if ($script:PsIntegrity) { "$($script:PsIntegrity.Version) ($($script:PsIntegrity.Edition))" } else { "unknown" })
+        HostName        = $(try { [System.Net.Dns]::GetHostName() } catch { "unknown" })
+        EgressIp        = $(if ($script:IsCloudShell) { "Cloud Shell (n/a)" } elseif ($script:EgressInfo -and $script:EgressInfo.Ip) { $script:EgressInfo.Ip } else { "unknown" })
+        EgressAsn       = $(if ($script:IsCloudShell) { "Cloud Shell (n/a)" } elseif ($script:EgressInfo -and $script:EgressInfo.Asn) { $script:EgressInfo.Asn } else { "unknown" })
+        TlsIssuers      = $(if ($script:TlsIssuerFindings) { ($script:TlsIssuerFindings -join "; ") } else { "none (public CA or not probed)" })
     }
     $rawJson = $null
     try {
