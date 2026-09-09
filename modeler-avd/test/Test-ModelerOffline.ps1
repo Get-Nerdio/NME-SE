@@ -7,15 +7,22 @@ $wsId    = '/subscriptions/s1/resourcegroups/rg1/providers/microsoft.operational
 $wsId2   = '/subscriptions/s1/resourcegroups/rg1/providers/microsoft.operationalinsights/workspaces/ws2'   # v0.17.3: network-blocked (NSP)
 $saProf  = '/subscriptions/s1/resourcegroups/rg-stor/providers/microsoft.storage/storageaccounts/stprofiles'
 $saGen   = '/subscriptions/s1/resourcegroups/rg-stor/providers/microsoft.storage/storageaccounts/stgen'
-$anfPool = '/subscriptions/s1/resourcegroups/rg-anf/providers/microsoft.netapp/netappaccounts/anf1/capacitypools/pool1'
+# v0.19: ANF lives in subscription s2 so ONE run exercises both cost paths:
+#   s1 -> one subscription-level query (429 w/ Retry-After first, then 200)
+#   s2 -> subscription-level query refused (403) -> per-RG fallback -> rg-anf
+#         throttled through the whole first pass -> recovered on the second pass
+$anfPool = '/subscriptions/s2/resourcegroups/rg-anf/providers/microsoft.netapp/netappaccounts/anf1/capacitypools/pool1'
 
 # v0.15: storage is ledger-only, no prompts - nothing to mock for input.
 
 function Get-AzContext { [pscustomobject]@{ Name = 'mock'; Account = [pscustomobject]@{ Id = 'don@mock.test' }; Tenant = [pscustomobject]@{ Id = 'ten-1' } } }
 $global:ArgSubScopes = @()   # v0.17: every ARG payload's subscriptions array, for the scope-pinning check
-$global:CostAnfCalls = 0     # v0.17.3: rg-anf cost scope always answers 429 - proves 3 attempts + polite skip
+$global:CostAnfCalls = 0     # v0.19: rg-anf answers 429 for 6 calls (one full retry budget), 200 on the 7th (second pass)
+$global:CostS1SubCalls = 0   # v0.19: subscription-level s1 query: 429 + Retry-After on the first call, 200 on the second
+$global:CostS2SubCalls = 0   # v0.19: subscription-level s2 query: refused (403) -> per-RG fallback
+$global:CostFilterRGs = @()  # v0.19: ResourceGroupName filter values seen on the s1 subscription query
 function Invoke-AzRestMethod {
-    param([string]$Method, [string]$Path, [string]$Payload)
+    param([string]$Method, [string]$Path, [string]$Payload, [string]$Uri)
     if ($Method -eq 'GET' -and $Path.StartsWith('/subscriptions?')) {
         return [pscustomobject]@{ StatusCode = 200; Content = (@{ value = @(
             @{ subscriptionId = 's1'; displayName = 'Sub One'; state = 'Enabled' },
@@ -106,11 +113,31 @@ function Invoke-AzRestMethod {
     }
     if ($Method -eq 'POST' -and $Path -like '*Microsoft.CostManagement/query*') {
         $rows = @()
-        if ($Path -like '*resourcegroups/rg-anf*') {
+        $throttled = '{"error":{"message":"Too many requests. Please retry."}}'
+        if ($Path -like '/subscriptions/s1/providers/*') {
+            # v0.19 fast path: one subscription-level query, filtered to the RGs that matter.
+            $global:CostS1SubCalls++
+            try { $global:CostFilterRGs = @((($Payload | ConvertFrom-Json).dataset.filter.and | Where-Object { $_.dimensions.name -eq 'ResourceGroupName' }).dimensions.values) } catch { }
+            if ($global:CostS1SubCalls -eq 1) {
+                return [pscustomobject]@{ StatusCode = 429; Content = $throttled; Headers = @{ 'Retry-After' = '7' } }
+            }
+            $rows += ,@(100.50, '/subscriptions/s1/resourcegroups/rg1/providers/microsoft.compute/virtualmachines/vm1', 'USD')
+            $rows += ,@(50.25,  '/subscriptions/s1/resourcegroups/rg1/providers/microsoft.compute/virtualmachines/vm2', 'USD')
+            $rows += ,@(10.00,  '/subscriptions/s1/resourcegroups/rg1/providers/microsoft.compute/disks/d1', 'USD')
+            $rows += ,@(42.00,  $saProf.ToLower(), 'USD')
+        } elseif ($Path -like '/subscriptions/s2/providers/*') {
+            # v0.19 fallback trigger: subscription-level query refused -> per-RG path.
+            $global:CostS2SubCalls++
+            return [pscustomobject]@{ StatusCode = 403; Content = '{"error":{"message":"The client does not have authorization to perform action Microsoft.CostManagement/query/action over scope /subscriptions/s2"}}' }
+        } elseif ($Path -like '*resourcegroups/rg-anf*') {
+            # v0.19 second pass: a scope throttled through its whole first-pass budget
+            # (6 attempts) must be recovered after the cooldown, not skipped.
             $global:CostAnfCalls++
-            return [pscustomobject]@{ StatusCode = 429; Content = '{"error":{"message":"Too many requests. Please retry."}}' }
-        }
-        if ($Path -like '*resourcegroups/rg-stor*') {
+            if ($global:CostAnfCalls -le 6) {
+                return [pscustomobject]@{ StatusCode = 429; Content = $throttled; Headers = @{ 'x-ms-ratelimit-microsoft.consumption-tenant-retry-after' = '3' } }
+            }
+            $rows += ,@(77.00, $anfPool.ToLower(), 'USD')
+        } elseif ($Path -like '*resourcegroups/rg-stor*') {
             $rows += ,@(42.00, $saProf.ToLower(), 'USD')
         } else {
             $rows += ,@(100.50, '/subscriptions/s1/resourcegroups/rg1/providers/microsoft.compute/virtualmachines/vm1', 'USD')
@@ -127,7 +154,7 @@ function Invoke-AzRestMethod {
 function Get-AzAccessToken { param([string]$ResourceUrl) [pscustomobject]@{ Token = 'mock-token' } }
 function Invoke-RestMethod {
     param($Method, $Uri, $Headers, $ContentType, $Body, $TimeoutSec)
-    if ("$Uri" -match 'modeler/VERSION') { return 'v0.18' }   # stale-copy self-check: report current
+    if ("$Uri" -match 'modeler/VERSION') { return 'v0.19' }   # stale-copy self-check: report current
     if ("$Uri" -notmatch 'api\.loganalytics\.io') { throw "unexpected Invoke-RestMethod uri in test: $Uri" }
     if ("$Uri" -match '22222222') { throw 'Response status code does not indicate success: 403 (Forbidden). NspValidationFailedError: Access to workspace ws2 from 1.2.3.4 is denied. To allow access from public networks, change the workspace Networking settings or add it to a Network Security Perimeter.' }
     $q = ($Body | ConvertFrom-Json).query
@@ -149,7 +176,7 @@ function Invoke-RestMethod {
 }
 
 Remove-Item /tmp/test-model*.* -Force -ErrorAction SilentlyContinue
-$env:MODELER_FAST_RETRY = '1'   # v0.17.3: skip the 20s/60s cost-429 waits in the harness
+$env:MODELER_FAST_RETRY = '1'   # v0.19: skip every throttle wait and the 90s cooldown in the harness
 & "$PSScriptRoot/../Get-NerdioModelerJson.ps1" -SkipDownload -OutFile /tmp/test-model.json -ModelName 'TEST'
 Remove-Item Env:MODELER_FAST_RETRY -ErrorAction SilentlyContinue
 
@@ -199,14 +226,19 @@ $checks = [ordered]@{
     'console log captured + clean'      = ($log -match 'Assembling deployments' -and $log -notmatch [char]27)
     'no raw-export failure in log'      = ($log -notmatch 'Raw data export failed' -and $log -match 'Raw decision data written')
     'counters exclude storage rows'     = ($log -match 'Usage found for 1 of 2 pool')
-    'rawdata sane + version + evidence' = ($null -ne $rawJson -and @($rawJson.pools).Count -eq 2 -and $rawJson.meta.version -eq 'v0.18' -and @($rawJson.storageCandidates).Count -eq 4 -and @($rawJson.mapEvidence).Count -ge 1)
-    'version is the first output line'  = ($log -match '(?m)^\[i\] Get-NerdioModelerJson v0\.18' -and ($log.IndexOf('Get-NerdioModelerJson v0.18') -lt $log.IndexOf('Signed in as')))
+    'rawdata sane + version + evidence' = ($null -ne $rawJson -and @($rawJson.pools).Count -eq 2 -and $rawJson.meta.version -eq 'v0.19' -and @($rawJson.storageCandidates).Count -eq 4 -and @($rawJson.mapEvidence).Count -ge 1)
+    'version is the first output line'  = ($log -match '(?m)^\[i\] Get-NerdioModelerJson v0\.19' -and ($log.IndexOf('Get-NerdioModelerJson v0.19') -lt $log.IndexOf('Signed in as')))
     'mixed-size pool: mode wins'        = ($a.workload.vmSize -eq 'Standard_D8s_v5' -and $a.image.type -eq 1 -and $a.workload.disk.size -eq 128 -and $a.workload.disk.type -eq 'Premium_LRS')
     'no stale-copy warning (current)'   = ($log -notmatch 'THIS COPY IS STALE')
     'empty pool: out of JSON, reported' = (@($m.deployments | Where-Object { $_.name -like 'PoolEmpty*' }).Count -eq 0 -and @($m.deployments).Count -eq 1 -and $rowEmpty.Flags -match '^EMPTY - excluded' -and $rowEmpty.VmSize -eq '-' -and $rowEmpty.Window -eq '-' -and $rowEmpty.ActualMo -eq '0' -and @($rawJson.emptyPools).Count -eq 1 -and $rawJson.emptyPools[0].name -eq 'PoolEmpty' -and $log -match '1 EMPTY host pool\(s\) excluded' -and $log -match '1 deployments; 1 empty pool\(s\) excluded')
     'NSP workspace named + fix given'   = ($log -match 'BLOCKED BY ITS NETWORK SETTINGS' -and $log -match 'inside the customer network')
-    'cost 429: three attempts made'     = ($global:CostAnfCalls -eq 3)
-    'cost 429: throttle msg, no causes' = ($log -match 'throttling that outlasted 3 attempts' -and $log -match 'Cost query skipped for rg-anf' -and $log -notmatch 'Common causes')
+    'cost: ONE sub query for s1, filtered'  = ($global:CostS1SubCalls -eq 2 -and @($global:CostFilterRGs).Count -eq 2 -and ($global:CostFilterRGs -contains 'rg1') -and ($global:CostFilterRGs -contains 'rg-stor'))
+    'cost: Retry-After honored (7s)'        = ($log -match 'Cost Management is throttling \(HTTP 429\) and asked for a 7s pause - honoring it')
+    'cost: s2 403 -> per-RG fallback'       = ($global:CostS2SubCalls -le 2 -and $log -match 'Subscription-level cost query for s2 was refused \(HTTP 403' -and $log -match 'falling back to one query per resource group')
+    'cost: rg-anf 6 tries, then 2nd pass'   = ($global:CostAnfCalls -eq 7 -and $log -match 'Cooling down 90s' -and $log -match 'Recovered on the second pass: resource group rg-anf' -and $log -match 'asked for a 3s pause')
+    'cost: NOTHING skipped or lost'         = ($log -notmatch 'Cost query skipped' -and $log -match 'Nothing was lost to throttling' -and $log -notmatch 'Common causes')
+    'ledger: anf ActualMo 77 (recovered)'   = ($lAnf.ActualMo -eq '77')
+    'rawdata: throttle history recorded'    = ($rawJson.throttle.hits -eq 7 -and $rawJson.throttle.waitedSeconds -eq 22 -and $rawJson.throttle.byService.'Cost Management' -eq 7 -and @($rawJson.throttle.recoveredOnSecondPass).Count -eq 1 -and $rawJson.throttle.recoveredOnSecondPass[0] -eq 'rg-anf' -and @($rawJson.costSkipped).Count -eq 0)
     'ARG pinned to enabled subs s1+s2'  = $(
         $ok = (@($global:ArgSubScopes).Count -ge 5)
         foreach ($sc in $global:ArgSubScopes) { if (@($sc).Count -ne 2 -or @($sc)[0] -ne 's1' -or @($sc)[1] -ne 's2') { $ok = $false } }

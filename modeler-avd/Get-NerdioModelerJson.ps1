@@ -59,6 +59,30 @@
     ./modeler.ps1 -TimeZone 'America/Chicago' -ModelName 'Contoso - Actuals'
 
 .NOTES
+    v0.19 (2026-09-09). NO DATA LOST TO THROTTLING. A 6-scope customer run
+    lost one resource group's actuals to Cost Management HTTP 429s, which
+    meant an estimated number in a CIO-facing model. Three changes, in the
+    order they matter:
+    (1) FEWER CALLS. Cost is now pulled with ONE query per subscription,
+    filtered to the resource groups that hold session hosts and profile
+    storage, instead of one query per resource group. The 6-scope run made
+    up to 36 calls in a burst (Amortized then Actual, three tries each);
+    it now makes one. If a subscription-level query is refused (Reader
+    granted per resource group, offer quirks), that subscription falls back
+    to the per-resource-group path on its own.
+    (2) HONOR RETRY-AFTER. Every Azure REST call (Cost Management, Resource
+    Graph, ARM, Log Analytics) now reads the header a 429 carries - Retry-
+    After in seconds or as a date, x-ms-user-quota-resets-after on Resource
+    Graph - and waits exactly that long before asking again, up to six
+    attempts inside a five-minute budget per call. Fixed 20s/60s waits
+    guessed at the window; this uses Azure's own answer. Cost calls are also
+    paced 1.5s apart. Every wait is printed, so a slow step never looks hung.
+    (3) SECOND PASS. Anything still throttled after its budget is set aside,
+    the run finishes everything else, cools down 90s so the rate window
+    resets, and tries those scopes once more before giving up. A scope that
+    fails both passes is reported as throttled, with the attempt count and
+    seconds waited, and rawdata.json records the whole throttle history.
+    MODELER_FAST_RETRY=1 skips the waits (dev harness only).
     v0.18 (2026-08-17). EMPTY HOST POOLS STAY OUT OF THE JSON - SE field
     feedback: a 114-pool tenant carried 38 pool objects with no session
     hosts and no activity, and each exported as a fake 1-user 9:00+9h
@@ -318,7 +342,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = 'v0.18'   # RELEASE RULE: bump modeler/VERSION in the same commit
+$ScriptVersion = 'v0.19'   # RELEASE RULE: bump modeler/VERSION in the same commit
 # Windows PowerShell 5.1 compatibility: force TLS 1.2 (old .NET Framework
 # defaults can be lower and ARM/Log Analytics require 1.2), and no PS7-only
 # syntax anywhere in this file (?? / ?. / -AsPlainText / utf8NoBOM).
@@ -351,6 +375,74 @@ if ([string]::IsNullOrEmpty($OutFile)) {
 function Write-Info { param([string]$m) Write-Host "[i] $m" -ForegroundColor Gray }
 function Write-Ok   { param([string]$m) Write-Host "[+] $m" -ForegroundColor Green }
 function Write-Warn2{ param([string]$m) Write-Host "[!] $m" -ForegroundColor Yellow }
+
+# --- throttling: honor Azure's own Retry-After, never lose data to a 429 (v0.19) ---
+# Azure services that throttle (Cost Management most of all; Resource Graph and
+# Log Analytics on big estates) answer HTTP 429 WITH a header that says how long
+# to wait: Retry-After (seconds, or an HTTP date), or on Resource Graph
+# x-ms-user-quota-resets-after (hh:mm:ss). Waiting exactly that long and asking
+# again is the documented contract. The previous fixed 20s/60s waits guessed at
+# the window and lost a resource group's actuals on a 6-scope customer run.
+$script:Throttle = @{ Hits = 0; WaitedSeconds = 0; Services = @{}; Recovered = @() }
+function Get-RetryAfterSeconds {
+    # Accepts an Invoke-AzRestMethod response (.Headers), a plain hashtable of
+    # headers, or an ErrorRecord from Invoke-RestMethod (.Exception.Response.Headers).
+    # Returns whole seconds, or $null when no usable header is present.
+    param($Source)
+    $hdrs = $null
+    try {
+        if ($null -eq $Source) { return $null }
+        if ($Source -is [System.Management.Automation.ErrorRecord]) { $hdrs = $Source.Exception.Response.Headers }
+        elseif ($Source -is [System.Collections.IDictionary]) { $hdrs = $Source }
+        elseif ($Source.PSObject.Properties['Headers']) { $hdrs = $Source.Headers }
+    } catch { return $null }
+    if ($null -eq $hdrs) { return $null }
+    $pairs = @()
+    try {
+        if ($hdrs -is [System.Collections.IDictionary]) { foreach ($k in @($hdrs.Keys)) { $pairs += ,@("$k", @($hdrs[$k])) } }
+        elseif ($hdrs.PSObject.Properties['AllKeys']) { foreach ($k in @($hdrs.AllKeys)) { $pairs += ,@("$k", @($hdrs[$k])) } }   # WebHeaderCollection (5.1)
+        else { foreach ($h in $hdrs) { $pairs += ,@("$($h.Key)", @($h.Value)) } }                                             # HttpResponseHeaders (Az, PS7)
+    } catch { return $null }
+    $best = $null
+    foreach ($p in $pairs) {
+        if ($p[0] -notmatch '(?i)retry-after|resets-after') { continue }
+        foreach ($v in $p[1]) {
+            $s = "$v".Trim(); $secs = $null; $n = 0; $ts = [TimeSpan]::Zero; $dt = [DateTime]::MinValue
+            if ([int]::TryParse($s, [ref]$n)) { $secs = $n }
+            elseif ([TimeSpan]::TryParse($s, [ref]$ts)) { $secs = [int][Math]::Ceiling($ts.TotalSeconds) }
+            elseif ([DateTime]::TryParse($s, [ref]$dt)) { $secs = [int][Math]::Ceiling(($dt.ToUniversalTime() - [DateTime]::UtcNow).TotalSeconds) }
+            if ($null -ne $secs -and $secs -ge 0 -and ($null -eq $best -or $secs -gt $best)) { $best = $secs }
+        }
+    }
+    return $best
+}
+function Invoke-AzRestRetry {
+    # Invoke-AzRestMethod with the 429/503 contract handled: wait what Azure asks
+    # (capped at 120s; backoff 5/15/30/60/90s when no header), up to MaxAttempts
+    # inside BudgetSeconds. Returns the last response either way - callers keep
+    # their own status handling. Every wait is printed so a slow step never
+    # looks hung. MODELER_FAST_RETRY=1 skips the sleeps (harness only).
+    param([string]$Method = 'GET', [string]$Path, [string]$Uri, [string]$Payload, [string]$What = 'Azure',
+          [int]$MaxAttempts = 6, [int]$BudgetSeconds = 300)
+    $started = [DateTime]::UtcNow
+    for ($attempt = 1; ; $attempt++) {
+        $call = @{ Method = $Method }
+        if ($Uri) { $call.Uri = $Uri } else { $call.Path = $Path }
+        if ($Payload) { $call.Payload = $Payload }
+        $resp = Invoke-AzRestMethod @call
+        if ($resp.StatusCode -ne 429 -and $resp.StatusCode -ne 503) { return $resp }
+        $script:Throttle.Hits++
+        $script:Throttle.Services[$What] = 1 + [int](Coalesce $script:Throttle.Services[$What] 0)
+        $elapsed = ([DateTime]::UtcNow - $started).TotalSeconds
+        if ($attempt -ge $MaxAttempts -or $elapsed -ge $BudgetSeconds) { return $resp }
+        $asked = Get-RetryAfterSeconds $resp
+        $wait = if ($null -ne $asked) { [Math]::Min([Math]::Max([int]$asked, 1), 120) } else { @(5, 15, 30, 60, 90)[[Math]::Min($attempt - 1, 4)] }
+        if ($null -ne $asked) { Write-Info "$What is throttling (HTTP $($resp.StatusCode)) and asked for a $($asked)s pause - honoring it, then trying again (attempt $attempt of $MaxAttempts)." }
+        else { Write-Info "$What is throttling (HTTP $($resp.StatusCode)) without saying how long - waiting $($wait)s, then trying again (attempt $attempt of $MaxAttempts)." }
+        $script:Throttle.WaitedSeconds += $wait
+        if ($env:MODELER_FAST_RETRY -ne '1') { Start-Sleep -Seconds $wait }
+    }
+}
 
 # --- console transcript: captured into the output zip so one run = one file back ---
 $script:TranscriptFile = ($OutFile -replace '\.json$', '') + '-console.log'
@@ -415,7 +507,7 @@ function Invoke-ArgQuery {
             $body = @{ query = $Query; options = @{ resultFormat = 'objectArray' } }
             if ($null -ne $chunk) { $body.subscriptions = @($chunk) }
             if ($skip) { $body.options.'$skipToken' = $skip }
-            $resp = Invoke-AzRestMethod -Method POST -Path "/providers/Microsoft.ResourceGraph/resources?api-version=2022-10-01" -Payload ($body | ConvertTo-Json -Depth 6)
+            $resp = Invoke-AzRestRetry -Method POST -Path "/providers/Microsoft.ResourceGraph/resources?api-version=2022-10-01" -Payload ($body | ConvertTo-Json -Depth 6) -What 'Resource Graph'
             if ($resp.StatusCode -ne 200) { throw "Resource Graph query failed (HTTP $($resp.StatusCode)): $($resp.Content)" }
             $parsed = $resp.Content | ConvertFrom-Json
             $all += @($parsed.data)
@@ -425,15 +517,24 @@ function Invoke-ArgQuery {
     return $all
 }
 
-# --- Cost Management Query API, one RG scope at a time (skip-safe; see .NOTES) ---
+# --- Cost Management Query API (skip-safe; see .NOTES v0.19) --------------------
+# One query per SUBSCRIPTION, filtered to the resource groups that matter, is the
+# normal path; the per-resource-group scope is the fallback when a subscription-
+# level query is refused. Both go through Invoke-AzRestRetry, so a 429 waits what
+# Azure asks instead of guessing. Calls are paced 1.5s apart on top of that.
+$script:LastCostCallUtc = $null
 function Get-ActualCostRows {
-    param([string]$Scope, [string]$CostType = 'ActualCost')
+    param([string]$Scope, [string]$CostType = 'ActualCost', [string[]]$ResourceGroupFilter = @())
     # The API dropped support for timeframe 'TheLastMonth' (HTTP 400: "currently not
     # supported") - use an explicit Custom range covering last calendar month (UTC).
     $utcNow = [DateTime]::UtcNow
     $firstOfThisMonth = [DateTime]::new($utcNow.Year, $utcNow.Month, 1, 0, 0, 0, [DateTimeKind]::Utc)
     $lastMonthStart = $firstOfThisMonth.AddMonths(-1)
     $lastMonthEnd = $firstOfThisMonth.AddDays(-1)
+    $svcFilter = @{ dimensions = @{ name = 'ServiceName'; operator = 'In'; values = @('Virtual Machines', 'Storage') } }
+    $filter = if ($ResourceGroupFilter.Count -gt 0) {
+        @{ and = @($svcFilter, @{ dimensions = @{ name = 'ResourceGroupName'; operator = 'In'; values = @($ResourceGroupFilter) } }) }
+    } else { $svcFilter }
     $body = @{
         type = $CostType
         timeframe = 'Custom'
@@ -444,23 +545,18 @@ function Get-ActualCostRows {
         dataset = @{
             aggregation = @{ totalCost = @{ name = 'Cost'; function = 'Sum' } }
             grouping = @(@{ type = 'Dimension'; name = 'ResourceId' })
-            filter = @{ dimensions = @{ name = 'ServiceName'; operator = 'In'; values = @('Virtual Machines', 'Storage') } }
+            filter = $filter
         }
-    } | ConvertTo-Json -Depth 8
+    } | ConvertTo-Json -Depth 10
     $rows = @(); $nextUri = $null; $first = $true
     while ($first -or $nextUri) {
-        $resp = $null
-        # Cost Management throttles hard at enterprise scale: an 18-scope run
-        # lost one RG to back-to-back 429s with a single 20s retry. Three
-        # attempts now, waiting 20s then 60s. (MODELER_FAST_RETRY=1 skips the
-        # waits - dev harness only.)
-        $retryWaits = @(20, 60)
-        foreach ($try in 0..$retryWaits.Count) {
-            $resp = if ($nextUri) { Invoke-AzRestMethod -Method POST -Uri $nextUri -Payload $body }
-                    else { Invoke-AzRestMethod -Method POST -Path "$Scope/providers/Microsoft.CostManagement/query?api-version=2023-03-01" -Payload $body }
-            if ($resp.StatusCode -ne 429) { break }
-            if ($try -lt $retryWaits.Count -and $env:MODELER_FAST_RETRY -ne '1') { Start-Sleep -Seconds $retryWaits[$try] }
+        if ($script:LastCostCallUtc -and $env:MODELER_FAST_RETRY -ne '1') {
+            $gapMs = ([DateTime]::UtcNow - $script:LastCostCallUtc).TotalMilliseconds
+            if ($gapMs -lt 1500) { Start-Sleep -Milliseconds ([int](1500 - $gapMs)) }
         }
+        $script:LastCostCallUtc = [DateTime]::UtcNow
+        $resp = if ($nextUri) { Invoke-AzRestRetry -Method POST -Uri $nextUri -Payload $body -What 'Cost Management' }
+                else { Invoke-AzRestRetry -Method POST -Path "$Scope/providers/Microsoft.CostManagement/query?api-version=2023-03-01" -Payload $body -What 'Cost Management' }
         if ($resp.StatusCode -ne 200) {
             $msg = ''
             try { $msg = "$((($resp.Content | ConvertFrom-Json).error.message))" } catch { $msg = "$($resp.Content)" }
@@ -481,6 +577,19 @@ function Get-ActualCostRows {
         $first = $false
     }
     return @{ ok = $true; rows = $rows }
+}
+# One cost scope, both cost types. AmortizedCost spreads RI/Savings Plan purchases
+# across usage (the honest number for reserved customers); PAYG-type offers reject
+# it, so fall back to ActualCost. EXCEPT on 429: throttling is rate-based, not
+# cost-type-specific - asking for the other type just doubles the hammering.
+function Invoke-CostScope {
+    param($Item)
+    $filter = @(if ($Item.Kind -eq 'sub') { $Item.RGs } else { @() })
+    try { $res = Get-ActualCostRows -Scope $Item.Scope -CostType 'AmortizedCost' -ResourceGroupFilter $filter } catch { $res = @{ ok = $false; status = "error: $($_.Exception.Message)" } }
+    if (-not $res.ok -and "$($res.status)" -notmatch '^HTTP 429') {
+        try { $res = Get-ActualCostRows -Scope $Item.Scope -CostType 'ActualCost' -ResourceGroupFilter $filter } catch { $res = @{ ok = $false; status = "error: $($_.Exception.Message)" } }
+    }
+    return $res
 }
 
 if (-not (Get-AzContext)) {
@@ -506,7 +615,7 @@ try {
     $subsRaw = @()
     $nextPath = "/subscriptions?api-version=2020-01-01"
     while ($nextPath) {
-        $resp = Invoke-AzRestMethod -Method GET -Path $nextPath
+        $resp = Invoke-AzRestRetry -Method GET -Path $nextPath
         if ($resp.StatusCode -ne 200) { throw "HTTP $($resp.StatusCode): $($resp.Content)" }
         $parsed = $resp.Content | ConvertFrom-Json
         $subsRaw += @($parsed.value)
@@ -543,7 +652,7 @@ if ($SubscriptionId.Count -gt 0) {
 # One run covers ONE tenant. If this sign-in can reach others, say so out loud -
 # "the environment" may be bigger than what this run can see.
 try {
-    $tResp = Invoke-AzRestMethod -Method GET -Path "/tenants?api-version=2020-01-01"
+    $tResp = Invoke-AzRestRetry -Method GET -Path "/tenants?api-version=2020-01-01"
     if ($tResp.StatusCode -eq 200) {
         $otherTenants = @((($tResp.Content | ConvertFrom-Json).value) | Where-Object { "$($_.tenantId)" -ne "$($script:TenText)" })
         if ($otherTenants.Count -gt 0) {
@@ -570,9 +679,28 @@ function Invoke-LaQuery {
         $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($tok.Token)
         try { [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) } finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
     } else { "$($tok.Token)" }
-    $resp = Invoke-RestMethod -Method Post -Uri "https://api.loganalytics.io/v1/workspaces/$WorkspaceCustomerId/query" `
-        -Headers @{ Authorization = "Bearer $tokenText" } -ContentType 'application/json' `
-        -Body (@{ query = $Query } | ConvertTo-Json -Depth 4 -Compress)
+    # v0.19: Log Analytics throttles too (HTTP 429 with Retry-After). Invoke-RestMethod
+    # throws on it, so catch, read the header off the exception, wait, ask again.
+    $resp = $null
+    for ($attempt = 1; $attempt -le 5; $attempt++) {
+        try {
+            $resp = Invoke-RestMethod -Method Post -Uri "https://api.loganalytics.io/v1/workspaces/$WorkspaceCustomerId/query" `
+                -Headers @{ Authorization = "Bearer $tokenText" } -ContentType 'application/json' `
+                -Body (@{ query = $Query } | ConvertTo-Json -Depth 4 -Compress)
+            break
+        } catch {
+            $code = 0; try { $code = [int]$_.Exception.Response.StatusCode } catch { $code = 0 }
+            $isThrottle = ($code -eq 429) -or ("$($_.Exception.Message)" -match '\b429\b')
+            if (-not $isThrottle -or $attempt -ge 5) { throw }
+            $asked = Get-RetryAfterSeconds $_
+            $wait = if ($null -ne $asked) { [Math]::Min([Math]::Max([int]$asked, 1), 120) } else { @(5, 15, 30, 60)[[Math]::Min($attempt - 1, 3)] }
+            $script:Throttle.Hits++
+            $script:Throttle.Services['Log Analytics'] = 1 + [int](Coalesce $script:Throttle.Services['Log Analytics'] 0)
+            $script:Throttle.WaitedSeconds += $wait
+            Write-Info "Log Analytics is throttling (HTTP 429)$(if ($null -ne $asked) { " and asked for a $($asked)s pause" }) - waiting $($wait)s, then trying again (attempt $attempt of 5)."
+            if ($env:MODELER_FAST_RETRY -ne '1') { Start-Sleep -Seconds $wait }
+        }
+    }
     $table = @($resp.tables) | Select-Object -First 1
     $rows = [System.Collections.Generic.List[object]]::new()
     if ($table) {
@@ -679,7 +807,7 @@ Write-Info "[3/8] Discovering Log Analytics workspaces from host pool diagnostic
 $workspaceIds = @{}   # workspaceResourceId -> $true
 foreach ($p in $pools) {
     try {
-        $resp = Invoke-AzRestMethod -Method GET -Path "$($p.id)/providers/Microsoft.Insights/diagnosticSettings?api-version=2021-05-01-preview"
+        $resp = Invoke-AzRestRetry -Method GET -Path "$($p.id)/providers/Microsoft.Insights/diagnosticSettings?api-version=2021-05-01-preview"
         if ($resp.StatusCode -eq 200) {
             foreach ($ds in (($resp.Content | ConvertFrom-Json).value)) {
                 if ($ds.properties.workspaceId) { $workspaceIds[$ds.properties.workspaceId.ToLower()] = $true }
@@ -767,7 +895,7 @@ $usage = @{}   # poolIdLower -> usage row (keep highest peak if seen in multiple
 $usageRows = 0
 foreach ($wsId in $workspaceIds.Keys) {
     try {
-        $wsResp = Invoke-AzRestMethod -Method GET -Path "$wsId`?api-version=2021-06-01"
+        $wsResp = Invoke-AzRestRetry -Method GET -Path "$wsId`?api-version=2021-06-01"
         if ($wsResp.StatusCode -ne 200) { Write-Warn2 "Cannot read workspace $wsId (HTTP $($wsResp.StatusCode)) - skipping."; continue }
         $customerId = ($wsResp.Content | ConvertFrom-Json).properties.customerId
         $result = Invoke-LaQuery -WorkspaceCustomerId $customerId -Query $telemetryKql
@@ -818,7 +946,7 @@ function Get-FileShareUsedGbFromMetrics {
     param([string]$AccountId, [string]$ShareName)
     try {
         $uri = "$AccountId/fileServices/default/providers/Microsoft.Insights/metrics?api-version=2019-07-01&metricnames=FileCapacity&aggregation=Average&interval=PT1H&timespan=PT2H" + "&`$filter=FileShare eq '$ShareName'"
-        $r = Invoke-AzRestMethod -Method GET -Path $uri
+        $r = Invoke-AzRestRetry -Method GET -Path $uri
         if ($r.StatusCode -ne 200) { return $null }
         $m = @((($r.Content | ConvertFrom-Json).value)) | Select-Object -First 1
         $pts = @($m.timeseries | ForEach-Object { $_.data } | Where-Object { $null -ne $_.average -and $_.average -gt 0 })
@@ -870,7 +998,7 @@ foreach ($sa in $storAccts) {
         $isPremium = $sku -match '^(?i)Premium'
         $isV2 = $sku -match '(?i)V2_'
         $provisionedModel = $isPremium -or $isV2   # premium (v1/v2) and standardV2 bill PROVISIONED; v1 standard bills USED
-        $shResp = Invoke-AzRestMethod -Method GET -Path "$($sa.id)/fileServices/default/shares?api-version=2023-01-01"
+        $shResp = Invoke-AzRestRetry -Method GET -Path "$($sa.id)/fileServices/default/shares?api-version=2023-01-01"
         if ($shResp.StatusCode -ne 200) { continue }   # no file service or not visible
         foreach ($sh in @((($shResp.Content | ConvertFrom-Json).value))) {
             $shName = "$($sh.name)"
@@ -880,8 +1008,8 @@ foreach ($sa in $storAccts) {
             $censusShares++
             $usedGb = $null; $usedSource = ''
             try {
-                $stResp = Invoke-AzRestMethod -Method GET -Path "$($sa.id)/fileServices/default/shares/$($shName)?api-version=2023-01-01&`$expand=stats"
-                if ($stResp.StatusCode -ne 200) { $stResp = Invoke-AzRestMethod -Method GET -Path "$($sa.id)/fileServices/default/shares/$($shName)?api-version=2023-01-01&`$expand=stats" }
+                $stResp = Invoke-AzRestRetry -Method GET -Path "$($sa.id)/fileServices/default/shares/$($shName)?api-version=2023-01-01&`$expand=stats"
+                if ($stResp.StatusCode -ne 200) { $stResp = Invoke-AzRestRetry -Method GET -Path "$($sa.id)/fileServices/default/shares/$($shName)?api-version=2023-01-01&`$expand=stats" }
                 if ($stResp.StatusCode -eq 200) {
                     $stProps = ($stResp.Content | ConvertFrom-Json).properties
                     if ($null -ne $stProps.shareUsageBytes) { $usedGb = [Math]::Round($stProps.shareUsageBytes / 1GB, 1); $usedSource = 'stats' }
@@ -965,7 +1093,7 @@ resources
         $usedSum = $null
         foreach ($v in $volsSmb) {
             try {
-                $mr = Invoke-AzRestMethod -Method GET -Path "$($v.id)/providers/Microsoft.Insights/metrics?api-version=2019-07-01&metricnames=VolumeLogicalSize&aggregation=Average&interval=PT1H&timespan=PT2H"
+                $mr = Invoke-AzRestRetry -Method GET -Path "$($v.id)/providers/Microsoft.Insights/metrics?api-version=2019-07-01&metricnames=VolumeLogicalSize&aggregation=Average&interval=PT1H&timespan=PT2H"
                 if ($mr.StatusCode -eq 200) {
                     $mm = @((($mr.Content | ConvertFrom-Json).value)) | Select-Object -First 1
                     $pts = @($mm.timeseries | ForEach-Object { $_.data } | Where-Object { $null -ne $_.average -and $_.average -gt 0 })
@@ -1009,7 +1137,7 @@ if ($storageCandidates.Count -gt 0 -and $workspaceIds.Keys.Count -gt 0 -and -not
     foreach ($k in $workspaceIds.Keys) { $mapWorkspaceIds[$k] = $true }
     foreach ($acctId in (@($storageCandidates | Where-Object { $_.Kind -notmatch 'NetApp' } | ForEach-Object { $_.ResourceId }) | Select-Object -Unique)) {
         try {
-            $dsResp = Invoke-AzRestMethod -Method GET -Path "$acctId/fileServices/default/providers/Microsoft.Insights/diagnosticSettings?api-version=2021-05-01-preview"
+            $dsResp = Invoke-AzRestRetry -Method GET -Path "$acctId/fileServices/default/providers/Microsoft.Insights/diagnosticSettings?api-version=2021-05-01-preview"
             if ($dsResp.StatusCode -eq 200) {
                 foreach ($ds in ((($dsResp.Content | ConvertFrom-Json).value))) {
                     if ($ds.properties.workspaceId) { $mapWorkspaceIds[$ds.properties.workspaceId.ToLower()] = $true }
@@ -1038,7 +1166,7 @@ HostIps | union PoolUsers | project RowType, Ip, UserGuess, HostPoolId
     $poolRows = [System.Collections.Generic.List[object]]::new()
     foreach ($wsId in $mapWorkspaceIds.Keys) {
         try {
-            $wsResp = Invoke-AzRestMethod -Method GET -Path "$wsId`?api-version=2021-06-01"
+            $wsResp = Invoke-AzRestRetry -Method GET -Path "$wsId`?api-version=2021-06-01"
             if ($wsResp.StatusCode -ne 200) { continue }
             $customerId = ($wsResp.Content | ConvertFrom-Json).properties.customerId
             foreach ($row in @((Invoke-LaQuery -WorkspaceCustomerId $customerId -Query $mapSharesKql).Results)) { $shareRows.Add($row) }
@@ -1273,34 +1401,78 @@ if ($script:AuthBroken -and -not $SkipCosts) {
     Write-Warn2 "[8/8] Cost pull skipped - Azure token broken (see banner above); a fresh-session re-run fills ActualMo in."
 }
 if (-not $SkipCosts -and -not $script:AuthBroken) {
-    Write-Info "[8/8] Pulling last month's ACTUAL spend for session-host VMs + disks (skips any scope without cost visibility)..."
+    Write-Info "[8/8] Pulling last month's ACTUAL spend for session-host VMs + disks (one query per subscription; waits politely if Azure throttles, so this step can take a few minutes on a busy tenant)..."
     $costByResource = @{}
     $costCurrency = ''
     $rgScopes = @{}
     foreach ($vmId in $vmSpecs.Keys) { $parts = $vmId -split '/'; $rgScopes["/subscriptions/$($parts[2])/resourcegroups/$($parts[4])"] = $parts[4] }
     # storage ledger gets actual spend too - add each candidate's resource group scope
     foreach ($cand in $storageCandidates) { if ($cand.ResourceId) { $parts = $cand.ResourceId -split '/'; $rgScopes["/subscriptions/$($parts[2])/resourcegroups/$($parts[4])"] = $parts[4] } }
-    $costOk = 0; $costSkipped = @()
+    # v0.19: group the resource groups by subscription and ask ONCE per subscription
+    # (ResourceGroupName filter). A refused subscription-level query expands into the
+    # per-resource-group items of the pre-v0.19 path. Scopes still throttled after
+    # their own retry budget wait for a second pass after a cooldown.
+    $bySub = @{}
     foreach ($scope in $rgScopes.Keys) {
-        # AmortizedCost spreads RI/Savings Plan purchases across usage (honest number for
-        # reserved customers); PAYG-type offers reject it, so fall back to ActualCost.
-        # EXCEPT on 429: throttling is rate-based, not cost-type-specific - retrying the
-        # other type just doubles the hammering (and the wait) for the same answer.
-        try { $res = Get-ActualCostRows -Scope $scope -CostType 'AmortizedCost' } catch { $res = @{ ok = $false; status = "error: $($_.Exception.Message)" } }
-        if (-not $res.ok -and "$($res.status)" -notmatch '^HTTP 429') {
-            try { $res = Get-ActualCostRows -Scope $scope -CostType 'ActualCost' } catch { $res = @{ ok = $false; status = "error: $($_.Exception.Message)" } }
+        $sub = ($scope -split '/')[2]
+        if (-not $bySub.ContainsKey($sub)) { $bySub[$sub] = @() }
+        $bySub[$sub] += $rgScopes[$scope]
+    }
+    $queue = New-Object System.Collections.ArrayList
+    foreach ($sub in ($bySub.Keys | Sort-Object)) {
+        $rgs = @($bySub[$sub] | Sort-Object -Unique)
+        [void]$queue.Add(@{ Kind = 'sub'; Scope = "/subscriptions/$sub"; Sub = $sub; RGs = $rgs; Label = "subscription $sub ($($rgs.Count) resource group(s): $($rgs -join ', '))" })
+    }
+    $costOk = 0; $rgCovered = 0; $costSkipped = @(); $costStopped = $false
+    $deferred = New-Object System.Collections.ArrayList
+    for ($pass = 1; $pass -le 2 -and -not $costStopped; $pass++) {
+        if ($pass -eq 2) {
+            if ($deferred.Count -eq 0) { break }
+            Write-Warn2 "Cost Management kept throttling $($deferred.Count) scope(s) past the retry budget. Cooling down 90s so the rate-limit window resets, then trying them once more before giving up..."
+            if ($env:MODELER_FAST_RETRY -ne '1') { Start-Sleep -Seconds 90 }
+            $queue = $deferred; $deferred = New-Object System.Collections.ArrayList
         }
-        if (-not $res.ok) {
-            if ((Test-CredError "$($res.status)") -and -not (Confirm-AzureAuthAlive)) {
-                Write-Warn2 "Cost pull stopped at the token failure - remaining scopes untried; a fresh-session re-run fills ActualMo in."
-                break
+        while ($queue.Count -gt 0) {
+            $item = $queue[0]; $queue.RemoveAt(0)
+            if ($script:Throttle.Hits -gt 0) { Write-Info "Cost scope: $($item.Label) ($($queue.Count) more queued$(if ($pass -eq 2) { ', second pass' }))." }
+            $res = Invoke-CostScope $item
+            if ($res.ok -and $item.Kind -eq 'sub' -and @($res.rows).Count -eq 0) {
+                # Zero rows for resource groups that hold running session hosts is suspicious
+                # (a filter quirk would show up exactly this way). The per-RG path is the
+                # proven one - confirm through it rather than record a silent zero.
+                Write-Info "Subscription-level cost query for $($item.Sub) returned no rows - confirming with one query per resource group."
+                foreach ($rg in $item.RGs) {
+                    [void]$queue.Add(@{ Kind = 'rg'; Scope = "/subscriptions/$($item.Sub)/resourcegroups/$rg"; Sub = $item.Sub; RGs = @($rg); Label = "resource group $rg" })
+                }
+                continue
             }
-            $costSkipped += [pscustomobject]@{ RG = $rgScopes[$scope]; Reason = "$($res.status)" }; continue
-        }
-        $costOk++
-        foreach ($row in $res.rows) {
-            $costByResource[$row.ResourceId] = (Coalesce $costByResource[$row.ResourceId] 0) + $row.Cost
-            if (-not $costCurrency -and $row.Currency) { $costCurrency = $row.Currency }
+            if ($res.ok) {
+                $costOk++; $rgCovered += @($item.RGs).Count
+                foreach ($row in $res.rows) {
+                    $costByResource[$row.ResourceId] = (Coalesce $costByResource[$row.ResourceId] 0) + $row.Cost
+                    if (-not $costCurrency -and $row.Currency) { $costCurrency = $row.Currency }
+                }
+                if ($pass -eq 2) { $script:Throttle.Recovered += ,@($item.RGs); Write-Ok "Recovered on the second pass: $($item.Label)." }
+                continue
+            }
+            $st = "$($res.status)"
+            if ($st -match '^HTTP 429') {
+                if ($pass -eq 1) { [void]$deferred.Add($item) }
+                else { $costSkipped += [pscustomobject]@{ RG = (@($item.RGs) -join ', '); Reason = $st } }
+                continue
+            }
+            if ((Test-CredError $st) -and -not (Confirm-AzureAuthAlive)) {
+                Write-Warn2 "Cost pull stopped at the token failure - remaining scopes untried; a fresh-session re-run fills ActualMo in."
+                $costStopped = $true; break
+            }
+            if ($item.Kind -eq 'sub') {
+                Write-Info "Subscription-level cost query for $($item.Sub) was refused ($st) - falling back to one query per resource group for its $(@($item.RGs).Count) resource group(s)."
+                foreach ($rg in $item.RGs) {
+                    [void]$queue.Add(@{ Kind = 'rg'; Scope = "/subscriptions/$($item.Sub)/resourcegroups/$rg"; Sub = $item.Sub; RGs = @($rg); Label = "resource group $rg" })
+                }
+                continue
+            }
+            $costSkipped += [pscustomobject]@{ RG = (@($item.RGs) -join ', '); Reason = $st }
         }
     }
     if ($costByResource.Count -gt 0) {
@@ -1319,7 +1491,7 @@ if (-not $SkipCosts -and -not $script:AuthBroken) {
             $review[$i] | Add-Member -NotePropertyName ActualMo -NotePropertyValue ([Math]::Round($sum, 2))
         }
         $pulledTotal = [Math]::Round(($costByResource.Values | Measure-Object -Sum).Sum, 2)
-        Write-Ok "Actual spend (last full month, $costCurrency) pulled from $costOk resource group(s). Attributed to session hosts + disks: $([Math]::Round($attributed, 2)). Other VM/Storage spend in those RGs: $([Math]::Round($pulledTotal - $attributed, 2))."
+        Write-Ok "Actual spend (last full month, $costCurrency) pulled for $rgCovered resource group(s) in $costOk query scope(s). Attributed to session hosts + disks: $([Math]::Round($attributed, 2)). Other VM/Storage spend in those RGs: $([Math]::Round($pulledTotal - $attributed, 2))."
         Write-Info "Compare the ActualMo column against the Modeler's monthly cost per deployment after import. Actuals already include their current scaling behavior; the model is the Nerdio-run future."
     } elseif ($rgScopes.Count -gt 0 -and $costOk -eq 0) {
         Write-Warn2 "No cost data was retrievable from any scope - model output unaffected."
@@ -1330,7 +1502,7 @@ if (-not $SkipCosts -and -not $script:AuthBroken) {
         }
         $throttledSkips = @($costSkipped | Where-Object { "$($_.Reason)" -match '^HTTP 429' })
         $otherSkips = @($costSkipped | Where-Object { "$($_.Reason)" -notmatch '^HTTP 429' })
-        if ($throttledSkips.Count -gt 0) { Write-Warn2 "HTTP 429 = Cost Management throttling that outlasted 3 attempts (20s + 60s waits) - not a permissions or offer problem. A re-run later usually fills these scopes' ActualMo; nothing else is affected." }
+        if ($throttledSkips.Count -gt 0) { Write-Warn2 "HTTP 429 = Cost Management kept throttling even after this run honored its Retry-After across two passes ($($script:Throttle.Hits) throttled replies, $($script:Throttle.WaitedSeconds)s waited). Not a permissions or offer problem: something else is hammering this tenant's Cost Management API right now (a FinOps tool, another export). Re-run in an hour to fill these scopes' ActualMo; nothing else is affected." }
         if ($otherSkips.Count -gt 0) { Write-Warn2 "Common causes: subscription offer type without cost API support (sponsored/internal/MSDN - typical in demo and lab tenants), CSP without customer cost visibility, or an EA where 'view charges' is disabled. Skipped cleanly - nothing else is affected." }
     }
 }
@@ -1374,6 +1546,11 @@ if ($usageRows -eq 0) {
     Write-Ok "Usage found for $withUsage of $($pools.Count) pool(s)."
 }
 if ($flagged -gt 0) { Write-Warn2 "$flagged pool(s) carry flags - see the Flags column above." }
+if ($script:Throttle.Hits -gt 0) {
+    $bySvc = @($script:Throttle.Services.Keys | Sort-Object | ForEach-Object { "$_ x$($script:Throttle.Services[$_])" }) -join ', '
+    $lost = @($(if (Get-Variable -Name costSkipped -ErrorAction SilentlyContinue) { $costSkipped } else { @() }) | Where-Object { "$($_.Reason)" -match '^HTTP 429' }).Count
+    Write-Info "Azure throttled this run $($script:Throttle.Hits) time(s) ($bySvc); waited $($script:Throttle.WaitedSeconds)s total as Azure asked$(if ($script:Throttle.Recovered.Count -gt 0) { ", recovered $($script:Throttle.Recovered.Count) scope(s) on the second pass" }). $(if ($lost -eq 0) { 'Nothing was lost to throttling.' } else { "$lost scope(s) still refused - see above." })"
+}
 Write-Ok "Model written: $OutFile ($($deployments.Count) deployments$(if ($emptyPools.Count -gt 0) { "; $($emptyPools.Count) empty pool(s) excluded" }))"
 $vmRgGroups = @($vmSpecs.Keys | ForEach-Object { ($_ -split '/')[4] } | Group-Object | Sort-Object Count -Descending)
 if ($vmRgGroups.Count -gt 0) {
@@ -1408,6 +1585,12 @@ try {
         costByResource = @($(if (Get-Variable -Name costByResource -ErrorAction SilentlyContinue) { $costByResource.Keys | ForEach-Object { [ordered]@{ resourceId = $_; cost = $costByResource[$_] } } } else { @() }))
         costSkipped = @($(if (Get-Variable -Name costSkipped -ErrorAction SilentlyContinue) { $costSkipped } else { @() }))
         costCurrency = $(if (Get-Variable -Name costCurrency -ErrorAction SilentlyContinue) { $costCurrency } else { $null })
+        throttle = [ordered]@{
+            mode = 'one Cost Management query per subscription (ResourceGroupName filter), per-resource-group fallback, Retry-After honored, second pass after 90s cooldown'
+            hits = $script:Throttle.Hits; waitedSeconds = $script:Throttle.WaitedSeconds
+            byService = $script:Throttle.Services
+            recoveredOnSecondPass = @($script:Throttle.Recovered | ForEach-Object { @($_) -join ', ' })
+        }
     }
     Write-Utf8NoBom -FilePath $rawFile -Content ($raw | ConvertTo-Json -Depth 12)
     if ($rawBuckets.Count -gt 0) { Write-Utf8NoBom -FilePath $bucketsFile -Content ((@($rawBuckets | ConvertTo-Csv -NoTypeInformation)) -join [Environment]::NewLine) }

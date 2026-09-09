@@ -82,7 +82,7 @@ Nothing needs to be installed. Cloud Shell ships every module the script uses, a
 5. **Usage.** 30 days of `WVDConnections` per workspace, bucketed into 15-minute concurrency slots of distinct users. From that: peak concurrent users, observed work days (days whose user-hours reach 25% of the busiest day's), the observed work window (hours at 20% of peak or better, measured on work days), weekly in-window vs. off-window user-hours, per-pool MAU, and peak users on any single host. Day and hour averages include the quiet slots and are normalized by each weekday's actual calendar count in the lookback. A 30-day window holds five of some weekdays and four of others; uniform-week math penalized the four-count days about 20%, enough to cost a real call center its Saturday shift. Concurrency counts connected sessions. NME's console counts sessions including disconnected and reads higher; sizing is unaffected because peak and per-host density share the same basis. Pools where session counts run 15% or more above connected peaks (from `WVDAgentHealthStatus`, when present) are flagged.
 6. **Assembly.** The modeling rules below, a flag for every default, and empty shells set aside: counted, flagged, never in the JSON.
 7. **Profile storage.** Azure Files shares and SMB NetApp volumes that could hold FSLogix profiles, with provisioned and used capacity. When file-access diagnostics flow to Log Analytics, also which host pools use each share.
-8. **Actual spend.** Last calendar month's cost for exactly those session-host VMs and OS disks, per resource group, via the Cost Management Query API.
+8. **Actual spend.** Last calendar month's cost for exactly those session-host VMs and OS disks via the Cost Management Query API: one query per subscription, filtered to the resource groups that matter. If Azure throttles, the script waits as long as Azure asks and tries again; anything still refused gets a second pass after a cooldown. See the cost section for the details.
 
 ---
 
@@ -114,11 +114,19 @@ Sizes are resilient. Share stats retry once, then fall back to Azure Monitor's `
 
 ## The cost comparison (`ActualMo`)
 
-For every resource group holding session-host VMs, the script queries the Cost Management Query API for last calendar month, filtered to Virtual Machines and Storage, grouped by resource. Cost is then attributed to each pool's VMs and OS disks. Amortized cost is tried first, so environments with Reservations or Savings Plans get honest numbers. Pay-as-you-go offers that reject amortized queries fall back to actual cost.
+The script queries the Cost Management Query API for last calendar month, filtered to Virtual Machines and Storage, grouped by resource. Cost is then attributed to each pool's VMs and OS disks. Amortized cost is tried first, so environments with Reservations or Savings Plans get honest numbers. Pay-as-you-go offers that reject amortized queries fall back to actual cost.
 
-**Permissions:** the same Reader access the script already needs. Any of Owner, Contributor, Reader, or Cost Management Reader at RG or subscription scope works.
+**How it avoids losing data to throttling.** Cost Management rate-limits per tenant, and it bites: a six-scope customer run once lost one resource group's actuals to HTTP 429, which meant an estimate in a CIO-facing model. Three things now keep that from happening, in the order they matter:
 
-**When it skips (by design):** cost API failures are almost never RBAC. They are billing-side policy: CSP subscriptions without customer cost visibility, EA enrollments where the admin disabled "view charges," or offer types with no cost API support at all (sponsored, internal, MSDN; typical in demo and lab tenants). Each failing scope is skipped with one warning line quoting Azure's actual error. The model, review table, JSON, and downloads are never affected. `-SkipCosts` turns the pull off entirely.
+1. **Fewer calls.** One query per subscription, filtered to the resource groups holding session hosts and profile storage, instead of one query per resource group. Six scopes used to mean up to 36 calls in a burst. Now it is one. If a subscription-level query is refused (Reader granted only on specific resource groups, an offer quirk) or comes back empty, that subscription falls back to the per-resource-group path on its own.
+2. **Azure's own wait time.** A 429 carries a `Retry-After` header that says how long to wait. Every Azure call the script makes (Cost Management, Resource Graph, ARM, Log Analytics) reads it and waits exactly that long, up to six attempts inside a five-minute budget per call. Cost calls are paced 1.5 seconds apart on top. Every wait prints, so a slow step never looks hung.
+3. **A second pass.** Anything still throttled after its budget is set aside. The run finishes everything else, cools down 90 seconds so the rate window resets, and tries those scopes once more before giving up.
+
+The end of the run prints a one-line throttle summary (how many 429s, seconds waited, what recovered), and rawdata.json records the same history. A scope that fails both passes is reported as throttled, with the counts, and that message means something else is hammering the tenant's Cost Management API at that moment. Re-run in an hour.
+
+**Permissions:** the same Reader access the script already needs. Any of Owner, Contributor, Reader, or Cost Management Reader at RG or subscription scope works. Subscription-scope Reader takes the fast path; resource-group-only Reader takes the per-resource-group path automatically.
+
+**When it skips (by design):** cost API failures that are not throttling are almost never RBAC. They are billing-side policy: CSP subscriptions without customer cost visibility, EA enrollments where the admin disabled "view charges," or offer types with no cost API support at all (sponsored, internal, MSDN; typical in demo and lab tenants). Each failing scope is skipped with one warning line quoting Azure's actual error. The model, review table, JSON, and downloads are never affected. `-SkipCosts` turns the pull off entirely.
 
 Reading the numbers: `ActualMo` already includes whatever your current scaling setup saves you. The comparison is Nerdio-run vs. how the environment is managed today. That's the honest comparison, and the one that shows where Nerdio's value actually comes from.
 
