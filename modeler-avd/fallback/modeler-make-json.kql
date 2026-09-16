@@ -223,8 +223,10 @@ let Assembled =
         ObsPerHost >= 1, ObsPerHost,
         LimitSane, MaxSessionLimit,
         VCpus)
-    | extend Density = iff(Experience == 2, 1.0,
-        min_of(10.0, round(todouble(UsersPerHost) / todouble(VCpus), 2)))
+    // single-session experiences (2 personal, 3 single-user pooled) are 1 user per host;
+    // the Modeler's import validator rejects anything under 0.1 (v0.20 floor)
+    | extend Density = iff(Experience == 2 or Experience == 3, 1.0,
+        max_of(0.1, min_of(10.0, round(todouble(UsersPerHost) / todouble(VCpus), 2))))
     | extend ImageType = iff(isnotempty(ImageId), 2, 1)
     | extend UsersTotal      = toint(coalesce(PeakConcurrentUsers, 0)),
              StartHourFinal  = toint(coalesce(StartHour, 9)),
@@ -245,7 +247,7 @@ let Assembled =
         0)
     | extend Flags = trim_end("; ", strcat(
         iff(UsersTotal == 0, "no telemetry; ", ""),
-        iff(Experience != 2 and ObsPerHost < 1, iff(LimitSane, "density from session limit (no per-host telemetry); ", "no limit + no telemetry, density 1.0/vCPU; "), ""),
+        iff(Experience != 2 and Experience != 3 and ObsPerHost < 1, iff(LimitSane, "density from session limit (no per-host telemetry); ", "no limit + no telemetry, density 1.0/vCPU; "), ""),
         iff(isempty(VmSize), "VM spec defaulted; ", ""),
         iff(isnull(StartHour) and UsersTotal > 0, "work window defaulted; ", ""),
         iff(OtPct >= 100, "overtime capped 100%; ", "")));
