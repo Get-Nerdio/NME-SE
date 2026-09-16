@@ -198,7 +198,7 @@ function Get-AzAccessToken {
 }
 function Invoke-RestMethod {
     param($Method, $Uri, $Headers, $ContentType, $Body, $TimeoutSec)
-    if ("$Uri" -match 'modeler/VERSION') { return 'v0.20.1' }   # stale-copy self-check: report current
+    if ("$Uri" -match 'modeler/VERSION') { return 'v0.20.2' }   # stale-copy self-check: report current
     if ("$Uri" -notmatch 'api\.loganalytics\.io') { throw "unexpected Invoke-RestMethod uri in test: $Uri" }
     if ("$Uri" -match '22222222') { throw 'Response status code does not indicate success: 403 (Forbidden). NspValidationFailedError: Access to workspace ws2 from 1.2.3.4 is denied. To allow access from public networks, change the workspace Networking settings or add it to a Network Security Perimeter.' }
     $q = ($Body | ConvertFrom-Json).query
@@ -228,6 +228,12 @@ $global:LaTokenMode = 'dead'; $global:LaTokenCalls = 0
 $global:CostS1SubCalls = 0; $global:CostS2SubCalls = 0; $global:CostAnfCalls = 0; $global:CostFilterRGs = @()
 Write-Host "`n--- SECOND RUN: Log Analytics token never issued ---"
 & "$PSScriptRoot/../Get-NerdioModelerJson.ps1" -SkipDownload -OutFile /tmp/test-model-dead.json -ModelName 'TEST-DEAD'
+# v0.20.2: third run with no Az.Accounts at all (Get-AzContext undefined) - must stop
+# cleanly with the install instructions, never a raw CommandNotFound.
+Remove-Item Function:Get-AzContext -ErrorAction SilentlyContinue
+Write-Host "`n--- THIRD RUN: Az.Accounts not installed ---"
+& "$PSScriptRoot/../Get-NerdioModelerJson.ps1" -SkipDownload -OutFile /tmp/test-model-nomod.json -ModelName 'TEST-NOMOD'
+$log3 = if (Test-Path /tmp/test-model-nomod-console.log) { Get-Content /tmp/test-model-nomod-console.log -Raw } else { '' }
 Remove-Item Env:MODELER_FAST_RETRY -ErrorAction SilentlyContinue
 
 Write-Host "`n--- VALIDATION ---"
@@ -294,14 +300,15 @@ $checks = [ordered]@{
     'dead run: gave up after 2 budgets (12)' = ($global:LaTokenCalls -eq 12 -and $log2 -match 'attempt 5 of 6' -and $log2 -notmatch 'attempt 6 of 6')
     'dead run: file says so everywhere'     = ($m2.description -match 'USAGE NOT COLLECTED \(Log Analytics token failure\)' -and $row2PoolA.Flags -match 'usage NOT collected this run \(no Log Analytics token - re-run\); users set to 1' -and $row2PoolA.PeakUsers -eq '0' -and (@($m2.deployments | Where-Object { $_.name -eq 'PoolA (no usage data)' })).Count -eq 1)
     'dead run: rawdata telemetry block'     = ($raw2.telemetry.collected -eq $false -and @($raw2.telemetry.workspacesNotQueried_tokenFailure).Count -eq 2 -and @($raw2.telemetry.poolWorkspaces).Count -eq 1)
+    'no module: install steps, clean stop'  = ($log3 -match 'The Az.Accounts PowerShell module is not installed on this machine' -and $log3 -match 'Install-Module Az.Accounts -Scope CurrentUser' -and $log3 -match 'Connect-AzAccount' -and $log3 -notmatch 'not recognized' -and -not (Test-Path /tmp/test-model-nomod.json))
     'dead run: rest of the run completed'   = ((Test-Path /tmp/test-model-dead.zip) -and $log2 -match 'Import pre-flight: 3/3 deployments pass' -and $log2 -match 'Storage ledger written' -and $log2 -match 'Model written')
     'admin tasks on pool deployment'    = (@($a.administrative.tasks.'2').Count -eq 16)
     'zip holds json+csv+ledger+log'     = ($zipOk -and (Test-Path /tmp/zipcheck/test-model.json) -and (Test-Path /tmp/zipcheck/test-model-review.csv) -and (Test-Path /tmp/zipcheck/test-model-storage-ledger.csv) -and (Test-Path $logPath))
     'console log captured + clean'      = ($log -match 'Assembling deployments' -and $log -notmatch [char]27)
     'no raw-export failure in log'      = ($log -notmatch 'Raw data export failed' -and $log -match 'Raw decision data written')
     'counters exclude storage rows'     = ($log -match 'Usage found for 1 of 4 pool')
-    'rawdata sane + version + evidence' = ($null -ne $rawJson -and @($rawJson.pools).Count -eq 4 -and $rawJson.meta.version -eq 'v0.20.1' -and @($rawJson.storageCandidates).Count -eq 4 -and @($rawJson.mapEvidence).Count -ge 1)
-    'version is the first output line'  = ($log -match '(?m)^\[i\] Get-NerdioModelerJson v0\.20\.1' -and ($log.IndexOf('Get-NerdioModelerJson v0.20.1') -lt $log.IndexOf('Signed in as')))
+    'rawdata sane + version + evidence' = ($null -ne $rawJson -and @($rawJson.pools).Count -eq 4 -and $rawJson.meta.version -eq 'v0.20.2' -and @($rawJson.storageCandidates).Count -eq 4 -and @($rawJson.mapEvidence).Count -ge 1)
+    'version is the first output line'  = ($log -match '(?m)^\[i\] Get-NerdioModelerJson v0\.20\.2' -and ($log.IndexOf('Get-NerdioModelerJson v0.20.2') -lt $log.IndexOf('Signed in as')))
     'mixed-size pool: mode wins'        = ($a.workload.vmSize -eq 'Standard_D8s_v5' -and $a.image.type -eq 1 -and $a.workload.disk.size -eq 128 -and $a.workload.disk.type -eq 'Premium_LRS')
     'no stale-copy warning (current)'   = ($log -notmatch 'THIS COPY IS STALE')
     'empty pool: out of JSON, reported' = (@($m.deployments | Where-Object { $_.name -like 'PoolEmpty*' }).Count -eq 0 -and @($m.deployments).Count -eq 3 -and $rowEmpty.Flags -match '^EMPTY - excluded' -and $rowEmpty.VmSize -eq '-' -and $rowEmpty.Window -eq '-' -and $rowEmpty.ActualMo -eq '0' -and @($rawJson.emptyPools).Count -eq 1 -and $rawJson.emptyPools[0].name -eq 'PoolEmpty' -and $log -match '1 EMPTY host pool\(s\) excluded' -and $log -match '3 deployments; 1 empty pool\(s\) excluded')

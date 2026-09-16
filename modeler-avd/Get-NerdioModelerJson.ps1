@@ -59,6 +59,12 @@
     ./modeler.ps1 -TimeZone 'America/Chicago' -ModelName 'Contoso - Actuals'
 
 .NOTES
+    v0.20.2 (2026-09-16). MISSING Az.Accounts SAID PLAINLY. A customer's first
+    local run (elevated Windows PowerShell, module never installed) died on a
+    raw "The term 'Get-AzContext' is not recognized". The script now checks
+    for the module before anything else and prints the two commands that fix
+    it (Install-Module Az.Accounts -Scope CurrentUser, Connect-AzAccount),
+    then stops cleanly. README troubleshooting row added.
     v0.20.1 (2026-09-16). COST ATTRIBUTION BY HOST NAMING, NOT BY RESOURCE
     GROUP. v0.20's first cut swept every unmatched VM and disk in a shared
     resource group into its pools by host count. Replayed against a demo
@@ -388,7 +394,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = 'v0.20.1' # RELEASE RULE: bump modeler/VERSION in the same commit
+$ScriptVersion = 'v0.20.2' # RELEASE RULE: bump modeler/VERSION in the same commit
 # Windows PowerShell 5.1 compatibility: force TLS 1.2 (old .NET Framework
 # defaults can be lower and ARM/Log Analytics require 1.2), and no PS7-only
 # syntax anywhere in this file (?? / ?. / -AsPlainText / utf8NoBOM).
@@ -654,6 +660,17 @@ function Invoke-CostScope {
     return $res
 }
 
+# v0.20.2: a laptop without Az.Accounts used to die on a raw "Get-AzContext is
+# not recognized" (a customer's first local run, elevated console, no module).
+# Say what is missing and print the two commands that fix it.
+if (-not (Get-Command Get-AzContext -ErrorAction SilentlyContinue)) {
+    Write-Warn2 "The Az.Accounts PowerShell module is not installed on this machine, so the script cannot talk to Azure yet. One-time setup (no admin rights needed; answer Y to the NuGet and PSGallery prompts):"
+    Write-Host "      Install-Module Az.Accounts -Scope CurrentUser" -ForegroundColor Yellow
+    Write-Host "      Connect-AzAccount" -ForegroundColor Yellow
+    Write-Warn2 "Then run this command again. Add -TenantId <tenant-id> to Connect-AzAccount if your account reaches more than one tenant. Azure Cloud Shell has the module built in."
+    if ($script:TranscriptOn) { try { Stop-Transcript | Out-Null } catch { }; $script:TranscriptOn = $false }
+    return
+}
 if (-not (Get-AzContext)) {
     Write-Warn2 "Not signed in to Azure. Run Connect-AzAccount first (add -TenantId <tenant-id> if you have several tenants), then run this command again. In Azure Cloud Shell sign-in is automatic."
     if ($script:TranscriptOn) { try { Stop-Transcript | Out-Null } catch { }; $script:TranscriptOn = $false }
