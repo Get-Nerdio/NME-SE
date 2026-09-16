@@ -159,7 +159,7 @@ Two fallbacks, in order:
    - `modeler-make-json.kql`: run it in the Log Analytics workspace that receives AVD diagnostics (find it: any host pool > Diagnostic settings). One result row holds check columns (`WorkspaceCheck`, pool counts, `FlaggedPools`) plus the complete import JSON in the `ModelerImportJson` cell. Export to CSV, then one command unwraps it. Instructions are in the file header, Windows and Mac.
    - `modeler-detail-grid.kql`: optional per-pool magnifier when a flag needs investigating.
 
-   Caveats vs. the script: you find the workspace yourself, extra workspaces are a commented one-line edit, and there is no storage ledger or cost pull.
+   Caveats vs. the script: you find the workspace yourself, extra workspaces are a commented one-line edit, and there is no storage ledger, cost pull, agreement discount, slot-pair merge, or tenant-wide user count.
 
 ---
 
