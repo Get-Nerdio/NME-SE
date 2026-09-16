@@ -141,15 +141,19 @@ function Invoke-AzRestMethod {
             $rows += ,@(100.50, '/subscriptions/s1/resourcegroups/rg1/providers/microsoft.compute/virtualmachines/vm1', 'USD')
             $rows += ,@(50.25,  '/subscriptions/s1/resourcegroups/rg1/providers/microsoft.compute/virtualmachines/vm2', 'USD')
             $rows += ,@(10.00,  '/subscriptions/s1/resourcegroups/rg1/providers/microsoft.compute/disks/d1', 'USD')
-            # v0.20: rg1 holds ONLY PoolA's hosts, and last month it also billed a VM + disk that
-            # no longer exist (the pool was rebuilt) - that spend belongs to PoolA, flagged.
-            $rows += ,@(30.00,  '/subscriptions/s1/resourcegroups/rg1/providers/microsoft.compute/virtualmachines/vm-gen7-1', 'USD')
-            $rows += ,@(5.00,   '/subscriptions/s1/resourcegroups/rg1/providers/microsoft.compute/disks/vm-gen7-1_osdisk', 'USD')
-            # v0.20: rg2 is SHARED by PoolTiny (1 host) and PoolSingle (1 host): matched rows
-            # go by id, the unmatched $30 splits 50/50 by host count, flagged as an estimate.
+            # v0.20: last month rg1 also billed vm7 + its disk, which no longer exist (PoolA was
+            # rebuilt). Same name stem as PoolA's current hosts (vm1..vm3 -> "vm") -> PoolA, flagged.
+            $rows += ,@(30.00,  '/subscriptions/s1/resourcegroups/rg1/providers/microsoft.compute/virtualmachines/vm7', 'USD')
+            $rows += ,@(5.00,   '/subscriptions/s1/resourcegroups/rg1/providers/microsoft.compute/disks/vm7_OsDisk_1_0f3a9c', 'USD')
+            # v0.20: an image-builder VM in the same group matches nobody's naming -> stays
+            # unattributed and is NAMED in the console (never swept into a pool's actuals).
+            $rows += ,@(50.00,  '/subscriptions/s1/resourcegroups/rg1/providers/microsoft.compute/virtualmachines/img-builder', 'USD')
+            $rows += ,@(4.00,   '/subscriptions/s1/resourcegroups/rg1/providers/microsoft.compute/disks/img-builder-osdisk', 'USD')
+            # v0.20: rg2 is SHARED by PoolTiny (vm4) and PoolSingle (vm5), both stem "vm": the
+            # rebuilt vm9 splits 50/50 by host count, flagged as an estimate.
             $rows += ,@(20.00,  '/subscriptions/s1/resourcegroups/rg2/providers/microsoft.compute/virtualmachines/vm4', 'USD')
             $rows += ,@(10.00,  '/subscriptions/s1/resourcegroups/rg2/providers/microsoft.compute/virtualmachines/vm5', 'USD')
-            $rows += ,@(30.00,  '/subscriptions/s1/resourcegroups/rg2/providers/microsoft.compute/virtualmachines/vm-old-9', 'USD')
+            $rows += ,@(30.00,  '/subscriptions/s1/resourcegroups/rg2/providers/microsoft.compute/virtualmachines/vm9', 'USD')
             $rows += ,@(42.00,  $saProf.ToLower(), 'USD')
         } elseif ($Path -like '/subscriptions/s2/providers/*') {
             # v0.19 fallback trigger: subscription-level query refused -> per-RG path.
@@ -194,7 +198,7 @@ function Get-AzAccessToken {
 }
 function Invoke-RestMethod {
     param($Method, $Uri, $Headers, $ContentType, $Body, $TimeoutSec)
-    if ("$Uri" -match 'modeler/VERSION') { return 'v0.20' }   # stale-copy self-check: report current
+    if ("$Uri" -match 'modeler/VERSION') { return 'v0.20.1' }   # stale-copy self-check: report current
     if ("$Uri" -notmatch 'api\.loganalytics\.io') { throw "unexpected Invoke-RestMethod uri in test: $Uri" }
     if ("$Uri" -match '22222222') { throw 'Response status code does not indicate success: 403 (Forbidden). NspValidationFailedError: Access to workspace ws2 from 1.2.3.4 is denied. To allow access from public networks, change the workspace Networking settings or add it to a Network Security Perimeter.' }
     $q = ($Body | ConvertFrom-Json).query
@@ -275,15 +279,16 @@ $checks = [ordered]@{
     'ledger: stprofiles ActualMo 42'    = ($lProf.ActualMo -eq '42')
     'census line printed'               = ($log -match 'Storage census: 2 account\(s\) found, 0 blocked by the token failure, 0 skipped')
     'ledger-only policy line printed'   = ($log -match 'Storage policy: all 4 store\(s\) recorded in the storage ledger')
-    'ActualMo: PoolA 195.75 (id + rebuilt)' = ($rowPoolA.ActualMo -eq '195.75' -and $rowPoolA.ActualBasis -eq 'by id + resource group (hosts rebuilt)' -and $rowPoolA.Flags -match 'ActualMo: 35 in rg1 billed to 1 VM\(s\) that are not current hosts \(hosts rebuilt since the billing month\)')
-    'ActualMo: rg2 split by host count'     = ($rowTiny.ActualMo -eq '35' -and $rowSingle.ActualMo -eq '25' -and $rowTiny.ActualBasis -match 'host-count share' -and $rowSingle.Flags -match '15 is this pool.s host-count share \(1 of 2 hosts\) of 30 unmatched VM/disk spend in rg2, which is shared by PoolSingle, PoolTiny \(estimate\)')
+    'ActualMo: PoolA 195.75 (id + naming)'  = ($rowPoolA.ActualMo -eq '195.75' -and $rowPoolA.ActualBasis -eq 'by id + host naming (hosts rebuilt)' -and $rowPoolA.Flags -match 'ActualMo includes 35 for 1 VM\(s\) \(and their disks\) named like this pool.s hosts that are not current hosts - hosts rebuilt since the billing month' -and $rowPoolA.Flags -notmatch 'split by host count')
+    'ActualMo: rg2 shared stem split 15/15' = ($rowTiny.ActualMo -eq '35' -and $rowSingle.ActualMo -eq '25' -and $rowTiny.ActualBasis -eq 'by id + host naming (hosts rebuilt; part split across pools sharing a name pattern)' -and $rowSingle.Flags -match 'ActualMo includes 15 for 1 VM\(s\).*; 15 of it split by host count with other pools sharing the name pattern \(estimate\)')
     'ActualMo: empty pool blank basis'      = ($rowEmpty.ActualMo -eq '0' -and $rowEmpty.ActualBasis -eq '')
-    'cost: summary explains the split'      = ($log -match 'Attributed to session hosts \+ disks: 255\.75 \(190\.75 by resource id; 65 by resource group because hosts were rebuilt since the billing month, of which 30 is a host-count split' -and $log -match 'Storage accounts in those groups: 119' -and $log -match 'Hosts were rebuilt since the billing month in 1 pool\(s\)')
+    'ActualMo: image VM never swept in'     = ($log -match 'VM/disk spend matching no pool.s host naming: 54 \(listed below\)' -and $log -match 'Not attributed: 54 of VM/disk spend in rg1 matches no pool.s host naming \(2 item\(s\); top: img-builder 50, img-builder-osdisk 4\)' -and @($rawJson.costUnattributed).Count -eq 1 -and $rawJson.costUnattributed[0].total -eq 54)
+    'cost: summary explains the split'      = ($log -match 'Attributed to session hosts \+ disks: 255\.75 \(190\.75 by resource id; 65 by host naming to VMs that were rebuilt since the billing month, of which 30 is split by host count across pools sharing a name pattern\)' -and $log -match 'Storage accounts in those groups: 119' -and $log -match 'Hosts were rebuilt since the billing month in 3 pool\(s\)')
     'token: retried, then cached (3 asks)'  = ($run1.LaTokenCalls -eq 3 -and $log -match 'Azure did not issue a Log Analytics token \(ManagedIdentityCredential authentication failed' -and $log -match 'waiting 5s, then asking again \(attempt 1 of 6\)' -and $log -match 'waiting 10s, then asking again \(attempt 2 of 6\)' -and $log -match 'Log Analytics token issued on attempt 3')
     'PoolTiny: density floored to 0.1'      = ($tiny.workload.maxUsersPerVCpu -eq 0.1 -and $tiny.experience -eq 1 -and $rowTiny.Density -eq '0.1' -and $rowTiny.Flags -match 'density raised to the Modeler minimum 0\.1')
     'PoolSingle: exp 3, density 1.0'        = ($single.experience -eq 3 -and $single.workload.maxUsersPerVCpu -eq 1 -and $single.workload.disk.size -eq 128 -and $single.workload.disk.type -eq 'Standard_LRS' -and $rowSingle.Flags -notmatch 'density from session limit' -and $rowSingle.Flags -match 'disk 127GB snapped up to 128GB tier')
     'import pre-flight: 3/3 pass, no fixes' = ($log -match 'Import pre-flight: 3/3 deployments pass the Modeler.s import checks\.' -and $log -notmatch 'Import pre-flight corrected')
-    'rawdata: costAttribution + telemetry'  = (@($rawJson.costAttribution).Count -eq 4 -and (@($rawJson.costAttribution | Where-Object { $_.poolId -eq $poolAId })[0].byResourceGroup -eq 35) -and (@($rawJson.costAttribution | Where-Object { $_.poolId -eq $poolAId })[0].rebuiltVmsBilled -eq 1) -and $rawJson.telemetry.collected -eq $true -and @($rawJson.telemetry.workspacesBlockedByNetwork).Count -eq 1)
+    'rawdata: costAttribution + telemetry'  = (@($rawJson.costAttribution).Count -eq 4 -and (@($rawJson.costAttribution | Where-Object { $_.poolId -eq $poolAId })[0].byHostNaming -eq 35) -and (@($rawJson.costAttribution | Where-Object { $_.poolId -eq $poolAId })[0].rebuiltVmsBilled -eq 1) -and $rawJson.telemetry.collected -eq $true -and @($rawJson.telemetry.workspacesBlockedByNetwork).Count -eq 1)
     'dead run: TELEMETRY NOT COLLECTED'     = ($log2 -match 'TELEMETRY NOT COLLECTED - the usage queries never ran: Azure would not issue a Log Analytics token' -and $log2 -match 'RE-RUN THIS COMMAND' -and $log2 -notmatch 'no WVDConnections data found')
     'dead run: workspaces named NOT QUERIED' = (([regex]::Matches($log2, 'NOT QUERIED - Azure would not issue a Log Analytics token')).Count -eq 2 -and $log2 -match 'Share->pool evidence NOT COLLECTED')
     'dead run: gave up after 2 budgets (12)' = ($global:LaTokenCalls -eq 12 -and $log2 -match 'attempt 5 of 6' -and $log2 -notmatch 'attempt 6 of 6')
@@ -295,8 +300,8 @@ $checks = [ordered]@{
     'console log captured + clean'      = ($log -match 'Assembling deployments' -and $log -notmatch [char]27)
     'no raw-export failure in log'      = ($log -notmatch 'Raw data export failed' -and $log -match 'Raw decision data written')
     'counters exclude storage rows'     = ($log -match 'Usage found for 1 of 4 pool')
-    'rawdata sane + version + evidence' = ($null -ne $rawJson -and @($rawJson.pools).Count -eq 4 -and $rawJson.meta.version -eq 'v0.20' -and @($rawJson.storageCandidates).Count -eq 4 -and @($rawJson.mapEvidence).Count -ge 1)
-    'version is the first output line'  = ($log -match '(?m)^\[i\] Get-NerdioModelerJson v0\.20' -and ($log.IndexOf('Get-NerdioModelerJson v0.20') -lt $log.IndexOf('Signed in as')))
+    'rawdata sane + version + evidence' = ($null -ne $rawJson -and @($rawJson.pools).Count -eq 4 -and $rawJson.meta.version -eq 'v0.20.1' -and @($rawJson.storageCandidates).Count -eq 4 -and @($rawJson.mapEvidence).Count -ge 1)
+    'version is the first output line'  = ($log -match '(?m)^\[i\] Get-NerdioModelerJson v0\.20\.1' -and ($log.IndexOf('Get-NerdioModelerJson v0.20.1') -lt $log.IndexOf('Signed in as')))
     'mixed-size pool: mode wins'        = ($a.workload.vmSize -eq 'Standard_D8s_v5' -and $a.image.type -eq 1 -and $a.workload.disk.size -eq 128 -and $a.workload.disk.type -eq 'Premium_LRS')
     'no stale-copy warning (current)'   = ($log -notmatch 'THIS COPY IS STALE')
     'empty pool: out of JSON, reported' = (@($m.deployments | Where-Object { $_.name -like 'PoolEmpty*' }).Count -eq 0 -and @($m.deployments).Count -eq 3 -and $rowEmpty.Flags -match '^EMPTY - excluded' -and $rowEmpty.VmSize -eq '-' -and $rowEmpty.Window -eq '-' -and $rowEmpty.ActualMo -eq '0' -and @($rawJson.emptyPools).Count -eq 1 -and $rawJson.emptyPools[0].name -eq 'PoolEmpty' -and $log -match '1 EMPTY host pool\(s\) excluded' -and $log -match '3 deployments; 1 empty pool\(s\) excluded')

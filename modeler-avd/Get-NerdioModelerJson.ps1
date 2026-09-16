@@ -59,6 +59,19 @@
     ./modeler.ps1 -TimeZone 'America/Chicago' -ModelName 'Contoso - Actuals'
 
 .NOTES
+    v0.20.1 (2026-09-16). COST ATTRIBUTION BY HOST NAMING, NOT BY RESOURCE
+    GROUP. v0.20's first cut swept every unmatched VM and disk in a shared
+    resource group into its pools by host count. Replayed against a demo
+    tenant, that handed an $807 image-builder VM, test boxes, and orphaned
+    disks to host pools as "rebuilt hosts". Now a billed VM (or its OS disk)
+    that is not a current host is attributed only when its name follows a
+    pool's host naming (same stem once trailing numbers and hex suffixes
+    are stripped), split by host count only when several pools in the group
+    share that stem. Everything else stays out of pool totals and is listed
+    by resource group with its top items, in the console and in
+    rawdata.json (costUnattributed). Replayed against the 47-pool run:
+    76,281 attributed (vs 7,294 in v0.19), and the unrelated VMs in the
+    storage groups are named instead of absorbed.
     v0.20 (2026-09-16). THREE DEFECTS FROM ONE 47-POOL / 1,199-HOST CLOUD
     SHELL RUN, each of which produced a plausible-looking file that was wrong:
     (1) TELEMETRY LOST TO A TOKEN TIMEOUT. Cloud Shell's token relay answered
@@ -88,13 +101,10 @@
     id against CURRENT session hosts. This customer rebuilds every host on
     each release (August's generation was gone by mid-September), so nine
     production pools showed ActualMo 0 while $69k of their VM and disk
-    spend sat in the "other" bucket ($7.3k attributed of $76.3k real). Now
-    VM and disk spend in a resource group that holds ONE pool's hosts is
-    attributed to that pool even when the ids no longer match, flagged as
-    "hosts rebuilt"; a resource group shared by several pools splits its
-    unmatched spend by current host count, flagged as an estimate. The
-    review CSV gains an ActualBasis column and rawdata.json a
-    costAttribution block so the split is auditable.
+    spend sat in the "other" bucket ($7.3k attributed of $76.3k real).
+    Rebuilt hosts are now recognized and attributed (see v0.20.1 for the
+    final rule). The review CSV gains an ActualBasis column and
+    rawdata.json a costAttribution block so the split is auditable.
     v0.19 (2026-09-09). NO DATA LOST TO THROTTLING. A 6-scope customer run
     lost one resource group's actuals to Cost Management HTTP 429s, which
     meant an estimated number in a CIO-facing model. Three changes, in the
@@ -378,7 +388,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = 'v0.20'   # RELEASE RULE: bump modeler/VERSION in the same commit
+$ScriptVersion = 'v0.20.1' # RELEASE RULE: bump modeler/VERSION in the same commit
 # Windows PowerShell 5.1 compatibility: force TLS 1.2 (old .NET Framework
 # defaults can be lower and ARM/Log Analytics require 1.2), and no PS7-only
 # syntax anywhere in this file (?? / ?. / -AsPlainText / utf8NoBOM).
@@ -389,6 +399,22 @@ try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::S
 # process-scoped and touches no user configuration.
 $env:SuppressAzurePowerShellBreakingChangeWarnings = 'true'
 function Coalesce { param($a, $b) if ($null -ne $a) { $a } else { $b } }
+function Get-HostNameStem {
+    # "avd-ec1-7-3-94" and "avd-ec1-8-1-108" -> "avd-ec"; "mspooled-268d" -> "mspooled";
+    # "vm7_OsDisk_1_<guid>" and "personal-03-osdisk" -> the VM's stem. Trailing
+    # numbers and short hex tokens (NME's random suffixes) are stripped until
+    # nothing changes. Empty when nothing is left.
+    param([string]$Name)
+    $n = "$Name".ToLowerInvariant()
+    $n = [regex]::Replace($n, '[-_](?:os)?disk.*$', '')
+    while ($true) {
+        $n2 = [regex]::Replace($n, '[-_]?(?:\d+|(?=[0-9a-f]{2,4}$)[0-9a-f]*\d[0-9a-f]*)$', '')
+        $n2 = $n2.TrimEnd('-', '_')
+        if ($n2 -eq $n) { break }
+        $n = $n2
+    }
+    return $n
+}
 function Write-Utf8NoBom {
     param([string]$FilePath, [string]$Content)
     $full = if ([IO.Path]::IsPathRooted($FilePath)) { $FilePath } else { Join-Path (Get-Location).Path $FilePath }
@@ -1639,26 +1665,41 @@ if (-not $SkipCosts -and -not $script:AuthBroken) {
         # v0.20: attribution by resource id alone missed REBUILT hosts. A customer
         # that re-creates every session host on each release billed last month's
         # generation under ids that no longer exist; nine production pools showed
-        # ActualMo 0 while their spend sat in "other". Now, VM and disk spend in a
-        # resource group that holds ONE pool's hosts belongs to that pool whether
-        # or not the ids match (flagged "hosts rebuilt"); a resource group shared
-        # by several pools splits its unmatched VM/disk spend by current host
-        # count (flagged as an estimate). Storage accounts stay out of pool totals.
+        # ActualMo 0 while their spend sat in "other". Now a billed VM (or its OS
+        # disk) that is NOT a current host is attributed to a pool when its name
+        # follows that pool's host naming (same stem once trailing numbers and
+        # hex suffixes are stripped: avd-ec1-7-3-94 and avd-ec1-8-1-108 both stem
+        # to "avd-ec"), flagged "hosts rebuilt". If several pools in the same
+        # resource group share a stem, the row splits by current host count. A
+        # resource group that holds ONE pool's hosts does NOT sweep everything in:
+        # image builders, jump boxes, and orphaned disks live in AVD resource
+        # groups too (a demo tenant carried an $807 image VM next to its hosts).
+        # Anything that matches no pool's naming is reported by group, top items
+        # named, so the reviewer can see exactly what it was. Storage accounts
+        # never enter a pool's total.
         $costLower = @{}
         foreach ($k in $costByResource.Keys) { $lk = "$k".ToLowerInvariant(); $costLower[$lk] = (Coalesce $costLower[$lk] 0) + $costByResource[$k] }
         $currentIds = @{}
         foreach ($vmId in $vmSpecs.Keys) { $currentIds["$vmId".ToLowerInvariant()] = $true; if ($vmSpecs[$vmId].osDiskId) { $currentIds["$($vmSpecs[$vmId].osDiskId)".ToLowerInvariant()] = $true } }
-        $rgPools = @{}       # rgScopeLower -> @(poolKey,...)
-        $rgHostCount = @{}   # "rgScopeLower|poolKey" -> current host count
+        # pool -> host-name stems (per resource group), and rg|stem -> pools that use it
+        $stemPools = @{}     # "rgScopeLower|stem" -> @(poolKey,...)
+        $stemHostCount = @{} # "rgScopeLower|stem|poolKey" -> current hosts with that stem
         foreach ($pk in $poolVmIds.Keys) {
             foreach ($vmId in $poolVmIds[$pk]) {
                 $rgKey = ((("$vmId" -split '/')[0..4]) -join '/').ToLowerInvariant()
-                if (-not $rgPools.ContainsKey($rgKey)) { $rgPools[$rgKey] = @() }
-                if ($rgPools[$rgKey] -notcontains $pk) { $rgPools[$rgKey] += $pk }
-                $rgHostCount["$rgKey|$pk"] = 1 + [int](Coalesce $rgHostCount["$rgKey|$pk"] 0)
+                $st = Get-HostNameStem (("$vmId" -split '/')[-1])
+                if (-not $st) { continue }
+                $sk = "$rgKey|$st"
+                if (-not $stemPools.ContainsKey($sk)) { $stemPools[$sk] = @() }
+                if ($stemPools[$sk] -notcontains $pk) { $stemPools[$sk] += $pk }
+                $stemHostCount["$sk|$pk"] = 1 + [int](Coalesce $stemHostCount["$sk|$pk"] 0)
             }
         }
-        $rgUnmatched = @{}; $rgUnmatchedVms = @{}; $storageSpend = 0.0; $vmDiskSpend = 0.0
+        $byNaming = @{}      # poolKey -> spend attributed by host naming
+        $byNamingRows = @{}  # poolKey -> count of rebuilt VMs (not disks)
+        $byNamingSplit = @{} # poolKey -> portion of byNaming that was a split across pools
+        $unattributed = @{}  # rgScopeLower -> @(@{ name; cost }...)
+        $storageSpend = 0.0; $vmDiskSpend = 0.0; $unattributedTotal = 0.0
         foreach ($rid in $costLower.Keys) {
             $isVm = $rid -match '/providers/microsoft\.compute/virtualmachines/'
             $isDisk = $rid -match '/providers/microsoft\.compute/disks/'
@@ -1666,56 +1707,61 @@ if (-not $SkipCosts -and -not $script:AuthBroken) {
             $vmDiskSpend += $costLower[$rid]
             if ($currentIds.ContainsKey($rid)) { continue }
             $rgKey = ((($rid -split '/')[0..4]) -join '/')
-            $rgUnmatched[$rgKey] = (Coalesce $rgUnmatched[$rgKey] 0) + $costLower[$rid]
-            if ($isVm) { $rgUnmatchedVms[$rgKey] = 1 + [int](Coalesce $rgUnmatchedVms[$rgKey] 0) }
+            $leaf = ($rid -split '/')[-1]
+            $st = Get-HostNameStem $leaf
+            $owners = @($(if ($st -and $stemPools.ContainsKey("$rgKey|$st")) { $stemPools["$rgKey|$st"] } else { @() }))
+            if ($owners.Count -eq 0) {
+                if (-not $unattributed.ContainsKey($rgKey)) { $unattributed[$rgKey] = @() }
+                $unattributed[$rgKey] += ,@{ name = $leaf; cost = $costLower[$rid] }
+                $unattributedTotal += $costLower[$rid]
+                continue
+            }
+            $all = 0; foreach ($o in $owners) { $all += [int](Coalesce $stemHostCount["$rgKey|$st|$o"] 0) }
+            foreach ($o in $owners) {
+                $share = if ($owners.Count -eq 1 -or $all -le 0) { $costLower[$rid] / [Math]::Max(1, $owners.Count) } else { $costLower[$rid] * [int](Coalesce $stemHostCount["$rgKey|$st|$o"] 0) / $all }
+                $byNaming[$o] = (Coalesce $byNaming[$o] 0) + $share
+                if ($owners.Count -gt 1) { $byNamingSplit[$o] = (Coalesce $byNamingSplit[$o] 0) + $share }
+                if ($isVm) { $byNamingRows[$o] = 1 + [int](Coalesce $byNamingRows[$o] 0) }
+            }
         }
-        $attributedById = 0.0; $attributedByRg = 0.0; $attributedSplit = 0.0
+        $attributedById = 0.0; $attributedByNaming = 0.0; $attributedSplit = 0.0
         $costAttribution = [System.Collections.Generic.List[object]]::new()
         for ($i = 0; $i -lt $pools.Count; $i++) {
             $key = $pools[$i].id.ToLower()
-            $byId = 0.0; $byRg = 0.0; $split = 0.0; $basis = 'by resource id'; $noteParts = @(); $rebuiltVms = 0; $myRgs = @()
+            $byId = 0.0
             if ($poolVmIds.ContainsKey($key)) {
                 foreach ($vmId in $poolVmIds[$key]) {
                     $byId += (Coalesce $costLower["$vmId".ToLowerInvariant()] 0)
                     $vmSpec = $vmSpecs[$vmId]
                     if ($vmSpec -and $vmSpec.osDiskId) { $byId += (Coalesce $costLower["$($vmSpec.osDiskId)".ToLowerInvariant()] 0) }
                 }
-                foreach ($rgKey in $rgPools.Keys) {
-                    if ($rgPools[$rgKey] -notcontains $key) { continue }
-                    $myRgs += ($rgKey -split '/')[4]
-                    $un = [double](Coalesce $rgUnmatched[$rgKey] 0)
-                    if ($un -le 0) { continue }
-                    $sharers = @($rgPools[$rgKey])
-                    if ($sharers.Count -eq 1) {
-                        $byRg += $un; $rebuiltVms += [int](Coalesce $rgUnmatchedVms[$rgKey] 0)
-                        $noteParts += "$([Math]::Round($un, 2)) in $(($rgKey -split '/')[4]) billed to $([int](Coalesce $rgUnmatchedVms[$rgKey] 0)) VM(s) that are not current hosts (hosts rebuilt since the billing month)"
-                    } else {
-                        $mine = [int](Coalesce $rgHostCount["$rgKey|$key"] 0)
-                        $all = 0; foreach ($s in $sharers) { $all += [int](Coalesce $rgHostCount["$rgKey|$s"] 0) }
-                        if ($all -gt 0) {
-                            $share = $un * $mine / $all
-                            $split += $share
-                            $names = @($sharers | ForEach-Object { $sk = $_; ($pools | Where-Object { $_.id.ToLower() -eq $sk } | Select-Object -First 1).name } | Sort-Object) -join ', '
-                            $noteParts += "$([Math]::Round($share, 2)) is this pool's host-count share ($mine of $all hosts) of $([Math]::Round($un, 2)) unmatched VM/disk spend in $(($rgKey -split '/')[4]), which is shared by $names (estimate)"
-                        }
-                    }
-                }
             }
-            $sum = $byId + $byRg + $split
-            if ($byRg -gt 0 -and $split -gt 0) { $basis = 'by id + resource group (hosts rebuilt) + host-count share of a shared group' }
-            elseif ($byRg -gt 0) { $basis = 'by id + resource group (hosts rebuilt)' }
-            elseif ($split -gt 0) { $basis = 'by id + host-count share of a shared group (estimate)' }
-            $attributedById += $byId; $attributedByRg += $byRg; $attributedSplit += $split
+            $nm = [double](Coalesce $byNaming[$key] 0)
+            $sp = [double](Coalesce $byNamingSplit[$key] 0)
+            $rebuiltVms = [int](Coalesce $byNamingRows[$key] 0)
+            $sum = $byId + $nm
+            $basis = if ($sum -le 0) { '' } elseif ($nm -gt 0 -and $sp -gt 0) { 'by id + host naming (hosts rebuilt; part split across pools sharing a name pattern)' } elseif ($nm -gt 0) { 'by id + host naming (hosts rebuilt)' } else { 'by resource id' }
+            $attributedById += $byId; $attributedByNaming += $nm; $attributedSplit += $sp
             $review[$i] | Add-Member -NotePropertyName ActualMo -NotePropertyValue ([Math]::Round($sum, 2))
-            $review[$i] | Add-Member -NotePropertyName ActualBasis -NotePropertyValue $(if ($sum -gt 0) { $basis } else { '' })
-            if ($noteParts.Count -gt 0) { $review[$i].Flags = (@(@($review[$i].Flags) + @("ActualMo: " + ($noteParts -join '; ')) | Where-Object { $_ }) -join '; ') }
-            $costAttribution.Add([ordered]@{ poolId = $pools[$i].id; actualMo = [Math]::Round($sum, 2); byResourceId = [Math]::Round($byId, 2); byResourceGroup = [Math]::Round($byRg, 2); byHostCountShare = [Math]::Round($split, 2); resourceGroups = @($myRgs | Select-Object -Unique); rebuiltVmsBilled = $rebuiltVms })
+            $review[$i] | Add-Member -NotePropertyName ActualBasis -NotePropertyValue $basis
+            if ($nm -gt 0) {
+                $note = "ActualMo includes $([Math]::Round($nm, 2)) for $rebuiltVms VM(s) (and their disks) named like this pool's hosts that are not current hosts - hosts rebuilt since the billing month$(if ($sp -gt 0) { "; $([Math]::Round($sp, 2)) of it split by host count with other pools sharing the name pattern (estimate)" })"
+                $review[$i].Flags = (@(@($review[$i].Flags) + @($note) | Where-Object { $_ }) -join '; ')
+            }
+            $costAttribution.Add([ordered]@{ poolId = $pools[$i].id; actualMo = [Math]::Round($sum, 2); byResourceId = [Math]::Round($byId, 2); byHostNaming = [Math]::Round($nm, 2); ofWhichSplitAcrossPools = [Math]::Round($sp, 2); rebuiltVmsBilled = $rebuiltVms })
         }
-        $attributed = $attributedById + $attributedByRg + $attributedSplit
+        $attributed = $attributedById + $attributedByNaming
         $pulledTotal = [Math]::Round(($costLower.Values | Measure-Object -Sum).Sum, 2)
-        $unattributedVmDisk = [Math]::Round($vmDiskSpend - $attributed, 2)
-        Write-Ok "Actual spend (last full month, $costCurrency) pulled for $rgCovered resource group(s) in $costOk query scope(s): $pulledTotal total. Attributed to session hosts + disks: $([Math]::Round($attributed, 2))$(if ($attributedByRg -gt 0 -or $attributedSplit -gt 0) { " ($([Math]::Round($attributedById, 2)) by resource id; $([Math]::Round($attributedByRg + $attributedSplit, 2)) by resource group because hosts were rebuilt since the billing month$(if ($attributedSplit -gt 0) { ", of which $([Math]::Round($attributedSplit, 2)) is a host-count split across pools sharing a group" }))" }). Storage accounts in those groups: $([Math]::Round($storageSpend, 2)).$(if ($unattributedVmDisk -gt 0.005) { " VM/disk spend not attributable to any pool: $unattributedVmDisk." })"
-        if ($attributedByRg -gt 0) { Write-Warn2 "Hosts were rebuilt since the billing month in $(@($costAttribution | Where-Object { $_.rebuiltVmsBilled -gt 0 }).Count) pool(s): last month's VMs no longer exist, so their spend was attributed by resource group. See ActualBasis and Flags in the review CSV." }
+        Write-Ok "Actual spend (last full month, $costCurrency) pulled for $rgCovered resource group(s) in $costOk query scope(s): $pulledTotal total. Attributed to session hosts + disks: $([Math]::Round($attributed, 2))$(if ($attributedByNaming -gt 0) { " ($([Math]::Round($attributedById, 2)) by resource id; $([Math]::Round($attributedByNaming, 2)) by host naming to VMs that were rebuilt since the billing month$(if ($attributedSplit -gt 0) { ", of which $([Math]::Round($attributedSplit, 2)) is split by host count across pools sharing a name pattern" }))" }). Storage accounts in those groups: $([Math]::Round($storageSpend, 2)).$(if ($unattributedTotal -gt 0.005) { " VM/disk spend matching no pool's host naming: $([Math]::Round($unattributedTotal, 2)) (listed below)." })"
+        if ($attributedByNaming -gt 0) { Write-Warn2 "Hosts were rebuilt since the billing month in $(@($costAttribution | Where-Object { $_.rebuiltVmsBilled -gt 0 }).Count) pool(s): last month's VMs no longer exist, so their spend was attributed by host naming. See ActualBasis and Flags in the review CSV." }
+        $unattributedList = [System.Collections.Generic.List[object]]::new()
+        foreach ($rgKey in ($unattributed.Keys | Sort-Object)) {
+            $rows = @($unattributed[$rgKey] | Sort-Object { -[double]$_.cost })
+            $rgTotal = 0.0; foreach ($r in $rows) { $rgTotal += [double]$r.cost }
+            $top = @($rows | Select-Object -First 5 | ForEach-Object { "$($_.name) $([Math]::Round([double]$_.cost, 2))" }) -join ', '
+            Write-Info "  Not attributed: $([Math]::Round($rgTotal, 2)) of VM/disk spend in $(($rgKey -split '/')[4]) matches no pool's host naming ($($rows.Count) item(s); top: $top)$(if ($rows.Count -gt 5) { ' - full list in rawdata.json' })."
+            $unattributedList.Add([ordered]@{ resourceGroup = ($rgKey -split '/')[4]; scope = $rgKey; total = [Math]::Round($rgTotal, 2); items = @($rows | ForEach-Object { [ordered]@{ name = $_.name; cost = [Math]::Round([double]$_.cost, 2) } }) })
+        }
         Write-Info "Compare the ActualMo column against the Modeler's monthly cost per deployment after import. Actuals already include their current scaling behavior; the model is the Nerdio-run future."
     } elseif ($rgScopes.Count -gt 0 -and $costOk -eq 0) {
         Write-Warn2 "No cost data was retrievable from any scope - model output unaffected."
@@ -1818,6 +1864,7 @@ try {
         costSkipped = @($(if (Get-Variable -Name costSkipped -ErrorAction SilentlyContinue) { $costSkipped } else { @() }))
         costCurrency = $(if (Get-Variable -Name costCurrency -ErrorAction SilentlyContinue) { $costCurrency } else { $null })
         costAttribution = @($(if (Get-Variable -Name costAttribution -ErrorAction SilentlyContinue) { $costAttribution } else { @() }))
+        costUnattributed = @($(if (Get-Variable -Name unattributedList -ErrorAction SilentlyContinue) { $unattributedList } else { @() }))
         telemetry = [ordered]@{
             collected = (-not $script:TelemetryNotCollected)
             usageRows = $usageRows
