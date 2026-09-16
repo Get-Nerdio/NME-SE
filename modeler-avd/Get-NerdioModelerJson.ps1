@@ -336,8 +336,8 @@
     ActualMo column in the review table.
     COST PULL REQUIREMENTS + SKIP BEHAVIOR: succeeds with the same Reader access
     the script already needs (any of Owner / Contributor / Reader / Cost Management
-    Reader at RG or subscription scope). When it fails, it is almost never RBAC —
-    it is billing-side policy: CSP subscriptions without customer cost visibility,
+    Reader at RG or subscription scope). When it fails, it is almost never RBAC.
+    It is billing-side policy: CSP subscriptions without customer cost visibility,
     EA enrollments where the admin disabled "view charges", or sponsored/legacy
     offers. Every such scope is SKIPPED with one warning line; the model, review
     table, JSON, and download are never affected. -SkipCosts disables the pull.
@@ -354,7 +354,7 @@
       (capped at the configured session limit), so the model reflects how they
       actually pack hosts, not what they allow. Falls back to session limit /
       vCPUs when there's no telemetry (flagged); last resort 1.0, flagged.
-      UI max 10. Both numbers appear in the review grid (PerHostPeak vs Limit) —
+      UI max 10. Both numbers appear in the review grid (PerHostPeak vs Limit);
       the gap between them is density headroom Nerdio can reclaim.
     - Disk type reported as found (Premium_LRS / StandardSSD_LRS / Standard_LRS all
       valid). Disk size snapped UP to the Modeler's offered tiers

@@ -355,7 +355,7 @@ foreach ($plan in ($pooledPlans | Sort-Object name)) {
     $dynamicFlag = $planLevelDynamic -or ($schedLevelDynamic.Count -gt 0)
 
     if (@($plan.refs).Count -eq 0) {
-        $stubs.Add("<!--stub-unassigned:$($plan.name)--><div class='stub'><b>Scaling plan $(HtmlEnc $plan.name)</b> ($(HtmlEnc $plan.resourceGroup)) &mdash; no host pools assigned. Azure is not scaling anything with it; nothing to enter in NME.$(if ($dynamicFlag) { " <span class='pill high'>DYNAMIC plan</span> If you assign it later, review its card manually." })</div>")
+        $stubs.Add("<!--stub-unassigned:$($plan.name)--><div class='stub'><b>Scaling plan $(HtmlEnc $plan.name)</b> ($(HtmlEnc $plan.resourceGroup)): no host pools assigned. Azure is not scaling anything with it; nothing to enter in NME.$(if ($dynamicFlag) { " <span class='pill high'>DYNAMIC plan</span> If you assign it later, review its card manually." })</div>")
         $unassignedFlags = @('no host pools assigned')
         if ($dynamicFlag) { $unassignedFlags += 'dynamic plan - manual review' }
         $review.Add([pscustomobject]@{ Plan=$plan.name; Schedule='(none assigned)'; Days=''; Pool=''; RG=$plan.resourceGroup; EnabledOnPool=''
@@ -373,7 +373,7 @@ foreach ($plan in ($pooledPlans | Sort-Object name)) {
 
         if ($null -eq $pool) {
             $poolName = ($poolIdL -split '/')[-1]
-            $stubs.Add("<!--stub-ghost:$poolName--><div class='stub'><b>$(HtmlEnc $poolName)</b> &mdash; referenced by plan $(HtmlEnc $plan.name) but not visible in the current scope. Re-run with -SubscriptionId covering that pool's subscription.</div>")
+            $stubs.Add("<!--stub-ghost:$poolName--><div class='stub'><b>$(HtmlEnc $poolName)</b>: referenced by plan $(HtmlEnc $plan.name) but not visible in the current scope. Re-run with -SubscriptionId covering that pool's subscription.</div>")
             $review.Add([pscustomobject]@{ Plan=$plan.name; Schedule=''; Days=''; Pool=$poolName; RG=''; EnabledOnPool=$enabled
                 SessionHosts=''; SessionLimit=''; MinActive=''; PreStageHosts=''; ScaleOutBelow=''; ScaleInAbove=''
                 Aggressiveness=''; ScaleInDelay=''; ProfileLB=''; StartVMOnConnect=''; TimeZone=$plan.timeZone
@@ -383,7 +383,7 @@ foreach ($plan in ($pooledPlans | Sort-Object name)) {
 
         if (-not $enabled) {
             $skipCount++
-            $stubs.Add("<!--stub-skip:$($pool.name)--><div class='stub'><b>$(HtmlEnc $pool.name)</b> ($(HtmlEnc $pool.resourceGroup)) &mdash; plan $(HtmlEnc $plan.name) is assigned but NOT enabled. Azure is not scaling this pool today; day-one mimicry needs no NME profile here.</div>")
+            $stubs.Add("<!--stub-skip:$($pool.name)--><div class='stub'><b>$(HtmlEnc $pool.name)</b> ($(HtmlEnc $pool.resourceGroup)): plan $(HtmlEnc $plan.name) is assigned but NOT enabled. Azure is not scaling this pool today; day-one mimicry needs no NME profile here.</div>")
             $review.Add([pscustomobject]@{ Plan=$plan.name; Schedule='(all)'; Days=''; Pool=$pool.name; RG=$pool.resourceGroup; EnabledOnPool=$false
                 SessionHosts=''; SessionLimit=''; MinActive=''; PreStageHosts=''; ScaleOutBelow=''; ScaleInAbove=''
                 Aggressiveness=''; ScaleInDelay=''; ProfileLB=''; StartVMOnConnect=''; TimeZone=$plan.timeZone
@@ -400,7 +400,7 @@ foreach ($plan in ($pooledPlans | Sort-Object name)) {
         if ($scheds.Count -eq 0) {
             $noSchedFlags = @('plan has no pooled schedules')
             if ($dynamicFlag) { $noSchedFlags += 'dynamic plan - manual review' }
-            $stubs.Add("<!--stub-nosched:$($pool.name)--><div class='stub'><b>$(HtmlEnc $pool.name)</b> ($(HtmlEnc $pool.resourceGroup)) &mdash; plan $(HtmlEnc $plan.name) has no pooled schedules. Nothing to translate; add schedules in Azure or configure NME fresh.$(if ($dynamicFlag) { " <span class='pill high'>DYNAMIC plan</span>" })</div>")
+            $stubs.Add("<!--stub-nosched:$($pool.name)--><div class='stub'><b>$(HtmlEnc $pool.name)</b> ($(HtmlEnc $pool.resourceGroup)): plan $(HtmlEnc $plan.name) has no pooled schedules. Nothing to translate; add schedules in Azure or configure NME fresh.$(if ($dynamicFlag) { " <span class='pill high'>DYNAMIC plan</span>" })</div>")
             $review.Add([pscustomobject]@{ Plan=$plan.name; Schedule='(none)'; Days=''; Pool=$pool.name; RG=$pool.resourceGroup; EnabledOnPool=$true
                 SessionHosts=$B; SessionLimit=$L; MinActive=''; PreStageHosts=''; ScaleOutBelow=''; ScaleInAbove=''
                 Aggressiveness=''; ScaleInDelay=''; ProfileLB=''; StartVMOnConnect=$svocText; TimeZone=$plan.timeZone
@@ -506,7 +506,7 @@ foreach ($plan in ($pooledPlans | Sort-Object name)) {
         $cl = New-Object System.Collections.Generic.List[string]
         $cl.Add("<!--card:$($pool.name)-->")
         $cl.Add("<div class='card'>")
-        $cl.Add("<div class='card-head'><div class='pool'>$(HtmlEnc $pool.name)<span class='rg'>$(HtmlEnc $pool.resourceGroup)</span></div><div class='fromplan'>from scaling plan <b>$(HtmlEnc $plan.name)</b> &middot; time zone $(HtmlEnc $plan.timeZone) &mdash; enter times as shown</div></div>")
+        $cl.Add("<div class='card-head'><div class='pool'>$(HtmlEnc $pool.name)<span class='rg'>$(HtmlEnc $pool.resourceGroup)</span></div><div class='fromplan'>from scaling plan <b>$(HtmlEnc $plan.name)</b> &middot; time zone $(HtmlEnc $plan.timeZone). Enter times as shown</div></div>")
         $cl.Add("<div class='sec'>Profile</div>")
         $cl.Add((Row 'Auto-scale' (Toggle $true)))
         $cl.Add((TextRow 'Profile name' "$($plan.name)-mimic"))
@@ -541,7 +541,7 @@ foreach ($plan in ($pooledPlans | Sort-Object name)) {
             $i++
             $s = $ce.S
             $cl.Add("<div class='sched'>")
-            $cl.Add("<div class='sched-head'>Schedule $i of $($calc.Count) &mdash; $(HtmlEnc $s.Name)$(if ($i -eq 1) { ' (primary)' })</div>")
+            $cl.Add("<div class='sched-head'>Schedule $i of $($calc.Count): $(HtmlEnc $s.Name)$(if ($i -eq 1) { ' (primary)' })</div>")
             $cl.Add((Row 'Work days' (DayChips $s.Days)))
             $cl.Add((TextRow 'Start of work hours' (Format-Time $s.RuH $s.RuM)))
             $cl.Add((TextRow 'Hosts to be active by start' "$($ce.PreStage)"))
@@ -578,7 +578,7 @@ foreach ($plan in ($pooledPlans | Sort-Object name)) {
 $personalHtml = New-Object System.Collections.Generic.List[string]
 foreach ($pp in $personalPlans) {
     foreach ($ref in @($pp.refs)) { $referencedPoolIds["$($ref.hostPoolArmPath)".ToLowerInvariant()] = $true }
-    $personalHtml.Add("<div class='stub'><b>$(HtmlEnc $pp.name)</b> &mdash; personal scaling plan ($(@($pp.refs).Count) pool reference(s), time zone $(HtmlEnc $pp.timeZone)). Not translated - this tool does pooled plans first.</div>")
+    $personalHtml.Add("<div class='stub'><b>$(HtmlEnc $pp.name)</b>: personal scaling plan ($(@($pp.refs).Count) pool reference(s), time zone $(HtmlEnc $pp.timeZone)). Not translated - this tool does pooled plans first.</div>")
     $review.Add([pscustomobject]@{ Plan=$pp.name; Schedule='(personal)'; Days=''; Pool="($(@($pp.refs).Count) pool(s))"; RG=$pp.resourceGroup; EnabledOnPool=''
         SessionHosts=''; SessionLimit=''; MinActive=''; PreStageHosts=''; ScaleOutBelow=''; ScaleInAbove=''
         Aggressiveness=''; ScaleInDelay=''; ProfileLB=''; StartVMOnConnect=''; TimeZone=$pp.timeZone
@@ -631,7 +631,7 @@ summary{cursor:pointer;font-size:13.5px;font-weight:600}
 $doc = New-Object System.Collections.Generic.List[string]
 $doc.Add("<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>NME Auto-Scale Profiles</title><style>$css</style></head><body>")
 $doc.Add("<div class='top'><h1>NME Auto-Scale Profiles</h1><div class='sub'>Day-one mimicry of your Azure scaling plans &middot; generated $(Get-Date -Format 'yyyy-MM-dd HH:mm') by Get-NerdioAutoscaleSheet.ps1 $script:Version</div>")
-$doc.Add("<div class='how'>One card per host pool. Key each card into NME's Create Auto-Scale Profile for that pool, top to bottom &mdash; toggles, pills, and chips read exactly as the NME controls do. If a card shows more than one pre-stage schedule, turn on Use multiple schedules and add every block. Notes call out anything Azure expressed differently. The Alternative Schedule tab stays reserved for holidays.</div></div>")
+$doc.Add("<div class='how'>One card per host pool. Key each card into NME's Create Auto-Scale Profile for that pool, top to bottom. Toggles, pills, and chips read exactly as the NME controls do. If a card shows more than one pre-stage schedule, turn on Use multiple schedules and add every block. Notes call out anything Azure expressed differently. The Alternative Schedule tab stays reserved for holidays.</div></div>")
 foreach ($c in $cards) { $doc.Add($c) }
 if ($stubs.Count -gt 0) {
     $doc.Add("<div class='stubs'><div class='h2'>Nothing to enter for these</div>")
@@ -644,7 +644,7 @@ if ($personalHtml.Count -gt 0) {
     $doc.Add("</div>")
 }
 if ($noPlanPools.Count -gt 0) {
-    $doc.Add("<details><summary>$($noPlanPools.Count) host pool(s) have no scaling plan &mdash; nothing to mimic; configure NME auto-scale fresh (click to expand)</summary>")
+    $doc.Add("<details><summary>$($noPlanPools.Count) host pool(s) have no scaling plan. Nothing to mimic; configure NME auto-scale fresh (click to expand)</summary>")
     foreach ($np in $noPlanPools) { $doc.Add("<div class='np'>$(HtmlEnc $np.name) &nbsp;($(HtmlEnc $np.resourceGroup), $(HtmlEnc $np.hostPoolType))</div>") }
     $doc.Add("</details>")
 }

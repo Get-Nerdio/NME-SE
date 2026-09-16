@@ -1,6 +1,6 @@
 //==================================================================================
-// NERDIO MODELER IMPORT BUILDER — THE QUERY                   v0.7 (2026-08-04)
-// v0.7: synced with Get-NerdioModelerJson.ps1 v0.4 — observed-first density
+// NERDIO MODELER IMPORT BUILDER: THE QUERY                   v0.7 (2026-08-04)
+// v0.7: synced with Get-NerdioModelerJson.ps1 v0.4. Observed-first density
 // (capped at session limit), disk-size tier snap, 23:45 window cap, users >= 1,
 // overtimeHours 0 when disabled. SKUs and disk types always reported verbatim.
 // One run. Reads the AVD environment's ACTUAL usage + config and returns ONE ROW:
@@ -16,10 +16,10 @@
 //     Time range to "Last 30 days".
 //  3. Edit the 3 PARAMETERS lines below (name, lookback, time zone).
 //  4. Paste this WHOLE file. Run. Read the one result row left to right:
-//       WorkspaceCheck   must say OK — FAIL means wrong workspace or Time range
-//       Pools / PoolsWithUsage / PoolsNoTelemetry — do the counts make sense?
+//       WorkspaceCheck   must say OK. FAIL means wrong workspace or Time range
+//       Pools / PoolsWithUsage / PoolsNoTelemetry: do the counts make sense?
 //       FlaggedPools     anything listed here got a default somewhere
-//     Want per-pool detail on a flag? Run modeler-detail-grid.kql (OPTIONAL —
+//     Want per-pool detail on a flag? Run modeler-detail-grid.kql (OPTIONAL:
 //     it is a magnifying glass, not a required step).
 //  5. Export the row: toolbar Export > CSV (all columns) -> query_data.csv.
 //  6. Turn that CSV into the JSON file:
@@ -32,20 +32,20 @@
 //     Wrong file name? List the CSVs (Windows: dir *.csv | Mac: ls *.csv) and swap it in.
 //  7. Nerdio Modeler > Import > pick customer.json. Done.
 //     (Alternative to 5-6: expand the result row and copy the ModelerImportJson
-//     cell value into a .json file by hand — fine when it isn't truncated.)
+//     cell value into a .json file by hand. Fine when it isn't truncated.)
 //
 // AFTER IMPORT, TOUCH UP (Azure can't tell us these): FSLogix (off by default),
 // RDP egress GB (10), custom-image VM hours (6h/D2s_v5), any pool flagged
 // "(no usage data)" in its name.
 //
-// IF "No tabular expression statement found": an empty line split the query —
+// IF "No tabular expression statement found": an empty line split the query;
 // no line may be fully blank. Click anywhere inside the query text, Run again.
 //
 // MULTI-WORKSPACE ENVIRONMENTS: every host pool lands in the JSON no matter what
 // (inventory comes from Resource Graph, tenant-wide). Usage fills in only for
 // pools sending diagnostics to the workspace you run in. Pools split across
 // workspaces? Uncomment the workspace("...") lines in ConnRaw/AgentRaw below,
-// put the other workspace name(s) in — one run then covers them all.
+// put the other workspace name(s) in. One run then covers them all.
 //==================================================================================
 //
 //---------------------------- PARAMETERS (match Step 1) ---------------------------

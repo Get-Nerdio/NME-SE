@@ -8,7 +8,7 @@
 //  2. Top left: set Scope to your directory and subscription(s).
 //  3. Paste this WHOLE file. Run.
 //  4. You get one row per host pool per schedule. Click a row > "See details" >
-//     read the Sheet column top to bottom — it is written in the same order as
+//     read the Sheet column top to bottom. It is written in the same order as
 //     NME's Create Auto-Scale Profile screen. (Or Download CSV and read the
 //     Sheet column in a text editor.)
 //
@@ -24,7 +24,7 @@
 //----------------------------------------------------------------------------------
 // SCOPE: pooled, power-management plans only. Personal plans excluded (later
 // phase). Dynamic-autoscaling (preview) plans that create/delete hosts are not
-// detected — verify the plan is power management before trusting Base/Burst.
+// detected. Verify the plan is power management before trusting Base/Burst.
 // Trigger constants: scale-out up to 2 hosts / 5 min; scale-in up to 1 / 15 min.
 //==================================================================================
 let Pools = resources
@@ -162,10 +162,10 @@ Refs
 //==================================================================================
 // IF IT ERRORS / LOOKS WRONG
 //  - "No tabular expression statement found" (if pasted into Log Analytics):
-//    an empty line split the query — no line may be fully blank; click inside
+//    an empty line split the query. No line may be fully blank; click inside
 //    the query text and Run again.
-//  - Empty results: fix the Scope (top left) — wrong directory or subscriptions.
-//  - "replace_string" unknown: older ARG surface — change the DaysText line to
+//  - Empty results: fix the Scope (top left). Wrong directory or subscriptions.
+//  - "replace_string" unknown: older ARG surface. Change the DaysText line to
 //    tostring(Days) and live with the brackets.
 //  - A pool shows 0 session hosts: its hosts aren't registered; numbers will be 0.
 //==================================================================================

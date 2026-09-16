@@ -1,9 +1,9 @@
 //==================================================================================
-// MODELER IMPORT BUILDER — OPTIONAL DETAIL GRID               v0.7 (2026-08-04)
-// v0.7: synced with the main query — observed-first density (PerHostPeak column),
+// MODELER IMPORT BUILDER: OPTIONAL DETAIL GRID               v0.7 (2026-08-04)
+// v0.7: synced with the main query. Observed-first density (PerHostPeak column),
 // disk tier snap, 23:45 window cap. SKUs and disk types reported verbatim.
 // Per-pool breakdown of everything the main query (modeler-make-json.kql) puts
-// into the JSON. OPTIONAL — a magnifying glass, not a required step. Run it when
+// into the JSON. OPTIONAL: a magnifying glass, not a required step. Run it when
 // the main query's WorkspaceCheck or FlaggedPools says look closer, or when you
 // want to eyeball per-pool numbers before sending a model. Read-only.
 //----------------------------------------------------------------------------------
