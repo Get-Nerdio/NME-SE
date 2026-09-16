@@ -19,6 +19,8 @@ A cost model is only as credible as the data behind it. This tool feeds the Mode
 
 3. Read the review table it prints. One row per pool; anything defaulted is spelled out in `Flags`. The run never stops to ask anything. The first lines name the signed-in account, the tenant, and every subscription in scope. If a pool you expected is missing, look there first. A run covers one tenant, and the script warns you when your account can reach others.
 4. One zip downloads automatically: `modeler-import-<timestamp>.zip`. It holds the import JSON, the review CSV, the storage ledger CSV, the raw observation data, and the full console log. If someone asked you to run this, that zip is the only thing to send back.
+
+   Cloud Shell shows the download as a link at the bottom of the shell window, and it stays up for a few seconds. Missed it? The zip is still in your Cloud Shell home folder (the `/home/<name>` in your prompt). Run `download modeler-import-<timestamp>.zip` to pop the link again, or use the toolbar's **Manage files > Download** and enter the zip name. If Cloud Shell was set up without a storage account, the home folder is wiped when the session closes; re-run the command and click the link when it appears.
 5. Nerdio Modeler > Import > pick the JSON from the zip. Done.
 
 **Running from a local machine instead:** the **Az.Accounts** module is all it takes. `Install-Module Az.Accounts` once, then `Connect-AzAccount`. Add `-TenantId <id>` if you have several tenants, and sign in as the account that has Reader on the environment you're scanning. The run header names the account, tenant, and subscriptions it can see, so a wrong sign-in is visible on line 2. Not signed in? The script stops immediately and tells you exactly what to run. It never half-runs.
@@ -159,6 +161,6 @@ Two fallbacks, in order:
 | Fewer pools than expected | Check the run's opening lines: signed-in account, tenant, and the subscription list. The usual cause is the wrong tenant; `Connect-AzAccount -TenantId <id>` and run again. A run covers one tenant, and the script names any others your account can reach |
 | Storage ledger rows have an empty `ServesPools` | File-share diagnostics aren't flowing to Log Analytics, so share-to-pool mapping has no evidence. Sizes and costs are still correct; ask the AVD admin which pools use the share |
 | `THIS COPY IS STALE` warning, or an old version number on the first line | The machine is running old code, usually a saved `modeler.ps1` or a replayed command pinned to an old commit. Delete saved copies and re-paste the Quick start command. The raw URL also caches for about 5 minutes right after an update |
-| Auto-download didn't fire | Use Cloud Shell's Manage files > Download and enter the printed filename |
+| Auto-download didn't fire, or the link disappeared before you clicked it | The zip is in your Cloud Shell home folder. Run `download <zip name>` to pop the link again, or use Cloud Shell's Manage files > Download and enter the printed filename. Searching your browser for the filename won't find it; the browser just turns the name into a web address |
 
 ---
