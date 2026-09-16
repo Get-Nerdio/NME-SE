@@ -15,6 +15,14 @@ $anfPool = '/subscriptions/s2/resourcegroups/rg-anf/providers/microsoft.netapp/n
 # v0.20: two more pools sharing rg2 (density floor + single-session rule + shared-RG cost split)
 $poolTinyId   = '/subscriptions/s1/resourcegroups/rg2/providers/microsoft.desktopvirtualization/hostpools/PoolTiny'
 $poolSingleId = '/subscriptions/s1/resourcegroups/rg2/providers/microsoft.desktopvirtualization/hostpools/PoolSingle'
+# v0.21: a blue/green slot family in rg3 - slot-one (4 hosts, peak 30) and Slot-Two (6 hosts,
+# peak 20) serve the same people in turn. Merged: peak 50 (their samples add per slot), 10 hosts,
+# MAU 4 (distinct-user union of the two slots' tokens), limit 25 -> over-provisioned flag.
+$poolB1Id = '/subscriptions/s1/resourcegroups/rg3/providers/microsoft.desktopvirtualization/hostpools/PoolB-slot-one'
+$poolB2Id = '/subscriptions/s1/resourcegroups/rg3/providers/microsoft.desktopvirtualization/hostpools/PoolB-Slot-Two'
+$global:TenantCalls = 0      # v0.21: the first /tenants call dies with a transport error -> retried
+$global:HashWs1Calls = 0     # v0.21: the first per-user token query on ws1 dies with a transport error -> retried
+$global:MeterCalls = 0       # v0.21: meter-level (MeterId + UsageQuantity) cost queries
 
 # v0.15: storage is ledger-only, no prompts - nothing to mock for input.
 
@@ -34,6 +42,8 @@ function Invoke-AzRestMethod {
         ) } | ConvertTo-Json -Depth 10) }
     }
     if ($Method -eq 'GET' -and $Path.StartsWith('/tenants?')) {
+        $global:TenantCalls++
+        if ($global:TenantCalls -eq 1) { throw [System.Net.Http.HttpRequestException]::new('An error occurred while sending the request.') }
         return [pscustomobject]@{ StatusCode = 200; Content = (@{ value = @(
             @{ tenantId = 'ten-1'; displayName = 'Mock Tenant' },
             @{ tenantId = 'ten-2'; displayName = 'Other Tenant' }
@@ -53,6 +63,8 @@ function Invoke-AzRestMethod {
                 @{ id = "$poolTinyId/sessionhosts/sh4"; vmId = '/subscriptions/s1/resourcegroups/rg2/providers/microsoft.compute/virtualmachines/vm4' },
                 @{ id = "$poolSingleId/sessionhosts/sh5"; vmId = '/subscriptions/s1/resourcegroups/rg2/providers/microsoft.compute/virtualmachines/vm5' }
             )
+            foreach ($n in 10, 11, 18, 19) { $data += @{ id = "$poolB1Id/sessionhosts/sh$n"; vmId = "/subscriptions/s1/resourcegroups/rg3/providers/microsoft.compute/virtualmachines/avd-b1-$n" } }
+            foreach ($n in 12, 13, 14, 15, 16, 17) { $data += @{ id = "$poolB2Id/sessionhosts/sh$n"; vmId = "/subscriptions/s1/resourcegroups/rg3/providers/microsoft.compute/virtualmachines/avd-b2-$n" } }
         } elseif ($q -match 'virtualmachines') {
             # v0.17.2 regression shape: two D8s hosts run DIFFERENT images (the old
             # vmSize+ephemeral+imageId grouping split them into count-1 groups and
@@ -65,12 +77,16 @@ function Invoke-AzRestMethod {
                 @{ id = '/subscriptions/s1/resourcegroups/rg2/providers/microsoft.compute/virtualmachines/vm4'; vmSize = 'Standard_D64s_v5'; ephemeral = $false; imageId = ''; osDiskId = '/subscriptions/s1/resourcegroups/rg2/providers/microsoft.compute/disks/d4' },
                 @{ id = '/subscriptions/s1/resourcegroups/rg2/providers/microsoft.compute/virtualmachines/vm5'; vmSize = 'Standard_D16s_v5'; ephemeral = $false; imageId = ''; osDiskId = '/subscriptions/s1/resourcegroups/rg2/providers/microsoft.compute/disks/d5' }
             )
+            foreach ($n in 10, 11, 18, 19) { $data += @{ id = "/subscriptions/s1/resourcegroups/rg3/providers/microsoft.compute/virtualmachines/avd-b1-$n"; vmSize = 'Standard_D8s_v5'; ephemeral = $false; imageId = ''; osDiskId = "/subscriptions/s1/resourcegroups/rg3/providers/microsoft.compute/disks/avd-b1-$n-osdisk" } }
+            foreach ($n in 12, 13, 14, 15, 16, 17) { $data += @{ id = "/subscriptions/s1/resourcegroups/rg3/providers/microsoft.compute/virtualmachines/avd-b2-$n"; vmSize = 'Standard_D8s_v5'; ephemeral = $false; imageId = ''; osDiskId = "/subscriptions/s1/resourcegroups/rg3/providers/microsoft.compute/disks/avd-b2-$n-osdisk" } }
         } elseif ($q -match 'microsoft.compute/disks') {
             $data = @(
                 @{ id = '/subscriptions/s1/resourcegroups/rg1/providers/microsoft.compute/disks/d1'; diskSizeGb = 128; diskSku = 'Premium_LRS' },
                 @{ id = '/subscriptions/s1/resourcegroups/rg2/providers/microsoft.compute/disks/d4'; diskSizeGb = 512; diskSku = 'StandardSSD_LRS' },
                 @{ id = '/subscriptions/s1/resourcegroups/rg2/providers/microsoft.compute/disks/d5'; diskSizeGb = 127; diskSku = 'Standard_LRS' }
             )
+            foreach ($n in 10, 11, 18, 19) { $data += @{ id = "/subscriptions/s1/resourcegroups/rg3/providers/microsoft.compute/disks/avd-b1-$n-osdisk"; diskSizeGb = 512; diskSku = 'StandardSSD_LRS' } }
+            foreach ($n in 12, 13, 14, 15, 16, 17) { $data += @{ id = "/subscriptions/s1/resourcegroups/rg3/providers/microsoft.compute/disks/avd-b2-$n-osdisk"; diskSizeGb = 512; diskSku = 'StandardSSD_LRS' } }
         } elseif ($q -match 'storageaccounts') {
             $data = @(
                 @{ id = $saProf; name = 'stprofiles'; resourceGroup = 'rg-stor'; location = 'eastus'; accountKind = 'FileStorage'; skuName = 'Premium_ZRS' },
@@ -89,7 +105,10 @@ function Invoke-AzRestMethod {
                 # v0.20: limit 2 on a D64 = 0.03 users/vCPU -> must floor to the Modeler minimum 0.1
                 @{ id = $poolTinyId; name = 'PoolTiny'; resourceGroup = 'rg2'; location = 'eastus'; subscriptionId = 's1'; hostPoolType = 'Pooled'; maxSessionLimit = 2; preferredAppGroupType = 'Desktop'; startVMOnConnect = $true },
                 # v0.20: limit 1 = single-user pooled (experience 3) -> density 1.0, never the 1/16 the limit implies
-                @{ id = $poolSingleId; name = 'PoolSingle'; resourceGroup = 'rg2'; location = 'eastus'; subscriptionId = 's1'; hostPoolType = 'Pooled'; maxSessionLimit = 1; preferredAppGroupType = 'Desktop'; startVMOnConnect = $true }
+                @{ id = $poolSingleId; name = 'PoolSingle'; resourceGroup = 'rg2'; location = 'eastus'; subscriptionId = 's1'; hostPoolType = 'Pooled'; maxSessionLimit = 1; preferredAppGroupType = 'Desktop'; startVMOnConnect = $true },
+                # v0.21: the slot family (limit 25 so the merged 10 hosts vs peak 50 trips the over-provisioning flag)
+                @{ id = $poolB1Id; name = 'PoolB-slot-one'; resourceGroup = 'rg3'; location = 'eastus'; subscriptionId = 's1'; hostPoolType = 'Pooled'; maxSessionLimit = 25; preferredAppGroupType = 'Desktop'; startVMOnConnect = $true },
+                @{ id = $poolB2Id; name = 'PoolB-Slot-Two'; resourceGroup = 'rg3'; location = 'eastus'; subscriptionId = 's1'; hostPoolType = 'Pooled'; maxSessionLimit = 25; preferredAppGroupType = 'Desktop'; startVMOnConnect = $true }
             )   # v0.18: PoolEmpty has no session hosts and no telemetry - must be excluded from the JSON
         }
         return [pscustomobject]@{ StatusCode = 200; Content = (@{ data = $data } | ConvertTo-Json -Depth 10) }
@@ -131,6 +150,20 @@ function Invoke-AzRestMethod {
     if ($Method -eq 'POST' -and $Path -like '*Microsoft.CostManagement/query*') {
         $rows = @()
         $throttled = '{"error":{"message":"Too many requests. Please retry."}}'
+        $isMeterQuery = $false
+        try { $isMeterQuery = [bool](@((($Payload | ConvertFrom-Json).dataset.grouping) | Where-Object { $_.name -eq 'MeterId' }).Count -gt 0) } catch { }
+        if ($isMeterQuery) {
+            # v0.21: effective unit prices. s1 answers (compute 20% under retail, E20 disks 20.3% under,
+            # one files meter that will not reconcile); s2 is refused like its resource query.
+            $global:MeterCalls++
+            if ($Path -like '/subscriptions/s2/providers/*') { return [pscustomobject]@{ StatusCode = 403; Content = '{"error":{"message":"no cost access on s2"}}' } }
+            $mrows = @()
+            $mrows += ,@(1507.44, 7440, 'm-d8s-v5', 'D8s v5', 'USD')
+            $mrows += ,@(306.0, 10, 'm-e20', 'E20 LRS Disk', 'USD')
+            $mrows += ,@(500.0, 100000, 'm-files', 'Premium LRS Provisioned', 'USD')
+            $c = @{ properties = @{ columns = @(@{name='Cost'},@{name='UsageQuantity'},@{name='MeterId'},@{name='Meter'},@{name='Currency'}); rows = $mrows } }
+            return [pscustomobject]@{ StatusCode = 200; Content = ($c | ConvertTo-Json -Depth 10) }
+        }
         if ($Path -like '/subscriptions/s1/providers/*') {
             # v0.19 fast path: one subscription-level query, filtered to the RGs that matter.
             $global:CostS1SubCalls++
@@ -155,6 +188,10 @@ function Invoke-AzRestMethod {
             $rows += ,@(10.00,  '/subscriptions/s1/resourcegroups/rg2/providers/microsoft.compute/virtualmachines/vm5', 'USD')
             $rows += ,@(30.00,  '/subscriptions/s1/resourcegroups/rg2/providers/microsoft.compute/virtualmachines/vm9', 'USD')
             $rows += ,@(42.00,  $saProf.ToLower(), 'USD')
+            # v0.21: rg3 slot family. slot-one: two VMs at 100 + two E20 disks at 90 -> disks are 47% of
+            # its 380 (flag); Slot-Two: six VMs at 50, no disk rows -> the family is 680 with disks at 26%.
+            foreach ($n in 10, 11) { $rows += ,@(100.00, "/subscriptions/s1/resourcegroups/rg3/providers/microsoft.compute/virtualmachines/avd-b1-$n", 'USD'); $rows += ,@(90.00, "/subscriptions/s1/resourcegroups/rg3/providers/microsoft.compute/disks/avd-b1-$n-osdisk", 'USD') }
+            foreach ($n in 12, 13, 14, 15, 16, 17) { $rows += ,@(50.00, "/subscriptions/s1/resourcegroups/rg3/providers/microsoft.compute/virtualmachines/avd-b2-$n", 'USD') }
         } elseif ($Path -like '/subscriptions/s2/providers/*') {
             # v0.19 fallback trigger: subscription-level query refused -> per-RG path.
             $global:CostS2SubCalls++
@@ -198,13 +235,33 @@ function Get-AzAccessToken {
 }
 function Invoke-RestMethod {
     param($Method, $Uri, $Headers, $ContentType, $Body, $TimeoutSec)
-    if ("$Uri" -match 'modeler/VERSION') { return 'v0.20.2' }   # stale-copy self-check: report current
+    if ("$Uri" -match 'modeler/VERSION') { return 'v0.21' }   # stale-copy self-check: report current
+    if ("$Uri" -match 'prices\.azure\.com') {
+        # v0.21: public retail prices by meter id. D8s v5 retail 0.2533/h (billed 0.2026 -> 20% under);
+        # E20 LRS Disk retail 38.40/month (billed 30.60 -> 20.3% under); the files meter has no entry.
+        $items = @()
+        if ("$Uri" -match "meterId eq 'm-d8s-v5'") { $items = @(@{ retailPrice = 0.2533; unitOfMeasure = '1 Hour'; serviceName = 'Virtual Machines'; productName = 'Virtual Machines Dsv5 Series'; skuName = 'D8s v5'; armRegionName = 'eastus'; meterName = 'D8s v5'; type = 'Consumption'; effectiveStartDate = '2025-01-01T00:00:00Z' }) }
+        elseif ("$Uri" -match "meterId eq 'm-e20'") { $items = @(@{ retailPrice = 38.40; unitOfMeasure = '1/Month'; serviceName = 'Storage'; productName = 'Standard SSD Managed Disks'; skuName = 'E20 LRS'; armRegionName = 'eastus'; meterName = 'E20 LRS Disk'; type = 'Consumption'; effectiveStartDate = '2025-01-01T00:00:00Z' }) }
+        return [pscustomobject]@{ Items = $items; NextPageLink = $null }
+    }
     if ("$Uri" -notmatch 'api\.loganalytics\.io') { throw "unexpected Invoke-RestMethod uri in test: $Uri" }
     if ("$Uri" -match '22222222') { throw 'Response status code does not indicate success: 403 (Forbidden). NspValidationFailedError: Access to workspace ws2 from 1.2.3.4 is denied. To allow access from public networks, change the workspace Networking settings or add it to a Network Security Perimeter.' }
     $q = ($Body | ConvertFrom-Json).query
     $pid_ = $poolAId.ToLower()
+    $b1 = $poolB1Id.ToLower(); $b2 = $poolB2Id.ToLower()
+    if ($q -match 'H = tostring\(hash\(') {
+        # v0.21: per-user tokens (never names). PoolA 120 users; slot-one u1,u2,u121; Slot-Two u1,u121,u122
+        # -> family MAU 4, tenant-wide distinct 122. The first ask on ws1 dies with a transport error.
+        $global:HashWs1Calls++
+        if ($global:HashWs1Calls -eq 1) { throw 'The underlying connection was closed: An unexpected error occurred on a send.' }
+        if ($q -notmatch [regex]::Escape("Salt = '")) { throw 'hash query carries no salt' }
+        $rows = @(); foreach ($i in 1..120) { $rows += ,@($pid_, "t$i") }
+        foreach ($t in 't1', 't2', 't121') { $rows += ,@($b1, $t) }
+        foreach ($t in 't1', 't121', 't122') { $rows += ,@($b2, $t) }
+        return [pscustomobject]@{ tables = @([pscustomobject]@{ name = 'PrimaryResult'; columns = @(@{ name = 'HostPoolId' }, @{ name = 'H' }); rows = $rows }) }
+    }
     if ($q -match 'Buckets \| project HostPoolId, SlotUtc') {
-        return ('{"tables":[{"name":"PrimaryResult","columns":[{"name":"HostPoolId"},{"name":"SlotUtc"},{"name":"ConcurrentUsers"}],"rows":[["PID","2026-08-05T13:00:00Z","5"],["PID","2026-08-05T13:15:00Z","7"],["PID","2026-08-05T13:30:00Z","6"]]}]}'.Replace('PID', $pid_) | ConvertFrom-Json)
+        return ('{"tables":[{"name":"PrimaryResult","columns":[{"name":"HostPoolId"},{"name":"SlotUtc"},{"name":"ConcurrentUsers"}],"rows":[["PID","2026-08-05T13:00:00Z","5"],["PID","2026-08-05T13:15:00Z","7"],["PID","2026-08-05T13:30:00Z","6"],["B1","2026-08-05T13:00:00Z","30"],["B1","2026-08-05T13:15:00Z","30"],["B2","2026-08-05T13:15:00Z","20"],["B2","2026-08-05T13:30:00Z","20"]]}]}'.Replace('PID', $pid_).Replace('B1', $b1).Replace('B2', $b2) | ConvertFrom-Json)
     }
     if ($q -match 'WVDAgentHealthStatus') {
         return ('{"tables":[{"name":"PrimaryResult","columns":[{"name":"HostPoolId"},{"name":"PeakSessions"}],"rows":[["PID","60"]]}]}'.Replace('PID', $pid_) | ConvertFrom-Json)
@@ -216,16 +273,20 @@ function Invoke-RestMethod {
     if ($q -match "'hostip'") {
         return ('{"tables":[{"name":"PrimaryResult","columns":[{"name":"RowType"},{"name":"Ip"},{"name":"UserGuess"},{"name":"HostPoolId"}],"rows":[["hostip","10.0.0.4","","PID"],["pooluser","","user1","PID"],["pooluser","","user2","PID"]]}]}'.Replace('PID', $pid_) | ConvertFrom-Json)
     }
-    return ('{"tables":[{"name":"PrimaryResult","columns":[{"name":"HostPoolId"},{"name":"PeakConcurrentUsers"},{"name":"StartHour"},{"name":"WorkDurationMinutes"},{"name":"WorkDaysJson"},{"name":"WeeklyOffUH"},{"name":"PeakUsersPerHost"},{"name":"Mau"}],"rows":[["PID","40","8","600","[1,2,3,4,5]","84","9","120"]]}]}'.Replace('PID', $pid_) | ConvertFrom-Json)
+    return ('{"tables":[{"name":"PrimaryResult","columns":[{"name":"HostPoolId"},{"name":"PeakConcurrentUsers"},{"name":"StartHour"},{"name":"WorkDurationMinutes"},{"name":"WorkDaysJson"},{"name":"WeeklyOffUH"},{"name":"PeakUsersPerHost"},{"name":"Mau"}],"rows":[["PID","40","8","600","[1,2,3,4,5]","84","9","120"],["B1","30","9","540","[1,2,3,4,5]","10","8","3"],["B2","20","9","540","[1,2,3,4,5]","5","7","3"]]}]}'.Replace('PID', $pid_).Replace('B1', $b1).Replace('B2', $b2) | ConvertFrom-Json)
 }
 
 Remove-Item /tmp/test-model*.* -Force -ErrorAction SilentlyContinue
 $env:MODELER_FAST_RETRY = '1'   # v0.19: skip every throttle wait and the 90s cooldown in the harness
 & "$PSScriptRoot/../Get-NerdioModelerJson.ps1" -SkipDownload -OutFile /tmp/test-model.json -ModelName 'TEST'
 # snapshot run 1's counters, then run again with a token relay that never answers (v0.20)
-$run1 = @{ LaTokenCalls = $global:LaTokenCalls; CostS1SubCalls = $global:CostS1SubCalls; CostS2SubCalls = $global:CostS2SubCalls; CostAnfCalls = $global:CostAnfCalls; CostFilterRGs = @($global:CostFilterRGs) }
+$run1 = @{ LaTokenCalls = $global:LaTokenCalls; CostS1SubCalls = $global:CostS1SubCalls; CostS2SubCalls = $global:CostS2SubCalls; CostAnfCalls = $global:CostAnfCalls; CostFilterRGs = @($global:CostFilterRGs); TenantCalls = $global:TenantCalls; HashWs1Calls = $global:HashWs1Calls; MeterCalls = $global:MeterCalls }
+# v0.21: the same tenant with -NoSlotMerge - the slot pools stay separate deployments
+$global:LaTokenCalls = 3; $global:CostS1SubCalls = 0; $global:CostS2SubCalls = 0; $global:CostAnfCalls = 0; $global:TenantCalls = 1; $global:HashWs1Calls = 1
+Write-Host "`n--- NO-MERGE RUN: -NoSlotMerge ---"
+& "$PSScriptRoot/../Get-NerdioModelerJson.ps1" -SkipDownload -OutFile /tmp/test-model-nomerge.json -ModelName 'TEST-NOMERGE' -NoSlotMerge
 $global:LaTokenMode = 'dead'; $global:LaTokenCalls = 0
-$global:CostS1SubCalls = 0; $global:CostS2SubCalls = 0; $global:CostAnfCalls = 0; $global:CostFilterRGs = @()
+$global:CostS1SubCalls = 0; $global:CostS2SubCalls = 0; $global:CostAnfCalls = 0; $global:CostFilterRGs = @(); $global:TenantCalls = 1; $global:HashWs1Calls = 1
 Write-Host "`n--- SECOND RUN: Log Analytics token never issued ---"
 & "$PSScriptRoot/../Get-NerdioModelerJson.ps1" -SkipDownload -OutFile /tmp/test-model-dead.json -ModelName 'TEST-DEAD'
 # v0.20.2: third run with no Az.Accounts at all (Get-AzContext undefined) - must stop
@@ -247,6 +308,12 @@ $rowPoolA = $csv | Where-Object { $_.Pool -eq 'PoolA' }
 $rowEmpty = $csv | Where-Object { $_.Pool -eq 'PoolEmpty' }
 $rowTiny = $csv | Where-Object { $_.Pool -eq 'PoolTiny' }
 $rowSingle = $csv | Where-Object { $_.Pool -eq 'PoolSingle' }
+$famDep = $m.deployments | Where-Object { $_.name -like 'PoolB (slots merged:*' }
+$rowB1 = $csv | Where-Object { $_.Pool -eq 'PoolB-slot-one' }
+$rowB2 = $csv | Where-Object { $_.Pool -eq 'PoolB-Slot-Two' }
+$mNoMerge = Get-Content /tmp/test-model-nomerge.json -Raw | ConvertFrom-Json
+$csvNoMerge = Import-Csv /tmp/test-model-nomerge-review.csv
+$logNoMerge = if (Test-Path /tmp/test-model-nomerge-console.log) { Get-Content /tmp/test-model-nomerge-console.log -Raw } else { '' }
 $m2 = Get-Content /tmp/test-model-dead.json -Raw | ConvertFrom-Json
 $csv2 = Import-Csv /tmp/test-model-dead-review.csv
 $row2PoolA = $csv2 | Where-Object { $_.Pool -eq 'PoolA' }
@@ -266,7 +333,7 @@ $log = if (Test-Path $logPath) { Get-Content $logPath -Raw } else { '' }
 
 $checks = [ordered]@{
     'schema=4'                          = ($m.schema -eq 4)
-    '3 deployments (pools only)'        = (@($m.deployments).Count -eq 3)
+    '4 deployments (3 pools + 1 family)' = (@($m.deployments).Count -eq 4)
     'PoolA users=40 abs=0'              = ($a.users.total -eq 40 -and $a.users.absentPercent -eq 0)
     'PoolA density 1.13 (obs 9/8)'      = ($a.workload.maxUsersPerVCpu -eq 1.13)
     'PoolA window 8+10h M-F'            = ($a.autoScale.workStartHour -eq 8 -and $a.autoScale.workDurationMinutes -eq 600)
@@ -289,31 +356,31 @@ $checks = [ordered]@{
     'ActualMo: rg2 shared stem split 15/15' = ($rowTiny.ActualMo -eq '35' -and $rowSingle.ActualMo -eq '25' -and $rowTiny.ActualBasis -eq 'by id + host naming (hosts rebuilt; part split across pools sharing a name pattern)' -and $rowSingle.Flags -match 'ActualMo includes 15 for 1 VM\(s\).*; 15 of it split by host count with other pools sharing the name pattern \(estimate\)')
     'ActualMo: empty pool blank basis'      = ($rowEmpty.ActualMo -eq '0' -and $rowEmpty.ActualBasis -eq '')
     'ActualMo: image VM never swept in'     = ($log -match 'VM/disk spend matching no pool.s host naming: 54 \(listed below\)' -and $log -match 'Not attributed: 54 of VM/disk spend in rg1 matches no pool.s host naming \(2 item\(s\); top: img-builder 50, img-builder-osdisk 4\)' -and @($rawJson.costUnattributed).Count -eq 1 -and $rawJson.costUnattributed[0].total -eq 54)
-    'cost: summary explains the split'      = ($log -match 'Attributed to session hosts \+ disks: 255\.75 \(190\.75 by resource id; 65 by host naming to VMs that were rebuilt since the billing month, of which 30 is split by host count across pools sharing a name pattern\)' -and $log -match 'Storage accounts in those groups: 119' -and $log -match 'Hosts were rebuilt since the billing month in 3 pool\(s\)')
+    'cost: summary explains the split'      = ($log -match 'Attributed to session hosts \+ disks: 935\.75 \(870\.75 by resource id; 65 by host naming to VMs that were rebuilt since the billing month, of which 30 is split by host count across pools sharing a name pattern\)' -and $log -match 'Storage accounts in those groups: 119' -and $log -match 'Hosts were rebuilt since the billing month in 3 pool\(s\)')
     'token: retried, then cached (3 asks)'  = ($run1.LaTokenCalls -eq 3 -and $log -match 'Azure did not issue a Log Analytics token \(ManagedIdentityCredential authentication failed' -and $log -match 'waiting 5s, then asking again \(attempt 1 of 6\)' -and $log -match 'waiting 10s, then asking again \(attempt 2 of 6\)' -and $log -match 'Log Analytics token issued on attempt 3')
     'PoolTiny: density floored to 0.1'      = ($tiny.workload.maxUsersPerVCpu -eq 0.1 -and $tiny.experience -eq 1 -and $rowTiny.Density -eq '0.1' -and $rowTiny.Flags -match 'density raised to the Modeler minimum 0\.1')
     'PoolSingle: exp 3, density 1.0'        = ($single.experience -eq 3 -and $single.workload.maxUsersPerVCpu -eq 1 -and $single.workload.disk.size -eq 128 -and $single.workload.disk.type -eq 'Standard_LRS' -and $rowSingle.Flags -notmatch 'density from session limit' -and $rowSingle.Flags -match 'disk 127GB snapped up to 128GB tier')
-    'import pre-flight: 3/3 pass, no fixes' = ($log -match 'Import pre-flight: 3/3 deployments pass the Modeler.s import checks\.' -and $log -notmatch 'Import pre-flight corrected')
-    'rawdata: costAttribution + telemetry'  = (@($rawJson.costAttribution).Count -eq 4 -and (@($rawJson.costAttribution | Where-Object { $_.poolId -eq $poolAId })[0].byHostNaming -eq 35) -and (@($rawJson.costAttribution | Where-Object { $_.poolId -eq $poolAId })[0].rebuiltVmsBilled -eq 1) -and $rawJson.telemetry.collected -eq $true -and @($rawJson.telemetry.workspacesBlockedByNetwork).Count -eq 1)
+    'import pre-flight: 4/4 pass, no fixes' = ($log -match 'Import pre-flight: 4/4 deployments pass the Modeler.s import checks\.' -and $log -notmatch 'Import pre-flight corrected')
+    'rawdata: costAttribution + telemetry'  = (@($rawJson.costAttribution).Count -eq 6 -and (@($rawJson.costAttribution | Where-Object { $_.poolId -eq $poolAId })[0].byHostNaming -eq 35) -and (@($rawJson.costAttribution | Where-Object { $_.poolId -eq $poolAId })[0].rebuiltVmsBilled -eq 1) -and $rawJson.telemetry.collected -eq $true -and @($rawJson.telemetry.workspacesBlockedByNetwork).Count -eq 1)
     'dead run: TELEMETRY NOT COLLECTED'     = ($log2 -match 'TELEMETRY NOT COLLECTED - the usage queries never ran: Azure would not issue a Log Analytics token' -and $log2 -match 'RE-RUN THIS COMMAND' -and $log2 -notmatch 'no WVDConnections data found')
     'dead run: workspaces named NOT QUERIED' = (([regex]::Matches($log2, 'NOT QUERIED - Azure would not issue a Log Analytics token')).Count -eq 2 -and $log2 -match 'Share->pool evidence NOT COLLECTED')
     'dead run: gave up after 2 budgets (12)' = ($global:LaTokenCalls -eq 12 -and $log2 -match 'attempt 5 of 6' -and $log2 -notmatch 'attempt 6 of 6')
     'dead run: file says so everywhere'     = ($m2.description -match 'USAGE NOT COLLECTED \(Log Analytics token failure\)' -and $row2PoolA.Flags -match 'usage NOT collected this run \(no Log Analytics token - re-run\); users set to 1' -and $row2PoolA.PeakUsers -eq '0' -and (@($m2.deployments | Where-Object { $_.name -eq 'PoolA (no usage data)' })).Count -eq 1)
     'dead run: rawdata telemetry block'     = ($raw2.telemetry.collected -eq $false -and @($raw2.telemetry.workspacesNotQueried_tokenFailure).Count -eq 2 -and @($raw2.telemetry.poolWorkspaces).Count -eq 1)
     'no module: install steps, clean stop'  = ($log3 -match 'The Az.Accounts PowerShell module is not installed on this machine' -and $log3 -match 'Install-Module Az.Accounts -Scope CurrentUser' -and $log3 -match 'Connect-AzAccount' -and $log3 -notmatch 'not recognized' -and -not (Test-Path /tmp/test-model-nomod.json))
-    'dead run: rest of the run completed'   = ((Test-Path /tmp/test-model-dead.zip) -and $log2 -match 'Import pre-flight: 3/3 deployments pass' -and $log2 -match 'Storage ledger written' -and $log2 -match 'Model written')
+    'dead run: rest of the run completed'   = ((Test-Path /tmp/test-model-dead.zip) -and $log2 -match 'Import pre-flight: 4/4 deployments pass' -and $log2 -match 'Storage ledger written' -and $log2 -match 'Model written')
     'admin tasks on pool deployment'    = (@($a.administrative.tasks.'2').Count -eq 16)
     'zip holds json+csv+ledger+log'     = ($zipOk -and (Test-Path /tmp/zipcheck/test-model.json) -and (Test-Path /tmp/zipcheck/test-model-review.csv) -and (Test-Path /tmp/zipcheck/test-model-storage-ledger.csv) -and (Test-Path $logPath))
     'console log captured + clean'      = ($log -match 'Assembling deployments' -and $log -notmatch [char]27)
     'no raw-export failure in log'      = ($log -notmatch 'Raw data export failed' -and $log -match 'Raw decision data written')
-    'counters exclude storage rows'     = ($log -match 'Usage found for 1 of 4 pool')
-    'rawdata sane + version + evidence' = ($null -ne $rawJson -and @($rawJson.pools).Count -eq 4 -and $rawJson.meta.version -eq 'v0.20.2' -and @($rawJson.storageCandidates).Count -eq 4 -and @($rawJson.mapEvidence).Count -ge 1)
-    'version is the first output line'  = ($log -match '(?m)^\[i\] Get-NerdioModelerJson v0\.20\.2' -and ($log.IndexOf('Get-NerdioModelerJson v0.20.2') -lt $log.IndexOf('Signed in as')))
+    'counters exclude storage rows'     = ($log -match 'Usage found for 3 of 6 pool')
+    'rawdata sane + version + evidence' = ($null -ne $rawJson -and @($rawJson.pools).Count -eq 6 -and $rawJson.meta.version -eq 'v0.21' -and @($rawJson.storageCandidates).Count -eq 4 -and @($rawJson.mapEvidence).Count -ge 1)
+    'version is the first output line'  = ($log -match '(?m)^\[i\] Get-NerdioModelerJson v0\.21' -and ($log.IndexOf('Get-NerdioModelerJson v0.21') -lt $log.IndexOf('Signed in as')))
     'mixed-size pool: mode wins'        = ($a.workload.vmSize -eq 'Standard_D8s_v5' -and $a.image.type -eq 1 -and $a.workload.disk.size -eq 128 -and $a.workload.disk.type -eq 'Premium_LRS')
     'no stale-copy warning (current)'   = ($log -notmatch 'THIS COPY IS STALE')
-    'empty pool: out of JSON, reported' = (@($m.deployments | Where-Object { $_.name -like 'PoolEmpty*' }).Count -eq 0 -and @($m.deployments).Count -eq 3 -and $rowEmpty.Flags -match '^EMPTY - excluded' -and $rowEmpty.VmSize -eq '-' -and $rowEmpty.Window -eq '-' -and $rowEmpty.ActualMo -eq '0' -and @($rawJson.emptyPools).Count -eq 1 -and $rawJson.emptyPools[0].name -eq 'PoolEmpty' -and $log -match '1 EMPTY host pool\(s\) excluded' -and $log -match '3 deployments; 1 empty pool\(s\) excluded')
+    'empty pool: out of JSON, reported' = (@($m.deployments | Where-Object { $_.name -like 'PoolEmpty*' }).Count -eq 0 -and @($m.deployments).Count -eq 4 -and $rowEmpty.Flags -match '^EMPTY - excluded' -and $rowEmpty.VmSize -eq '-' -and $rowEmpty.Window -eq '-' -and $rowEmpty.ActualMo -eq '0' -and @($rawJson.emptyPools).Count -eq 1 -and $rawJson.emptyPools[0].name -eq 'PoolEmpty' -and $log -match '1 EMPTY host pool\(s\) excluded' -and $log -match '4 deployments; 1 empty pool\(s\) excluded')
     'NSP workspace named + fix given'   = ($log -match 'BLOCKED BY ITS NETWORK SETTINGS' -and $log -match 'inside the customer network')
-    'cost: ONE sub query for s1, filtered'  = ($run1.CostS1SubCalls -eq 2 -and @($run1.CostFilterRGs).Count -eq 3 -and ($run1.CostFilterRGs -contains 'rg1') -and ($run1.CostFilterRGs -contains 'rg2') -and ($run1.CostFilterRGs -contains 'rg-stor'))
+    'cost: ONE sub query for s1, filtered'  = ($run1.CostS1SubCalls -eq 2 -and @($run1.CostFilterRGs).Count -eq 4 -and ($run1.CostFilterRGs -contains 'rg1') -and ($run1.CostFilterRGs -contains 'rg2') -and ($run1.CostFilterRGs -contains 'rg3') -and ($run1.CostFilterRGs -contains 'rg-stor'))
     'cost: Retry-After honored (7s)'        = ($log -match 'Cost Management is throttling \(HTTP 429\) and asked for a 7s pause - honoring it')
     'cost: s2 403 -> per-RG fallback'       = ($run1.CostS2SubCalls -le 2 -and $log -match 'Subscription-level cost query for s2 was refused \(HTTP 403' -and $log -match 'falling back to one query per resource group')
     'cost: rg-anf 6 tries, then 2nd pass'   = ($run1.CostAnfCalls -eq 7 -and $log -match 'Cooling down 90s' -and $log -match 'Recovered on the second pass: resource group rg-anf' -and $log -match 'asked for a 3s pause')
@@ -324,12 +391,26 @@ $checks = [ordered]@{
         $ok = (@($global:ArgSubScopes).Count -ge 5)
         foreach ($sc in $global:ArgSubScopes) { if (@($sc).Count -ne 2 -or @($sc)[0] -ne 's1' -or @($sc)[1] -ne 's2') { $ok = $false } }
         $ok)
-    'identity banner + scope printed'   = ($log -match 'Signed in as don@mock\.test - tenant ten-1' -and $log -match 'Scope: 2 enabled subscription\(s\)' -and $log -match 'Sub One  \(s1\)' -and $log -match 'Sub Two  \(s2\)')
+    'identity banner + scope printed'   = ($log -match 'Signed in as an account in mock\.test - tenant ten-1' -and $log -notmatch 'don@mock' -and $log -match 'Scope: 2 enabled subscription\(s\)' -and $log -match 'Sub One  \(s1\)' -and $log -match 'Sub Two  \(s2\)')
     'other-tenant warning printed'      = ($log -match 'can also reach 1 other tenant' -and $log -match 'Connect-AzAccount -TenantId ten-2')
-    'rawdata identity block'            = ($rawJson.meta.identity.account -eq 'don@mock.test' -and $rawJson.meta.identity.tenantId -eq 'ten-1' -and @($rawJson.meta.identity.scopeSubscriptions).Count -eq 2)
-    'per-sub pool counts printed'       = ($log -match 'Found 4 host pool\(s\) across 1 subscription\(s\)' -and $log -match 'Sub One : 4 pool\(s\)')
-    'usage buckets csv in zip'          = (@($rawBucketsCsv).Count -eq 3 -and $rawBucketsCsv[1].ConcurrentUsers -eq '7')
+    'rawdata identity block'            = ($rawJson.meta.identity.account -eq 'an account in mock.test' -and $rawJson.meta.identity.accountMasked -eq $true -and $rawJson.meta.identity.tenantId -eq 'ten-1' -and @($rawJson.meta.identity.scopeSubscriptions).Count -eq 2)
+    'per-sub pool counts printed'       = ($log -match 'Found 6 host pool\(s\) across 1 subscription\(s\)' -and $log -match 'Sub One : 6 pool\(s\)')
+    'usage buckets csv in zip'          = (@($rawBucketsCsv).Count -eq 7 -and $rawBucketsCsv[1].ConcurrentUsers -eq '7' -and $rawBucketsCsv[0].SlotUtc -eq '2026-08-05T13:00:00Z')
     'no cmdlet-missing / skip errors'   = ($log -notmatch 'not recognized' -and $log -notmatch 'storage account\(s\) skipped \(slow')
+    # ---- v0.21
+    'family: one deployment, peak 50'       = ($null -ne $famDep -and @($famDep).Count -eq 1 -and $famDep.name -eq 'PoolB (slots merged: PoolB-slot-one + PoolB-Slot-Two)' -and $famDep.users.total -eq 50 -and $famDep.workload.vmSize -eq 'Standard_D8s_v5' -and $famDep.workload.disk.size -eq 512 -and @($m.deployments | Where-Object { $_.name -like 'PoolB-*' }).Count -eq 0)
+    'family: review keeps both rows'        = ($rowB1.MergedInto -eq 'PoolB' -and $rowB2.MergedInto -eq 'PoolB' -and $rowPoolA.MergedInto -eq '' -and $rowB1.PeakUsers -eq '30' -and $rowB2.PeakUsers -eq '20' -and $rowB1.Hosts -eq '4' -and $rowB2.Hosts -eq '6' -and $rowPoolA.Hosts -eq '3' -and $rowEmpty.Hosts -eq '0')
+    'family: table + rawdata'               = ($log -match 'BLUE/GREEN SLOT FAMILIES \(one deployment each' -and $log -match 'Blue/green slot families merged: 1 family \(2 slot pools\)' -and @($rawJson.slotFamilies).Count -eq 1 -and $rawJson.slotFamilies[0].family -eq 'PoolB' -and $rawJson.slotFamilies[0].hosts -eq 10 -and $rawJson.slotFamilies[0].peakConcurrentUsers -eq 50 -and $rawJson.slotFamilies[0].mau -eq 4 -and $rawJson.slotFamilies[0].merged -eq $true -and $rawJson.slotFamilies[0].actualMo -eq 680 -and $rawJson.slotFamilies[0].actualDisk -eq 180 -and $rawJson.slotFamilies[0].peakAtUtc -eq '2026-08-05T13:15:00Z')
+    'family: over-provisioned flag'         = ($rawJson.slotFamilies[0].flags -match 'over-provisioned: 10 hosts registered for a peak of 50 users \(25 per host\); 3 would carry it with 10% headroom' -and $rowB1.Flags -match 'over-provisioned: 4 hosts registered for a peak of 30 users \(25 per host\); 2 would carry it' -and $rowPoolA.Flags -notmatch 'over-provisioned')
+    'family: description says merged'       = ($m.description -match '1 blue/green slot family merged into one deployment each')
+    'no-merge run: slots stay separate'     = (@($mNoMerge.deployments).Count -eq 5 -and @($mNoMerge.deployments | Where-Object { $_.name -eq 'PoolB-slot-one' }).Count -eq 1 -and @($mNoMerge.deployments | Where-Object { $_.name -like '*slots merged*' }).Count -eq 0 -and (@($csvNoMerge | Where-Object { $_.MergedInto })).Count -eq 0 -and $logNoMerge -match 'kept as separate deployments \(-NoSlotMerge\)')
+    'tenant: peak 57 + 122 distinct users'  = ($log -match 'TENANT-WIDE, COUNTS ONLY: peak 57 concurrent user\(s\) at Wed Aug 5, 9:15 AM \(America/New_York\); 122 distinct user\(s\) connected in the 30-day lookback \(the per-pool MAU column adds to 126' -and $log -match '15 session host\(s\) registered' -and $rawJson.tenant.peakConcurrentUsers -eq 57 -and $rawJson.tenant.distinctUsers -eq 122 -and $rawJson.tenant.perPoolMauSum -eq 126 -and $rawJson.tenant.hostsRegistered -eq 15)
+    'pii: no names, no sign-in, salted'     = ($rawJson.meta.identity.account -notmatch '@' -and (Get-Content /tmp/zipcheck/test-model-rawdata.json -Raw) -notmatch 'don@mock|user1|user2' -and $log -notmatch 'don@mock|user1|user2' -and $rawJson.meta.notes -match 'No user identifiers are exported' -and $run1.HashWs1Calls -eq 2)
+    'pii: transcript header redacted'       = ($log -match '(?m)^Username: \[redacted\]' -and $log -match '(?m)^Machine: \[redacted\]' -and $log -notmatch '(?m)^RunAs User: (?!\[redacted\])')
+    'cost: ActualVm/ActualDisk + disk flag' = ($rowB1.ActualMo -eq '380' -and $rowB1.ActualVm -eq '200' -and $rowB1.ActualDisk -eq '180' -and $rowB1.Flags -match 'OS disks are 47% of this pool.s bill' -and $rowB2.ActualMo -eq '300' -and $rowB2.Flags -notmatch 'OS disks are' -and $rowPoolA.ActualVm -eq '180.75' -and $rowPoolA.ActualDisk -eq '15')
+    'discount: measured, printed, entered'  = ($log -match 'AZURE AGREEMENT DISCOUNT TO ENTER IN THE MODELER: 20%' -and $log -match 'compute meters: 20% under retail across 1 meter\(s\), 1507\.44 spend' -and $log -match 'OS disk meters: 20\.3% under retail across 1 meter\(s\), 306 spend' -and $log -match '1 meter\(s\) left out of the average' -and $m.globalSettings.enterpriseDiscount -eq 20 -and $rawJson.discount.enteredInModel -eq 20 -and $rawJson.discount.compute.discountPct -eq 20 -and @($rawJson.discount.meters).Count -eq 3 -and $run1.MeterCalls -eq 2 -and $log -match 'Meter-level cost query for subscription s2 was refused')
+    'transport: ARM + LA retried once'      = ($run1.TenantCalls -eq 2 -and $log -match 'Azure call hit a transport error \(An error occurred while sending the request\.\) - waiting 3s, then trying again \(1 of 3\)' -and $log -match 'Log Analytics call hit a transport error \(The underlying connection was closed' -and $log -match 'can also reach 1 other tenant')
+    'ledger + review csv columns'           = ((($csv[0].PSObject.Properties.Name) -join ',') -match 'Pool,RG,Type,Exp,Region,VmSize,Hosts,Limit,Density,PerHostPeak,PeakUsers,MAU,Window,Days,Overtime,MergedInto,Flags,ActualMo,ActualVm,ActualDisk,ActualBasis')
 }
 $fail = 0
 foreach ($k in $checks.Keys) {
