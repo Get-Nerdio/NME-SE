@@ -3113,7 +3113,7 @@ try {
         # AAD-only SQL auth therefore still isn't exercised by this test (not reported - a fixed test
         # limitation, not a finding about the environment).
 
-        # Mirror ConfigureSqlServer's temporary public-access toggle (cloudshell-deploy.ps1:702-747):
+        # Mirror ConfigureSqlServer's temporary public-access toggle (cloudshell-deploy.ps1):
         # the installer only flips PublicNetworkAccess to Enabled when the server was created Disabled
         # (i.e. -PrivateEndpointOnly here), does its SQL work, then restores it in a finally. Query the
         # live server rather than trusting $PrivateEndpointOnly directly, so this stays correct even if
@@ -3265,6 +3265,48 @@ try {
         if ($webRes.Ok) {
             Add-Result -Category "Deployability" -Check "Web App (httpsOnly, TLS 1.3, FTPS disabled)" -Result "Pass" -Detail "Created successfully."
             Add-TrackedResource -Type "webapp" -ResourceGroupName $ResourceGroupName -Name $portalWebName
+
+            # The template grants the portal web app's managed identity three data-plane roles on the
+            # Key Vault. Assign the same roles by id (as the template does) to surface any policy that
+            # restricts role assignments to service principals. Removed at cleanup.
+            if ($kvOk) {
+                $webPrincipalId = $null
+                try { $webPrincipalId = ($webRes.Content | ConvertFrom-Json).identity.principalId } catch {}
+                $kvRoles = @(
+                    @{ Name = "Key Vault Secrets Officer"; Id = "b86a8fe4-44ce-4948-aee5-eccb2c155cd7" },
+                    @{ Name = "Key Vault Crypto User"; Id = "12338af0-0e69-4776-bea7-57ae8d297424" },
+                    @{ Name = "Key Vault Certificate User"; Id = "db79e9a7-68ee-4b58-9aeb-b90e7c24fcba" }
+                )
+                if (-not $webPrincipalId) {
+                    Add-Result -Category "Deployability" -Check "Key Vault roles for Web App identity" -Result "Info" -Detail "Not tested (Web App managed identity not found)."
+                }
+                else {
+                    $kvRoleResults = Invoke-WithSpinner -Activity "Testing Key Vault role assignments (Web App identity)" -ScriptBlock {
+                        foreach ($role in $kvRoles) {
+                            $ra = $null; $raErr = $null
+                            # A freshly created managed identity can lag replication to Entra - retry only
+                            # "principal not found"; a policy denial won't match and is reported.
+                            for ($a = 1; $a -le 5; $a++) {
+                                try { $ra = New-AzRoleAssignment -ObjectId $webPrincipalId -RoleDefinitionId $role.Id -Scope $kvId -ErrorAction Stop; $raErr = $null; break }
+                                catch {
+                                    $raErr = Get-DetailedErrorMessage -ErrorRecord $_
+                                    if ($a -lt 5 -and "$($_.Exception.Message)" -match "does not exist|cannot find|PrincipalNotFound|principal|replicat") { Start-Sleep -Seconds ($a * 5); continue }
+                                    break
+                                }
+                            }
+                            @{ Name = $role.Name; Ra = $ra; Error = $raErr }
+                        }
+                    }
+                    foreach ($rr in $kvRoleResults) {
+                        $check = "Key Vault role assignment ($($rr.Name), Web App identity)"
+                        if ($rr.Ra) {
+                            Add-Result -Category "Deployability" -Check $check -Result "Pass" -Detail "Created successfully."
+                            Add-TrackedResource -Type "roleassignment" -ResourceGroupName $ResourceGroupName -Name $rr.Ra.RoleAssignmentId
+                        }
+                        else { Add-PolicyFailureResult -Category "Deployability" -Check $check -RawMessage $rr.Error }
+                    }
+                }
+            }
         }
         else { Add-PolicyFailureResult -Category "Deployability" -Check "Web App (httpsOnly, TLS 1.3, FTPS disabled)" -RawMessage $webRes.Error }
     }
