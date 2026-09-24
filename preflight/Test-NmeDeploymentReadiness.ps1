@@ -1326,7 +1326,7 @@ function Test-PrivateDnsZones {
         $dnsZoneCtxSwitched = $false
         if ($PrivateDnsZoneSubId -and $PrivateDnsZoneSubId -ne $SubscriptionId) {
             try { Set-AzContext -Subscription $PrivateDnsZoneSubId -ErrorAction Stop | Out-Null; $dnsZoneCtxSwitched = $true }
-            catch { Add-Result -Category "PrivateDns" -Check "Private DNS zones subscription" -Result "Warn" -Detail "Could not switch to subscription '$PrivateDnsZoneSubId' to read the private DNS zones; results below are from the current subscription and may be inaccurate." -Message $_.Exception.Message }
+            catch { Add-Result -Category "PrivateDns" -Check "Private DNS zones subscription" -Result "Warn" -Detail "Could not switch subscriptions; results below may be inaccurate." -Message $_.Exception.Message }
         }
         try {
         if ($CreateNewVnet) {
@@ -1973,7 +1973,7 @@ try {
         Add-Result -Category "Info" -Check "Tenant context" -Result "Pass" -Detail "Context pinned to the subscription's owning tenant $TenantId."
     }
     elseif ($TenantId) {
-        Add-Result -Category "Info" -Check "Tenant context" -Result "Warn" -Detail "Active context tenant '$activeTenant' does not match the subscription's owning tenant '$TenantId'. Key Vault and SQL steps may fail with an issuer mismatch - pin with 'Connect-AzAccount -TenantId $TenantId' on install day."
+        Add-Result -Category "Info" -Check "Tenant context" -Result "Warn" -Detail "Active context tenant '$activeTenant' does not match the subscription's owning tenant '$TenantId' - expect the Key Vault and SQL steps to fail with an issuer mismatch."
     }
 
     # Cloud environment (Commercial / Gov / China) drives Graph endpoint and DNS suffixes.
@@ -2089,7 +2089,7 @@ try {
         if ($script:EgressInfo.Ip) {
             $egressDetail = "Egress IP $($script:EgressInfo.Ip) - $($script:EgressInfo.Org)."
             if ($script:EgressInfo.IsZscaler) {
-                $egressDetail += " Traffic is egressing via ZSCALER (AS22616/AS53813) - expect non-web (SQL/1433) filtering and rotating source IPs; pin firewall rules to the observed IP and see the SQL egress check."
+                $egressDetail += " Egressing via ZSCALER (AS22616/AS53813) - expect non-web (SQL/1433) filtering and rotating source IPs."
             }
             Add-Result -Category "Info" -Check "Internet egress" -Result "Info" -Detail $egressDetail
         }
@@ -3050,11 +3050,11 @@ try {
             param($kv)
             if ($kv.KeyOk) { Add-Result -Category "Deployability" -Check "Key Vault key creation (RSA data-protection key)" -Result "Pass" -Detail "Created successfully." }
             elseif (& $isTenantIssuerErr $kv.KeyError) { Add-Result -Category "Deployability" -Check "Key Vault key creation (RSA data-protection key)" -Result "Fail" -Detail $tenantIssuerDetail -Message $kv.KeyError }
-            elseif (& $isDataPlanePermErr $kv.KeyError) { Add-Result -Category "Deployability" -Check "Key Vault key creation (RSA data-protection key)" -Result "Warn" -Detail "Not tested - could not grant the running user data-plane access to the throwaway vault (access-policy model). This is a test limitation, not an Azure Policy block." -Message $kv.KeyError }
+            elseif (& $isDataPlanePermErr $kv.KeyError) { Add-Result -Category "Deployability" -Check "Key Vault key creation (RSA data-protection key)" -Result "Warn" -Detail "Not tested - could not grant data-plane access to the throwaway vault (test limitation, not a policy block)." -Message $kv.KeyError }
             else { Add-PolicyFailureResult -Category "Deployability" -Check "Key Vault key creation (RSA data-protection key)" -RawMessage $kv.KeyError }
             if ($kv.SecretOk) { Add-Result -Category "Deployability" -Check "Key Vault secret creation" -Result "Pass" -Detail "Created successfully." }
             elseif (& $isTenantIssuerErr $kv.SecretError) { Add-Result -Category "Deployability" -Check "Key Vault secret creation" -Result "Fail" -Detail $tenantIssuerDetail -Message $kv.SecretError }
-            elseif (& $isDataPlanePermErr $kv.SecretError) { Add-Result -Category "Deployability" -Check "Key Vault secret creation" -Result "Warn" -Detail "Not tested - could not grant the running user data-plane access to the throwaway vault (access-policy model). This is a test limitation, not an Azure Policy block." -Message $kv.SecretError }
+            elseif (& $isDataPlanePermErr $kv.SecretError) { Add-Result -Category "Deployability" -Check "Key Vault secret creation" -Result "Warn" -Detail "Not tested - could not grant data-plane access to the throwaway vault (test limitation, not a policy block)." -Message $kv.SecretError }
             else { Add-PolicyFailureResult -Category "Deployability" -Check "Key Vault secret creation" -RawMessage $kv.SecretError }
         }
 
@@ -3109,7 +3109,7 @@ try {
     # template: test it when the SQL server has public access, skip it under -PrivateEndpointOnly.
     if ($sqlOk) {
         if ($PrivateEndpointOnly) {
-            Add-Result -Category "Deployability" -Check "SQL firewall rule (AllowAllWindowsAzureIps)" -Result "Info" -Detail "Not applicable - private-endpoint deployments do not create this rule (template condition not(configurePrivateEndpoints))."
+            Add-Result -Category "Deployability" -Check "SQL firewall rule (AllowAllWindowsAzureIps)" -Result "Info" -Detail "Not applicable (private-endpoint deployment)"
         }
         else {
             try {
@@ -3133,7 +3133,7 @@ try {
         # would go undetected until install day. Not applicable under -PrivateEndpointOnly - there is
         # no public data path to test.
         if ($PrivateEndpointOnly) {
-            Add-Result -Category "Connectivity" -Check "SQL data path (operator -> 1433)" -Result "Info" -Detail "Not applicable - -PrivateEndpointOnly leaves no public data path to the SQL server to test from this machine."
+            Add-Result -Category "Connectivity" -Check "SQL data path (operator -> 1433)" -Result "Info" -Detail "Not applicable (-PrivateEndpointOnly)"
         }
         else {
             Test-SqlOperatorDataPath -ResourceGroupName $ResourceGroupName -ServerName $sqlName -Fqdn "$sqlName.$SqlSuffix" -EgressIp $script:EgressInfo.Ip -IsCloudShell $script:IsCloudShell
