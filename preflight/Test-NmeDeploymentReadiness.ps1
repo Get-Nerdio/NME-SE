@@ -458,29 +458,35 @@ function Get-PolicyFromError {
         catch {}
     }
 
-    # Secondary: the error.additionalInfo[].info shape (ids, display names, and - for Initiative-
-    # assigned policies - the set definition id). Only attempted when the primary parse above didn't
-    # already resolve a name, and only trusted when the message truly is one clean trailing JSON blob -
-    # appended diagnostic text (ErrorDetails/response body/etc.) can otherwise garble this parse.
-    if (-not $out.PolicyAssignmentDisplayName -and -not $out.PolicyDefinitionDisplayName -and $ExceptionMessage -match "({.*}$)") {
-        try {
-            $j = $Matches[0] | ConvertFrom-Json -ErrorAction Stop
-            if ($j.error.message) { $out.Message = $j.error.message }
-            $info = ($j.error.additionalInfo | Where-Object { $_.type -eq "PolicyViolation" } | Select-Object -First 1).info
-            if ($info) {
-                if (-not $out.PolicyDefinitionId -and $info.policyDefinitionId) { $out.PolicyDefinitionId = $info.policyDefinitionId }
-                if (-not $out.PolicyAssignmentId -and $info.policyAssignmentId) { $out.PolicyAssignmentId = $info.policyAssignmentId }
-                if ($info.policySetDefinitionId) { $out.PolicySetDefinitionId = $info.policySetDefinitionId }
-                if ($info.policyDefinitionDisplayName) { $out.PolicyDefinitionDisplayName = $info.policyDefinitionDisplayName }
-                if ($info.policyAssignmentDisplayName) { $out.PolicyAssignmentDisplayName = $info.policyAssignmentDisplayName }
-            }
+    # Secondary: the PolicyViolation additionalInfo[].info block (ids, display names, and - for
+    # Initiative-assigned policies - the set definition id). The raw text is usually several parts
+    # joined by newlines (exception message + ErrorDetails + response body), and the parts use
+    # different shapes: ARM's {"error":{"additionalInfo":[...]}} vs the Track1 SDK body
+    # {"Code":...,"AdditionalInfo":[...]} with no "error" wrapper. Try the whole text and every
+    # JSON-object line, in both shapes (property access is case-insensitive), and take the first hit.
+    if (-not $out.PolicyAssignmentDisplayName -and -not $out.PolicyDefinitionDisplayName) {
+        $candidates = @($ExceptionMessage) + @($ExceptionMessage -split "`r`n|`n|`r" | Where-Object { $_ -match '^\s*\{.*\}\s*$' })
+        foreach ($c in $candidates) {
+            $j = $null
+            try { $j = $c | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+            $root = if ($j.error) { $j.error } else { $j }
+            $infoBlocks = @($root.additionalInfo) + @($root.details | ForEach-Object { $_.additionalInfo })
+            $info = ($infoBlocks | Where-Object { $_ -and $_.type -eq "PolicyViolation" } | Select-Object -First 1).info
+            if (-not $info) { continue }
+            if ($root.message) { $out.Message = $root.message }
+            if (-not $out.PolicyDefinitionId -and $info.policyDefinitionId) { $out.PolicyDefinitionId = $info.policyDefinitionId }
+            if (-not $out.PolicyAssignmentId -and $info.policyAssignmentId) { $out.PolicyAssignmentId = $info.policyAssignmentId }
+            if ($info.policySetDefinitionId) { $out.PolicySetDefinitionId = $info.policySetDefinitionId }
+            if ($info.policyDefinitionDisplayName) { $out.PolicyDefinitionDisplayName = $info.policyDefinitionDisplayName }
+            if ($info.policyAssignmentDisplayName) { $out.PolicyAssignmentDisplayName = $info.policyAssignmentDisplayName }
+            break
         }
-        catch {}
     }
 
-    # Last resort: bare policyDefinitionId/policyAssignmentId resource-id keys (older/odd shapes).
-    if (-not $out.PolicyDefinitionId -and $ExceptionMessage -match "policyDefinitionId'?:?\s*'?(/[^',\s\}]+)") { $out.PolicyDefinitionId = $Matches[1] }
-    if (-not $out.PolicyAssignmentId -and $ExceptionMessage -match "policyAssignmentId'?:?\s*'?(/[^',\s\}]+)") { $out.PolicyAssignmentId = $Matches[1] }
+    # Last resort: bare policyDefinitionId/policyAssignmentId resource-id keys (older/odd shapes),
+    # quoted either way ('key': '/...' or "key":"/...").
+    if (-not $out.PolicyDefinitionId -and $ExceptionMessage -match "policyDefinitionId['`"]?\s*:?\s*['`"]?(/[^'`",\s\}]+)") { $out.PolicyDefinitionId = $Matches[1] }
+    if (-not $out.PolicyAssignmentId -and $ExceptionMessage -match "policyAssignmentId['`"]?\s*:?\s*['`"]?(/[^'`",\s\}]+)") { $out.PolicyAssignmentId = $Matches[1] }
     return $out
 }
 
@@ -1032,8 +1038,11 @@ function Add-PolicyFailureResult {
         [string] $FailedPrefix = "Failed"
     )
     $p = Get-PolicyFromError -ExceptionMessage $RawMessage
-    $pDisplayHint = if ($p.PolicyAssignmentDisplayName) { $p.PolicyAssignmentDisplayName } elseif ($p.PolicyDefinitionDisplayName) { $p.PolicyDefinitionDisplayName } else { $null }
+    # Prefer the policy DEFINITION's name - it says what the rule enforces (e.g. "Key vaults should
+    # have deletion protection enabled"); the assignment name is appended so the customer can find it.
+    $pDisplayHint = if ($p.PolicyDefinitionDisplayName) { $p.PolicyDefinitionDisplayName } elseif ($p.PolicyAssignmentDisplayName) { $p.PolicyAssignmentDisplayName } else { $null }
     $polName = Resolve-PolicyName -PolicyDefinitionId $p.PolicyDefinitionId -PolicyAssignmentId $p.PolicyAssignmentId -PolicySetDefinitionId $p.PolicySetDefinitionId -DisplayNameHint $pDisplayHint
+    $assignmentNote = if ($p.PolicyAssignmentDisplayName -and $p.PolicyAssignmentDisplayName -ne $polName) { " (assignment '$($p.PolicyAssignmentDisplayName)')" } else { "" }
     $concise = Get-ConciseErrorMessage -RawMessage $RawMessage
 
     if ($ResourceGroupNameForActivityLog) {
@@ -1058,12 +1067,12 @@ function Add-PolicyFailureResult {
         }
 
         $tagHint = if ($Tags -and $Tags.Count -gt 0) { " Check the supplied tags against required-tag/tag-value policies." } else { "" }
-        $detail = if ($policySource) { "Blocked by Azure Policy '$polName'.$tagHint" }
+        $detail = if ($policySource) { "Blocked by Azure Policy '$polName'$assignmentNote.$tagHint" }
         elseif ($polName) { "Blocked by Azure Policy (id '$polName').$tagHint" }
         else { "Failed: $concise$tagHint" }
     }
     else {
-        $detail = if ($polName) { "Blocked by Azure Policy: '$polName'." } else { "$FailedPrefix`: $concise" }
+        $detail = if ($polName) { "Blocked by Azure Policy '$polName'$assignmentNote." } else { "$FailedPrefix`: $concise" }
     }
 
     Add-Result -Category $Category -Check $Check -Result "Fail" -Detail $detail -PolicyName $polName -Message $concise -RawMessage $RawMessage
@@ -1861,7 +1870,7 @@ Write-Host "  2. Check required resource providers are registered (read-only)."
 Write-Host "  3. Show you the exact resource names (and tags) it will use and let you customize them."
 Write-Host "  4. Create a temporary resource group (or use an existing empty one you provide) and attempt to deploy"
 Write-Host "     throwaway copies of the resources Nerdio Manager needs (Log Analytics, Storage, SQL server/database/firewall rule,"
-Write-Host "     App Service, Web App, Key Vault + key/secret, Automation, App Insights, a role assignment, and data collection rules)."
+Write-Host "     App Service, Web App, Key Vault + key/secret/certificate, Automation, App Insights, a role assignment, and data collection rules)."
 Write-Host "  5. Optionally test private endpoints, DNS resolution, and App Service VNet integration"
 Write-Host "     outbound connectivity, in an existing VNet you name or a new one this script creates"
 Write-Host "  6. DELETE everything it created, then provide a report you can send to your Nerdio sales team."
@@ -2559,7 +2568,7 @@ try {
             $rgCreateStart = (Get-Date).ToUniversalTime().AddMinutes(-5)
             $rgErrMsg = Get-DetailedErrorMessage -ErrorRecord $_
             $policyInfo = Get-PolicyFromError -ExceptionMessage $rgErrMsg
-            $armDisplayHint = if ($policyInfo.PolicyAssignmentDisplayName) { $policyInfo.PolicyAssignmentDisplayName } elseif ($policyInfo.PolicyDefinitionDisplayName) { $policyInfo.PolicyDefinitionDisplayName } else { $null }
+            $armDisplayHint = if ($policyInfo.PolicyDefinitionDisplayName) { $policyInfo.PolicyDefinitionDisplayName } elseif ($policyInfo.PolicyAssignmentDisplayName) { $policyInfo.PolicyAssignmentDisplayName } else { $null }
             $policyName = Resolve-PolicyName -PolicyDefinitionId $policyInfo.PolicyDefinitionId -PolicyAssignmentId $policyInfo.PolicyAssignmentId -PolicySetDefinitionId $policyInfo.PolicySetDefinitionId -DisplayNameHint $armDisplayHint
             $policySource = if ($policyName -and $policyName -ne $policyInfo.PolicyDefinitionId -and $policyName -ne $policyInfo.PolicyAssignmentId) { "the ARM error" } else { $null }
 
@@ -2846,33 +2855,37 @@ try {
         }
     } -ArgumentList $ResourceGroupName, $aspName, $Location, $Tags -InitializationScript $script:ErrorHelperInitScript
 
+    # Created via ARM PUT with the template's exact vault properties (nme-template-8.1.json): Azure
+    # RBAC authorization (no access policies), soft delete with 90-day retention, NO purge protection,
+    # and public network access / default ACL action following the private-endpoint choice.
     $jobs += Start-ThreadJob -Name "KeyVault" -ScriptBlock {
-        param($rg, $name, $loc, $tags, $pna)
+        param($rg, $name, $loc, $tags, $pna, $rmUrl, $subId, $tenantId)
         try {
-            $kvParams = @{ ResourceGroupName = $rg; VaultName = $name; Location = $loc; Sku = "Standard"; SoftDeleteRetentionInDays = 90; DisableRbacAuthorization = $true; Tag = $tags; ErrorAction = "Stop" }
-            if ($pna -eq "Disabled") {
-                try { New-AzKeyVault @kvParams -PublicNetworkAccess "Disabled" | Out-Null }
-                catch {
-                    # Only fall back for the specific "older Az.KeyVault has no -PublicNetworkAccess on
-                    # create" case, identified by PowerShell's canonical parameter-binding error. Do NOT
-                    # match on the bare property name "publicNetworkAccess" - an Azure Policy DENIAL message
-                    # references that property too, and treating a real policy block as a missing-parameter
-                    # would (briefly) create a public Key Vault instead of surfacing the block as a Fail.
-                    if ($_.Exception -is [System.Management.Automation.ParameterBindingException] -or "$($_.Exception.Message)" -match "A parameter cannot be found that matches parameter name") {
-                        New-AzKeyVault @kvParams | Out-Null
-                        Update-AzKeyVault -VaultName $name -ResourceGroupName $rg -PublicNetworkAccess "Disabled" -ErrorAction Stop | Out-Null
-                    }
-                    else { throw }
+            $body = @{
+                location   = $loc
+                tags       = $tags
+                properties = @{
+                    sku                       = @{ family = "A"; name = "standard" }
+                    tenantId                  = $tenantId
+                    accessPolicies            = @()
+                    enabledForDeployment      = $false
+                    enableSoftDelete          = $true
+                    enableRbacAuthorization   = $true
+                    softDeleteRetentionInDays = 90
+                    publicNetworkAccess       = $pna
+                    networkAcls               = @{ bypass = "AzureServices"; defaultAction = $(if ($pna -eq "Disabled") { "Deny" } else { "Allow" }) }
                 }
-            }
-            else { New-AzKeyVault @kvParams | Out-Null }
+            } | ConvertTo-Json -Depth 6
+            $uri = "$($rmUrl.TrimEnd('/'))/subscriptions/$subId/resourceGroups/$rg/providers/Microsoft.KeyVault/vaults/$name`?api-version=2023-07-01"
+            $resp = Invoke-AzRestMethod -Method PUT -Uri $uri -Payload $body -ErrorAction Stop
+            if ($resp.StatusCode -lt 200 -or $resp.StatusCode -ge 300) { throw $resp.Content }
             @{ Target = "Key Vault"; Ok = $true; Name = $name; Kind = "kv" }
         }
         catch {
             $errMsg = Get-DetailedErrorMessage -ErrorRecord $_
             @{ Target = "Key Vault"; Ok = $false; Error = $errMsg; Name = $name; Kind = "kv" }
         }
-    } -ArgumentList $ResourceGroupName, $kvName, $Location, $Tags, $pna -InitializationScript $script:ErrorHelperInitScript
+    } -ArgumentList $ResourceGroupName, $kvName, $Location, $Tags, $pna, $AzEnv.ResourceManagerUrl, $SubscriptionId, $TenantId -InitializationScript $script:ErrorHelperInitScript
 
     # NME deploys two Automation Accounts (an updater account with a system-assigned identity, and a
     # scripted-actions account with no identity) - test both, matching the installer template.
@@ -2919,174 +2932,129 @@ try {
         }
     }
 
-    # Simulate the brief Key Vault public-endpoint enable the standard install performs (to write
-    # secrets) before locking it back down. An Azure Policy that denies enabling KV public network
-    # access would block the install even though the final state is compliant - this surfaces that
-    # up front. Runs whenever the KV was created (not gated on -TestPrivate): every standard install
-    # does this toggle, and the check is cheap (two control-plane updates).
+    # Key Vault, mirroring 8.1 end to end. The template deploys the data-protection key and three
+    # secrets as ARM child resources (control plane - no data-plane rights or network path needed).
+    # cloudshell-deploy.ps1 then grants the running user "Key Vault Administrator" on the vault
+    # (Grant-KeyVaultAccess - the vault uses RBAC, so no access policies), temporarily opens network
+    # access ONLY if the vault was created private (Unlock-KeyVaultNetworkAccess: IP ACL to the
+    # ipinfo.io client IP, then public access on), creates self-signed certificates on the data
+    # plane as that user, and re-locks the vault.
     $kvOk = ($jobResults | Where-Object { $_.Kind -eq "kv" -and $_.Ok })
     if ($kvOk) {
-        # The installer's Key Vault sequence, mirrored end-to-end: harden -> briefly enable public
-        # access (the step a "deny KV public access" policy would block) -> grant the running user a
-        # data-plane access policy (the throwaway vault uses the access-policy model, like the
-        # installer, so the user has no data-plane rights by default) -> pin a correct-tenant token ->
-        # write the RSA data-protection key (no expiration, as the installer does) and a secret ->
-        # re-harden. Factored into a function so the exact same steps can be replayed after a mid-run
-        # re-authentication (the multi-tenant "Invalid issuer" retry below). No console writes, so it
-        # is safe to run under a spinner; returns a plain result the caller reports afterwards.
+        $kvId = "/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.KeyVault/vaults/$kvName"
+
+        $keyBody = @{ properties = @{ kty = "RSA"; attributes = @{ enabled = $true } } } | ConvertTo-Json -Depth 4
+        $keyRes = Invoke-PreflightArmPut -RmUrl $AzEnv.ResourceManagerUrl -ResourceId "$kvId/keys/nmepf-dp-key" -ApiVersion "2023-07-01" -Body $keyBody
+        if ($keyRes.Ok) { Add-Result -Category "Deployability" -Check "Key Vault key (RSA data-protection key)" -Result "Pass" -Detail "Created successfully." }
+        else { Add-PolicyFailureResult -Category "Deployability" -Check "Key Vault key (RSA data-protection key)" -RawMessage $keyRes.Error }
+
+        $secretBody = @{ properties = @{ value = "PreflightTest-$(New-RandomString -Length 16)"; attributes = @{ enabled = $true } } } | ConvertTo-Json -Depth 4
+        $secretRes = Invoke-PreflightArmPut -RmUrl $AzEnv.ResourceManagerUrl -ResourceId "$kvId/secrets/nmepf-test-secret" -ApiVersion "2023-07-01" -Body $secretBody
+        if ($secretRes.Ok) { Add-Result -Category "Deployability" -Check "Key Vault secret" -Result "Pass" -Detail "Created successfully." }
+        else { Add-PolicyFailureResult -Category "Deployability" -Check "Key Vault secret" -RawMessage $secretRes.Error }
+
+        # The installer's steps as the signed-in user. No console writes, so it is safe to run under
+        # a spinner; returns a plain result the caller reports (and tracks for cleanup) afterwards.
         function Invoke-KvInstallSimulation {
             param(
-                [string] $VaultName, [string] $ResourceGroupName, [string] $MeObjectId,
-                [string] $SignedInAccount, [string] $KeyVaultAudience, [string] $TenantId, [string] $EgressIp
+                [string] $VaultName, [string] $VaultId, [string] $ResourceGroupName, [string] $MeObjectId,
+                [string] $KeyVaultAudience, [string] $TenantId, [string] $EgressIp, [bool] $Hardened
             )
-            try { Update-AzKeyVault -VaultName $VaultName -ResourceGroupName $ResourceGroupName -PublicNetworkAccess "Disabled" -ErrorAction Stop | Out-Null } catch {}
             $result = @{}
-            # Installer order: pin the network ACL to the local IP BEFORE flipping public access on
-            # (Unlock-KeyVaultNetworkAccess, cloudshell-deploy.ps1:649-650), so the data-plane writes
-            # below actually traverse an IP-restricted vault instead of an effectively allow-all one.
-            # $EgressIp is only known on local runs (never in Cloud Shell) - skip rather than invent one.
-            if ($EgressIp) {
-                try {
-                    Update-AzKeyVaultNetworkRuleSet -VaultName $VaultName -ResourceGroupName $ResourceGroupName -IPAddressRange $EgressIp -DefaultAction Deny -Bypass None -ErrorAction Stop | Out-Null
-                    $result.AclAttempted = $true
-                    $result.AclOk = $true
-                }
-                catch {
-                    $result.AclAttempted = $true
-                    $result.AclOk = $false
-                    $result.AclError = Get-DetailedErrorMessage -ErrorRecord $_
-                }
-            }
             try {
-                Update-AzKeyVault -VaultName $VaultName -ResourceGroupName $ResourceGroupName -PublicNetworkAccess "Enabled" -ErrorAction Stop | Out-Null
-                $result.Ok = $true
+                $ra = New-AzRoleAssignment -ObjectId $MeObjectId -RoleDefinitionName "Key Vault Administrator" -Scope $VaultId -ErrorAction Stop
+                $result.RoleOk = $true; $result.RoleAssignmentId = $ra.RoleAssignmentId
             }
-            catch {
-                $kvToggleErrMsg = Get-DetailedErrorMessage -ErrorRecord $_
-                $result.Ok = $false
-                $result.Error = $kvToggleErrMsg
-                $result.IsParamBind = ($_.Exception -is [System.Management.Automation.ParameterBindingException] -or $kvToggleErrMsg -match "A parameter cannot be found")
-            }
-            if ($result.Ok) {
-                # Grant the running user a data-plane access policy so the key/secret writes below aren't
-                # refused by the vault itself (a data-plane 403, unrelated to Azure Policy). Best-effort;
-                # a failure here is surfaced by the writes below.
-                try {
-                    if ($MeObjectId) { Set-AzKeyVaultAccessPolicy -VaultName $VaultName -ResourceGroupName $ResourceGroupName -ObjectId $MeObjectId -PermissionsToKeys create, get, delete -PermissionsToSecrets set, get, delete -ErrorAction Stop | Out-Null }
-                    elseif ($SignedInAccount) { Set-AzKeyVaultAccessPolicy -VaultName $VaultName -ResourceGroupName $ResourceGroupName -UserPrincipalName $SignedInAccount -PermissionsToKeys create, get, delete -PermissionsToSecrets set, get, delete -ErrorAction Stop | Out-Null }
-                    $result.AccessPolicySet = $true
+            catch { $result.RoleOk = $false; $result.RoleError = Get-DetailedErrorMessage -ErrorRecord $_; return $result }
+
+            if ($Hardened) {
+                # Unlock-KeyVaultNetworkAccess order: pin the ACL to the client IP BEFORE enabling
+                # public access. $EgressIp is only known on local runs (never in Cloud Shell).
+                if ($EgressIp) {
+                    $result.AclAttempted = $true
+                    try { Update-AzKeyVaultNetworkRuleSet -VaultName $VaultName -ResourceGroupName $ResourceGroupName -IPAddressRange $EgressIp -DefaultAction Deny -Bypass None -ErrorAction Stop | Out-Null; $result.AclOk = $true }
+                    catch { $result.AclOk = $false; $result.AclError = Get-DetailedErrorMessage -ErrorRecord $_ }
                 }
-                catch { $result.AccessPolicySet = $false; $result.AccessPolicyError = Get-DetailedErrorMessage -ErrorRecord $_ }
-                # Prime the token cache with a Key Vault (data-plane) token explicitly scoped to the
-                # subscription's home tenant before the writes below. For an account signed in across
-                # multiple Entra tenants (guest/B2B access), Az PowerShell can otherwise silently reuse a
-                # cached token for a different tenant on this resource audience than the one already
-                # resolved for the subscription, which the vault then rejects with "Invalid issuer"
-                # (AKV10032). Best-effort - if this fails, the writes below will surface the real error.
+                try { Update-AzKeyVault -VaultName $VaultName -ResourceGroupName $ResourceGroupName -PublicNetworkAccess "Enabled" -ErrorAction Stop | Out-Null; $result.UnlockOk = $true }
+                catch { $result.UnlockOk = $false; $result.UnlockError = Get-DetailedErrorMessage -ErrorRecord $_ }
+            }
+
+            if (-not $Hardened -or $result.UnlockOk) {
+                # Pin a Key Vault token to the subscription's tenant first - a multi-tenant (guest/B2B)
+                # account can otherwise reuse another tenant's cached token and get AKV10032.
                 try { Get-AzAccessToken -ResourceUrl $KeyVaultAudience -TenantId $TenantId -ErrorAction Stop | Out-Null } catch {}
-                # Retry briefly for data-plane/access-policy propagation after enabling public access; a
-                # real policy denial or issuer mismatch won't match the retry regex and falls through
-                # quickly to be reported.
-                for ($a = 1; $a -le 4; $a++) {
+                # Same certificate policy as ConfigureAppCertificate. A fresh RBAC assignment can take a
+                # few minutes to reach the data plane - retry only that (and throttling) for up to ~3 min.
+                $certPolicy = New-AzKeyVaultCertificatePolicy -SecretContentType "application/x-pkcs12" -SubjectName "CN=nmepf-test-cert" -IssuerName "Self" -ValidityInMonths 120 -ReuseKeyOnRenewal
+                for ($a = 1; $a -le 12; $a++) {
                     try {
-                        Add-AzKeyVaultKey -VaultName $VaultName -Name "nmepf-dp-key" -Destination "Software" -KeyType "RSA" -ErrorAction Stop | Out-Null
-                        $result.KeyOk = $true; break
+                        $op = Add-AzKeyVaultCertificate -VaultName $VaultName -Name "nmepf-test-cert" -CertificatePolicy $certPolicy -ErrorAction Stop
+                        for ($w = 0; $w -lt 12 -and $op.Status -eq "inProgress"; $w++) {
+                            Start-Sleep -Seconds 5
+                            $op = Get-AzKeyVaultCertificateOperation -VaultName $VaultName -Name "nmepf-test-cert" -ErrorAction Stop
+                        }
+                        if ($op.Status -eq "completed") { $result.CertOk = $true }
+                        else { $result.CertOk = $false; $result.CertError = "Certificate operation ended with status '$($op.Status)'. $($op.ErrorMessage)" }
+                        break
                     }
                     catch {
-                        $result.KeyError = Get-DetailedErrorMessage -ErrorRecord $_
-                        if ($a -lt 4 -and "$($_.Exception.Message)" -match "Forbidden|not authorized|network|throttl|429|503|being provisioned") { Start-Sleep -Seconds ($a * 5); continue }
-                        $result.KeyOk = $false; break
+                        $result.CertError = Get-DetailedErrorMessage -ErrorRecord $_
+                        if ($a -lt 12 -and "$($_.Exception.Message)" -match "ForbiddenByRbac|Caller is not authorized|throttl|429|503") { Start-Sleep -Seconds 15; continue }
+                        $result.CertOk = $false; break
                     }
                 }
-                try {
-                    Set-AzKeyVaultSecret -VaultName $VaultName -Name "nmepf-test-secret" -SecretValue (ConvertTo-SecureString -String "PreflightTest!$(Get-Random)" -AsPlainText -Force) -ErrorAction Stop | Out-Null
-                    $result.SecretOk = $true
-                }
-                catch { $result.SecretError = Get-DetailedErrorMessage -ErrorRecord $_; $result.SecretOk = $false }
             }
-            # Revert to the hardened end-state (best-effort/cosmetic; the KV is deleted at cleanup anyway).
-            try { Update-AzKeyVault -VaultName $VaultName -ResourceGroupName $ResourceGroupName -PublicNetworkAccess "Disabled" -ErrorAction Stop | Out-Null } catch {}
+
+            if ($Hardened -and $result.UnlockOk) {
+                # Lock-KeyVaultNetworkAccess: public access off and trusted-service bypass removed.
+                try { Update-AzKeyVault -VaultName $VaultName -ResourceGroupName $ResourceGroupName -PublicNetworkAccess "Disabled" -ErrorAction Stop | Out-Null } catch {}
+                try { Update-AzKeyVaultNetworkRuleSet -VaultName $VaultName -ResourceGroupName $ResourceGroupName -Bypass None -ErrorAction Stop | Out-Null } catch {}
+            }
             return $result
         }
 
-        # Run the install simulation (harden -> ACL -> enable -> data-plane writes -> harden) under a spinner.
-        $kvToggle = Invoke-WithSpinner -Activity "Testing Key Vault public-access toggle and data-plane writes" -ScriptBlock {
-            Invoke-KvInstallSimulation -VaultName $kvName -ResourceGroupName $ResourceGroupName -MeObjectId $meObjectId -SignedInAccount $SignedInAccount -KeyVaultAudience $KeyVaultAudience -TenantId $TenantId -EgressIp $script:EgressInfo.Ip
-        }
-
-        # Report the network-rule-set (IP ACL) write. Only attempted when an egress IP is known (local
-        # runs; never in Cloud Shell, see E12 above) - without one there is no IP to pin the rule to, and
-        # inventing one would misrepresent the test rather than skip it.
-        if (-not $kvToggle.AclAttempted) {
-            Add-Result -Category "Deployability" -Check "Key Vault firewall rule (temporary IP ACL)" -Result "Info" -Detail "Not tested (egress IP unknown)."
-        }
-        elseif ($kvToggle.AclOk) {
-            Add-Result -Category "Deployability" -Check "Key Vault firewall rule (temporary IP ACL)" -Result "Pass" -Detail "Created successfully."
+        if (-not $meObjectId) {
+            Add-Result -Category "Deployability" -Check "Key Vault certificate creation" -Result "Info" -Detail "Not tested (signed-in user's object id unavailable)."
         }
         else {
-            Add-PolicyFailureResult -Category "Deployability" -Check "Key Vault firewall rule (temporary IP ACL)" -RawMessage $kvToggle.AclError
-        }
+            $kvHardened = ($pna -eq "Disabled")
+            $kvSim = Invoke-WithSpinner -Activity "Testing Key Vault role assignment and certificate creation" -ScriptBlock {
+                Invoke-KvInstallSimulation -VaultName $kvName -VaultId $kvId -ResourceGroupName $ResourceGroupName -MeObjectId $meObjectId -KeyVaultAudience $KeyVaultAudience -TenantId $TenantId -EgressIp $script:EgressInfo.Ip -Hardened $kvHardened
+            }
 
-        if ($kvToggle.Ok) {
-            Add-Result -Category "Deployability" -Check "Key Vault temporary public access (confirmed allowed)" -Result "Pass"
-        }
-        elseif ($kvToggle.IsParamBind) {
-            Add-Result -Category "Deployability" -Check "Key Vault temporary public access (install step)" -Result "Warn" -Detail "Not tested - the installed Az.KeyVault module is too old. Update the Az modules and re-run."
-        }
-        else {
-            Add-PolicyFailureResult -Category "Deployability" -Check "Key Vault temporary public access (install step)" -RawMessage $kvToggle.Error
-        }
+            if ($kvSim.RoleOk) {
+                Add-Result -Category "Deployability" -Check "Key Vault role assignment (Key Vault Administrator)" -Result "Pass" -Detail "Created successfully."
+                Add-TrackedResource -Type "roleassignment" -ResourceGroupName $ResourceGroupName -Name $kvSim.RoleAssignmentId
+            }
+            else { Add-PolicyFailureResult -Category "Deployability" -Check "Key Vault role assignment (Key Vault Administrator)" -RawMessage $kvSim.RoleError }
 
-        # Classifiers for the data-plane write outcomes.
-        # A Key Vault firewall rejection (ForbiddenByFirewall) is distinct from both of the below: it is
-        # not an Azure Policy block and not a test limitation - it means the data-plane write left this
-        # machine via an IP the vault's ACL does not cover (commonly split egress, e.g. Zscaler routing
-        # HTTPS and data-plane traffic differently), which is a genuine finding: the installer's Key
-        # Vault step will fail from this network path the same way.
-        $isKvFirewallErr = { param($m) $m -and ($m -match "ForbiddenByFirewall" -or $m -match "Client address is not authorized") }
-        # A vault data-plane permission refusal ("does not have keys/secrets ... permission", Forbidden
-        # from the access policy) is NOT an Azure Policy block - report it as a WARN test limitation
-        # rather than a misleading policy Fail. A genuine Azure Policy denial (RequestDisallowedByPolicy)
-        # falls through to Add-PolicyFailureResult, which names the blocking policy.
-        $isDataPlanePermErr = { param($m) $m -and ($m -match "does not have (keys|secrets|certificates).*permission" -or $m -match "ForbiddenByPolicy" -or $m -match "AccessDenied") }
-        # A "wrong/invalid issuer" rejection (Key Vault AKV10032, or the ARM equivalent) means the token
-        # was minted by a tenant the vault doesn't trust. A vault's tenant affinity is fixed at CREATION
-        # time from the active context, so this cannot be corrected by a data-plane re-auth after the
-        # fact - it is prevented up front by pinning the context to the subscription's owning tenant
-        # before any resources are created (see the intake region). If it still occurs here, that pin
-        # could not be applied (the account needs an interactive sign-in to the subscription's tenant),
-        # and the remedy is to reconnect to that tenant and re-run - reported as a Fail + a next-step.
-        $isTenantIssuerErr = { param($m) $m -and ($m -match "AKV10032" -or $m -match "Invalid issuer" -or $m -match "wrong issuer") }
-        $hasTenantIssuer = { param($kv) (& $isTenantIssuerErr $kv.KeyError) -or (& $isTenantIssuerErr $kv.SecretError) }
-        $tenantIssuerDetail = "Key Vault rejected the token as issued by the wrong tenant. Run 'Connect-AzAccount -TenantId $TenantId -UseDeviceAuthentication', then re-run this script."
+            if ($kvHardened -and $kvSim.RoleOk) {
+                if (-not $kvSim.AclAttempted) { Add-Result -Category "Deployability" -Check "Key Vault firewall rule (temporary IP ACL)" -Result "Info" -Detail "Not tested (egress IP unknown)." }
+                elseif ($kvSim.AclOk) { Add-Result -Category "Deployability" -Check "Key Vault firewall rule (temporary IP ACL)" -Result "Pass" -Detail "Created successfully." }
+                else { Add-PolicyFailureResult -Category "Deployability" -Check "Key Vault firewall rule (temporary IP ACL)" -RawMessage $kvSim.AclError }
+                if ($kvSim.UnlockOk) { Add-Result -Category "Deployability" -Check "Key Vault temporary public access (install step)" -Result "Pass" -Detail "Allowed." }
+                else { Add-PolicyFailureResult -Category "Deployability" -Check "Key Vault temporary public access (install step)" -RawMessage $kvSim.UnlockError }
+            }
 
-        # Report the two data-plane write rows from a $kvToggle result.
-        $reportKvDataPlane = {
-            param($kv)
-            if ($kv.KeyOk) { Add-Result -Category "Deployability" -Check "Key Vault key creation (RSA data-protection key)" -Result "Pass" -Detail "Created successfully." }
-            elseif (& $isTenantIssuerErr $kv.KeyError) { Add-Result -Category "Deployability" -Check "Key Vault key creation (RSA data-protection key)" -Result "Fail" -Detail $tenantIssuerDetail -Message $kv.KeyError }
-            elseif (& $isKvFirewallErr $kv.KeyError) { Add-Result -Category "Deployability" -Check "Key Vault key creation (RSA data-protection key)" -Result "Fail" -Detail "Key Vault firewall rejected this machine although its egress IP was allowed - likely split egress (e.g. Zscaler). The installer's Key Vault step will fail from this network; route all HTTPS through one egress IP." -Message $kv.KeyError }
-            elseif (& $isDataPlanePermErr $kv.KeyError) { Add-Result -Category "Deployability" -Check "Key Vault key creation (RSA data-protection key)" -Result "Warn" -Detail "Not tested - could not grant this account data-plane access to the test vault." -Message $kv.KeyError }
-            else { Add-PolicyFailureResult -Category "Deployability" -Check "Key Vault key creation (RSA data-protection key)" -RawMessage $kv.KeyError }
-            if ($kv.SecretOk) { Add-Result -Category "Deployability" -Check "Key Vault secret creation" -Result "Pass" -Detail "Created successfully." }
-            elseif (& $isTenantIssuerErr $kv.SecretError) { Add-Result -Category "Deployability" -Check "Key Vault secret creation" -Result "Fail" -Detail $tenantIssuerDetail -Message $kv.SecretError }
-            elseif (& $isKvFirewallErr $kv.SecretError) { Add-Result -Category "Deployability" -Check "Key Vault secret creation" -Result "Fail" -Detail "Key Vault firewall rejected this machine although its egress IP was allowed - likely split egress (e.g. Zscaler). The installer's Key Vault step will fail from this network; route all HTTPS through one egress IP." -Message $kv.SecretError }
-            elseif (& $isDataPlanePermErr $kv.SecretError) { Add-Result -Category "Deployability" -Check "Key Vault secret creation" -Result "Warn" -Detail "Not tested - could not grant this account data-plane access to the test vault." -Message $kv.SecretError }
-            else { Add-PolicyFailureResult -Category "Deployability" -Check "Key Vault secret creation" -RawMessage $kv.SecretError }
-        }
-
-        # Report the data-plane key/secret writes (only attempted if the public-access enable succeeded).
-        # Key and secret are children of the vault - removed when the vault is purged at cleanup.
-        if ($kvToggle.Ok) {
-            & $reportKvDataPlane $kvToggle
-
-            # If Key Vault still rejected the token as wrong-issuer, the up-front tenant pin did not take
-            # (the account needs an interactive sign-in to the subscription's tenant). The vault's tenant
-            # is fixed at creation, so this cannot be fixed mid-run - record a next-step telling the user
-            # to reconnect to the correct tenant and re-run.
-            if (& $hasTenantIssuer $kvToggle) {
+            # Data-plane outcome. A wrong-issuer rejection means the tenant pin at intake didn't take;
+            # a firewall rejection despite the ACL means split egress; an RBAC refusal that outlasted
+            # the retries is propagation lag (not a policy block). Anything else goes to the policy
+            # parser, which names the blocking policy when there is one.
+            $certCheck = "Key Vault certificate creation"
+            $certErr = $kvSim.CertError
+            if ($kvSim.CertOk) { Add-Result -Category "Deployability" -Check $certCheck -Result "Pass" -Detail "Created successfully." }
+            elseif ($null -eq $kvSim.CertOk) { }   # not attempted - the role/unlock row above explains why
+            elseif ($certErr -match "AKV10032|Invalid issuer|wrong issuer") {
+                Add-Result -Category "Deployability" -Check $certCheck -Result "Fail" -Detail "Key Vault rejected the token as issued by the wrong tenant. Run 'Connect-AzAccount -TenantId $TenantId -UseDeviceAuthentication', then re-run this script." -Message $certErr
                 $NextSteps.Add("Key Vault checks hit a wrong-tenant token. Run 'Connect-AzAccount -TenantId $TenantId -UseDeviceAuthentication', then re-run this script.")
             }
+            elseif ($certErr -match "ForbiddenByFirewall|Client address is not authorized") {
+                Add-Result -Category "Deployability" -Check $certCheck -Result "Fail" -Detail "Key Vault firewall rejected this machine although its egress IP was allowed - likely split egress (e.g. Zscaler). The installer's Key Vault step will fail from this network; route all HTTPS through one egress IP." -Message $certErr
+            }
+            elseif ($certErr -match "ForbiddenByRbac|Caller is not authorized") {
+                Add-Result -Category "Deployability" -Check $certCheck -Result "Warn" -Detail "Not confirmed - the Key Vault Administrator assignment had not taken effect after 3 minutes." -Message $certErr
+            }
+            else { Add-PolicyFailureResult -Category "Deployability" -Check $certCheck -RawMessage $certErr }
         }
     }
 
@@ -3140,7 +3108,7 @@ try {
             }
         }
         # The installer's ARM template creates the server with azureADOnlyAuthentication=true
-        # (template-8.0.json); the throwaway server here uses SQL auth so the bogus-login probe below
+        # (nme-template-8.1.json); the throwaway server here uses SQL auth so the bogus-login probe below
         # can distinguish a real SQL response from a broken path. A policy that requires or forbids
         # AAD-only SQL auth therefore still isn't exercised by this test (not reported - a fixed test
         # limitation, not a finding about the environment).
@@ -3675,7 +3643,10 @@ finally {
                     "appinsights" { Remove-AzResource -ResourceId $t.Id -Force -ErrorAction Stop | Out-Null }
                     "dcr" { Remove-AzResource -ResourceId $t.Id -Force -ErrorAction Stop | Out-Null }
                     "dce" { Remove-AzResource -ResourceId $t.Id -Force -ErrorAction Stop | Out-Null }
-                    "roleassignment" { Remove-AzRoleAssignment -ObjectId $t.Note -RoleDefinitionName "Contributor" -Scope $t.Id -ErrorAction Stop | Out-Null }
+                    "roleassignment" {
+                        $del = Invoke-AzRestMethod -Method DELETE -Path "$($t.Name)?api-version=2022-04-01" -ErrorAction Stop
+                        if ($del.StatusCode -ge 300 -and $del.StatusCode -ne 404) { throw "HTTP $($del.StatusCode): $($del.Content)" }
+                    }
                     default { }
                 }
                 @{ Type = $t.Type; Name = $t.Name; Ok = $true }
