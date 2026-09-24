@@ -280,7 +280,9 @@ font-family:ui-monospace,SFMono-Regular,Menlo,monospace;}
 
     # Run metadata.
     [void]$sb.AppendLine('<table class="meta">')
-    foreach ($p in $Meta.PSObject.Properties) {
+    # Subscription/cloud/region/RG are in the configuration table, the timestamp is in the subtitle,
+    # and TLS issuers have their own result rows - don't repeat them here.
+    foreach ($p in ($Meta.PSObject.Properties | Where-Object { $_.Name -notin @("TimestampUtc", "SubscriptionId", "Cloud", "Region", "ResourceGroup", "TlsIssuers") })) {
         [void]$sb.AppendLine("<tr><td>$(ConvertTo-HtmlText $p.Name)</td><td>$(ConvertTo-HtmlText ([string]$p.Value))</td></tr>")
     }
     [void]$sb.AppendLine('</table>')
@@ -397,8 +399,7 @@ function Invoke-CloudShellDownload {
         return
     }
     catch {
-        Write-Host -ForegroundColor "Yellow" "  Could not auto-download '$Path': $($_.Exception.Message)."
-        Write-Host -ForegroundColor "Yellow" "  Use the Cloud Shell 'Manage files -> Download' toolbar button and enter: $arg"
+        Write-Host -ForegroundColor "Yellow" "  Could not start the download automatically - use Manage files > Download and enter: $arg"
     }
 }
 #endregion
@@ -415,10 +416,10 @@ function New-PreflightLock {
         New-AzResourceLock -LockName $LockName -LockLevel "CanNotDelete" -Scope $ResourceId -Force -ErrorAction Stop | Out-Null
         $lockResourceId = "$ResourceId/providers/Microsoft.Authorization/locks/$LockName"
         Add-TrackedResource -Type "lock" -ResourceGroupName $ResourceGroupName -Name $LockName -Id $lockResourceId -Note $ResourceId
-        Add-Result -Category "Deployability" -Check "$Label lock" -Result "Pass" -Detail "CanNotDelete lock applied."
+        Add-Result -Category "Deployability" -Check "$Label lock" -Result "Pass" -Detail "Created successfully."
     }
     catch {
-        Add-Result -Category "Deployability" -Check "$Label lock" -Result "Warn" -Detail "Could not apply CanNotDelete lock." -Message $_.Exception.Message
+        Add-Result -Category "Deployability" -Check "$Label lock" -Result "Warn" -Detail "Could not apply CanNotDelete lock: $(Get-ConciseErrorMessage -RawMessage $_.Exception.Message)" -Message $_.Exception.Message
     }
 }
 
@@ -490,6 +491,16 @@ function Get-ConciseErrorMessage {
     param([string] $RawMessage)
     if ([string]::IsNullOrWhiteSpace($RawMessage)) { return $RawMessage }
 
+    # Strip generic Azure boilerplate that tells the reader nothing about what to change in their
+    # environment (e.g. the App Service quota error's note about aggregate scaling operations).
+    $clean = {
+        param([string] $m)
+        $m = ($m -replace "[`r`n]+", " ")
+        $m = $m -replace "\s*Note that if you experience multiple scaling operations failing.*?currently displayed\.?", ""
+        $m = $m -replace "\s*Additional details - Location:\s*(?=Current Limit)", " "
+        return ($m -replace "\s{2,}", " ").Trim()
+    }
+
     $extract = {
         param($obj)
         if ($null -eq $obj) { return $null }
@@ -511,7 +522,7 @@ function Get-ConciseErrorMessage {
         try {
             $j = $s | ConvertFrom-Json -ErrorAction Stop
             $m = & $extract $j
-            if ($m) { return ($m -replace "[`r`n]+", " ").Trim() }
+            if ($m) { return (& $clean $m) }
         }
         catch {}
     }
@@ -520,8 +531,8 @@ function Get-ConciseErrorMessage {
     $line = $RawMessage -split "`r`n|`n|`r" | ForEach-Object { $_.Trim() } |
         Where-Object { $_ -and $_ -notmatch "Operation returned an invalid status code" } |
         Select-Object -First 1
-    if ($line) { return $line }
-    return $RawMessage.Trim()
+    if ($line) { return (& $clean $line) }
+    return (& $clean $RawMessage)
 }
 
 # Resolve a policy definition/assignment id to a friendly display name.
@@ -722,7 +733,8 @@ function Test-SqlOperatorDataPath {
         [bool] $IsCloudShell = $false
     )
     $check = "SQL data path (operator -> 1433)"
-    $pathNote = if ($IsCloudShell) { " (this path is Cloud Shell's egress, not the install machine's - re-run this test from the machine that will actually run the installer)" } else { "" }
+    $pathNote = if ($IsCloudShell) { " (tested from Cloud Shell)" } else { "" }
+    $splitEgressReported = $false
 
     try {
         # Best-effort: open the SQL firewall to the known egress IP before probing. Child of the server -
@@ -748,7 +760,7 @@ function Test-SqlOperatorDataPath {
         finally { if ($tcpClient) { $tcpClient.Close() } }
 
         if (-not $tcpOk) {
-            Add-Result -Category "Connectivity" -Check $check -Result "Fail" -Detail "1433 egress blocked$pathNote - could not open a TCP connection to ${Fqdn}:1433 from this machine within 10s. Outbound 1433 is commonly blocked by corporate egress/Zscaler; NME's App Service must reach SQL on 1433."
+            Add-Result -Category "Connectivity" -Check $check -Result "Fail" -Detail "Outbound TCP 1433 to SQL is blocked$pathNote. The installer connects to SQL directly - allow outbound 1433 to *.$($Fqdn -replace '^[^.]+\.', '')."
             return
         }
 
@@ -775,7 +787,7 @@ function Test-SqlOperatorDataPath {
                 Add-Result -Category "Connectivity" -Check $check -Result "Pass" -Detail "SQL data path OK"
             }
             catch {
-                Add-Result -Category "Connectivity" -Check $check -Result "Fail" -Detail "TLS handshake broken on path$pathNote - reached TCP 1433 but the encrypted handshake to ${Fqdn}:1433 did not complete ($(Get-ConciseErrorMessage -RawMessage $_.Exception.Message)). This is the signature of TLS interception/inspection (e.g. Zscaler) sitting on the SQL path."
+                Add-Result -Category "Connectivity" -Check $check -Result "Fail" -Detail "TLS handshake to ${Fqdn}:1433 failed$pathNote - likely TLS inspection (e.g. Zscaler). Exempt SQL traffic on 1433 from TLS inspection. ($(Get-ConciseErrorMessage -RawMessage $_.Exception.Message))"
             }
             finally {
                 if ($ssl) { $ssl.Dispose() }
@@ -797,19 +809,22 @@ function Test-SqlOperatorDataPath {
                 $conn = New-Object System.Data.SqlClient.SqlConnection($connStr)
                 $conn.Open()
                 # Should never actually succeed (bogus login) - if it somehow does, the path clearly works.
-                Add-Result -Category "Connectivity" -Check $check -Result "Pass" -Detail "SQL data path OK"
+                if (-not $splitEgressReported) { Add-Result -Category "Connectivity" -Check $check -Result "Pass" -Detail "SQL data path OK" }
                 return
             }
             catch {
                 $msg = $_.Exception.Message
                 if ($msg -match "Login failed for user") {
-                    Add-Result -Category "Connectivity" -Check $check -Result "Pass" -Detail "SQL data path OK"
+                    # After a split-egress Fail, the retry only validates the rest of the path - a
+                    # second, contradicting Pass row would just be noise.
+                    if (-not $splitEgressReported) { Add-Result -Category "Connectivity" -Check $check -Result "Pass" -Detail "SQL data path OK" }
                     return
                 }
                 elseif ($msg -match "Client with IP address '([^']+)'|not allowed to access the server") {
                     $foundIp = if ($Matches -and $Matches[1]) { $Matches[1] } else { $null }
-                    if ($foundIp -and $EgressIp -and $foundIp -ne $EgressIp) {
-                        Add-Result -Category "Connectivity" -Check $check -Result "Fail" -Detail "split egress: web IP != SQL IP$pathNote - your HTTPS egress is $EgressIp but the SQL path left this machine via $foundIp. Your outbound path differs by destination (common with Zscaler); the firewall rule created for $EgressIp does not cover the SQL path."
+                    if ($foundIp -and $EgressIp -and $foundIp -ne $EgressIp -and -not $splitEgressReported) {
+                        Add-Result -Category "Connectivity" -Check $check -Result "Fail" -Detail "Split egress$pathNote`: HTTPS leaves via $EgressIp but SQL traffic leaves via $foundIp (common with Zscaler). The installer allows only the HTTPS-detected IP in the SQL firewall, so its SQL step will be rejected. Route HTTPS and 1433 through the same egress IP, or run the installer from a network that does."
+                        $splitEgressReported = $true
                         # Best-effort: allow the IP SQL actually saw and retry once so the rest of the path
                         # can still be validated.
                         try { New-AzSqlServerFirewallRule -ResourceGroupName $ResourceGroupName -ServerName $ServerName -FirewallRuleName $foundIp -StartIpAddress $foundIp -EndIpAddress $foundIp -ErrorAction Stop | Out-Null } catch {}
@@ -817,21 +832,22 @@ function Test-SqlOperatorDataPath {
                         return
                     }
                     elseif ($foundIp) {
-                        Add-Result -Category "Connectivity" -Check $check -Result "Warn" -Detail "SQL firewall rule for $foundIp not yet effective$pathNote$(if ($attempt -lt $maxAttempts) { '; retrying once.' } else { ' after retrying.' })"
+                        # Firewall rule propagation lag - only worth reporting if it persists past the retry.
                         if ($attempt -lt $maxAttempts) { Start-Sleep -Seconds 5; continue }
+                        if (-not $splitEgressReported) { Add-Result -Category "Connectivity" -Check $check -Result "Warn" -Detail "Not confirmed$pathNote - SQL still rejected $foundIp after its firewall rule was added." }
                         return
                     }
                     else {
-                        Add-Result -Category "Connectivity" -Check $check -Result "Warn" -Detail "SQL rejected the connection by source IP$pathNote but the IP could not be parsed from the error: $(Get-ConciseErrorMessage -RawMessage $msg)"
+                        Add-Result -Category "Connectivity" -Check $check -Result "Warn" -Detail "Not confirmed$pathNote - SQL rejected this machine's source IP: $(Get-ConciseErrorMessage -RawMessage $msg)"
                         return
                     }
                 }
                 elseif ($msg -match "pre-login handshake|SSL Provider|wait operation timed out") {
-                    Add-Result -Category "Connectivity" -Check $check -Result "Fail" -Detail "TLS handshake broken on path$pathNote - reached TCP 1433 but the encrypted pre-login handshake to ${Fqdn}:1433 did not complete ($(Get-ConciseErrorMessage -RawMessage $msg)). This is the signature of TLS interception/inspection (e.g. Zscaler) sitting on the SQL path."
+                    Add-Result -Category "Connectivity" -Check $check -Result "Fail" -Detail "TLS handshake to ${Fqdn}:1433 failed$pathNote - likely TLS inspection (e.g. Zscaler). Exempt SQL traffic on 1433 from TLS inspection. ($(Get-ConciseErrorMessage -RawMessage $msg))"
                     return
                 }
                 else {
-                    Add-Result -Category "Connectivity" -Check $check -Result "Warn" -Detail "Unexpected error probing the SQL data path$pathNote`: $(Get-ConciseErrorMessage -RawMessage $msg)"
+                    Add-Result -Category "Connectivity" -Check $check -Result "Warn" -Detail "Not confirmed$pathNote`: $(Get-ConciseErrorMessage -RawMessage $msg)"
                     return
                 }
             }
@@ -841,7 +857,7 @@ function Test-SqlOperatorDataPath {
         }
     }
     catch {
-        Add-Result -Category "Connectivity" -Check $check -Result "Warn" -Detail "Could not complete the SQL data-path probe$pathNote`: $(Get-ConciseErrorMessage -RawMessage (Get-DetailedErrorMessage -ErrorRecord $_))"
+        Add-Result -Category "Connectivity" -Check $check -Result "Warn" -Detail "Not confirmed$pathNote`: $(Get-ConciseErrorMessage -RawMessage (Get-DetailedErrorMessage -ErrorRecord $_))"
     }
 }
 
@@ -1041,15 +1057,10 @@ function Add-PolicyFailureResult {
             }
         }
 
-        $detail = if ($policySource) {
-            "Blocked by Azure Policy '$polName' (identified via $policySource). The resource group could not be created$(if ($Tags -and $Tags.Count -gt 0) { ' - review the tags you supplied against required-tag/tag-value policies' })."
-        }
-        elseif ($polName) {
-            "Blocked by Azure Policy id '$polName' (display name could not be resolved). The resource group could not be created$(if ($Tags -and $Tags.Count -gt 0) { ' - review the tags you supplied against required-tag/tag-value policies' })."
-        }
-        else {
-            "The resource group could not be created$(if ($Tags -and $Tags.Count -gt 0) { ' (this often indicates a required-tag/tag-value Deny policy - review the supplied tags)' }). Could not identify the specific policy from the ARM error or the Activity Log after waiting up to 5 minutes for ingestion - check the Activity Log manually for '$ResourceGroupNameForActivityLog'."
-        }
+        $tagHint = if ($Tags -and $Tags.Count -gt 0) { " Check the supplied tags against required-tag/tag-value policies." } else { "" }
+        $detail = if ($policySource) { "Blocked by Azure Policy '$polName'.$tagHint" }
+        elseif ($polName) { "Blocked by Azure Policy (id '$polName').$tagHint" }
+        else { "Failed: $concise$tagHint" }
     }
     else {
         $detail = if ($polName) { "Blocked by Azure Policy: '$polName'." } else { "$FailedPrefix`: $concise" }
@@ -1307,14 +1318,13 @@ function Test-PrivateDnsZones {
         $usesCustomDns = $Vnet.DhcpOptions.DnsServers -and $Vnet.DhcpOptions.DnsServers.Count -gt 0
         $dnsServers = if ($usesCustomDns) { $Vnet.DhcpOptions.DnsServers -join ", " } else { "Azure-provided default (168.63.129.16)" }
     }
-    Add-Result -Category "PrivateDns" -Check "VNet DNS configuration" -Result "Info" -Detail "VNet '$ExistingVnetName' DNS servers: $dnsServers"
     $ConfigSummary["VNet DNS configuration"] = "VNet '$ExistingVnetName': $dnsServers"
 
     if ($usesCustomDns) {
         # VNet resolves names via its own (non-Azure) DNS servers rather than Azure-provided DNS,
         # so Azure private DNS zones linked to this VNet aren't how resolution works here - skip that check.
         $zoneList = ($RequiredPrivateDnsZones | ForEach-Object { "$($_.Zone) ($($_.Purpose))" }) -join "; "
-        Add-Result -Category "PrivateDns" -Check "Private DNS zones" -Result "Info" -Detail "VNet uses custom DNS servers ($dnsServers); Azure private DNS zone checks are not applicable. The custom DNS server must resolve: $zoneList"
+        Add-Result -Category "PrivateDns" -Check "Private DNS zones" -Result "Info" -Detail "VNet uses custom DNS ($dnsServers). Your DNS must resolve these zones to the private endpoint IPs: $zoneList"
     }
     elseif ($PrivateDnsZonesMode -eq "Existing") {
         # The customer's private DNS zones may live in a DIFFERENT subscription than the one
@@ -1326,7 +1336,7 @@ function Test-PrivateDnsZones {
         $dnsZoneCtxSwitched = $false
         if ($PrivateDnsZoneSubId -and $PrivateDnsZoneSubId -ne $SubscriptionId) {
             try { Set-AzContext -Subscription $PrivateDnsZoneSubId -ErrorAction Stop | Out-Null; $dnsZoneCtxSwitched = $true }
-            catch { Add-Result -Category "PrivateDns" -Check "Private DNS zones subscription" -Result "Warn" -Detail "Could not switch subscriptions; results below may be inaccurate." -Message $_.Exception.Message }
+            catch { Add-Result -Category "PrivateDns" -Check "Private DNS zones subscription" -Result "Warn" -Detail "Could not access subscription '$PrivateDnsZoneSubId' - zone results below may be inaccurate. Grant this account Reader on it." -Message $_.Exception.Message }
         }
         try {
         if ($CreateNewVnet) {
@@ -1340,11 +1350,11 @@ function Test-PrivateDnsZones {
                 $match = $rgZones | Where-Object { $_.Name -eq $rz.Zone }
                 if (-not $match) {
                     $missingZones += $rz.Zone
-                    Add-Result -Category "PrivateDns" -Check "Private DNS zone: $($rz.Zone)" -Result "Fail" -Detail "MISSING from resource group '$PrivateDnsZoneRg' - required for $($rz.Purpose) private endpoints. Linkage to the real VNet is handled at install (this test VNet is throwaway)."
+                    Add-Result -Category "PrivateDns" -Check "Private DNS zone: $($rz.Zone)" -Result "Fail" -Detail "Missing from resource group '$PrivateDnsZoneRg' - required for $($rz.Purpose) private endpoints."
                 }
             }
             if ($missingZones.Count -eq 0) {
-                Add-Result -Category "PrivateDns" -Check "Private DNS zones" -Result "Pass" -Detail "All required zones present in resource group '$PrivateDnsZoneRg'. Linkage to the real VNet is handled at install."
+                Add-Result -Category "PrivateDns" -Check "Private DNS zones" -Result "Pass" -Detail "All required zones present in resource group '$PrivateDnsZoneRg'."
             }
             $ConfigSummary["Private DNS zones missing"] = if ($missingZones.Count -gt 0) { $missingZones -join "; " } else { "none - all required zones present" }
         }
@@ -1366,7 +1376,7 @@ function Test-PrivateDnsZones {
                 if (-not $match) {
                     $missingZones += $rz.Zone
                     $whereText = if ($PrivateDnsZoneRg) { "resource group '$PrivateDnsZoneRg'" } else { "this subscription" }
-                    Add-Result -Category "PrivateDns" -Check "Private DNS zone: $($rz.Zone)" -Result "Fail" -Detail "MISSING from $whereText - required for $($rz.Purpose) private endpoints."
+                    Add-Result -Category "PrivateDns" -Check "Private DNS zone: $($rz.Zone)" -Result "Fail" -Detail "Missing from $whereText - required for $($rz.Purpose) private endpoints."
                     $dnsZoneReport += "$($rz.Zone) ($($rz.Purpose)): missing from $whereText"
                     continue
                 }
@@ -1380,16 +1390,14 @@ function Test-PrivateDnsZones {
                 }
                 if ($linked) { $dnsZoneReport += "$($rz.Zone) ($($rz.Purpose)): present and linked" }
                 else {
-                    Add-Result -Category "PrivateDns" -Check "Private DNS zone: $($rz.Zone)" -Result "Warn" -Detail "Present but NOT linked to '$ExistingVnetName' ($($rz.Purpose)). Add a virtual network link."
+                    Add-Result -Category "PrivateDns" -Check "Private DNS zone: $($rz.Zone)" -Result "Warn" -Detail "Not linked to VNet '$ExistingVnetName' - add a virtual network link."
                     $dnsZoneReport += "$($rz.Zone) ($($rz.Purpose)): present but NOT linked"
                 }
             }
             $linkedCount = @($dnsZoneReport | Where-Object { $_ -like "*: present and linked" }).Count
+            # Missing/unlinked zones already have their own rows; only the all-good case needs a rollup.
             if ($linkedCount -eq $RequiredPrivateDnsZones.Count) {
-                Add-Result -Category "PrivateDns" -Check "Private DNS zones" -Result "Pass" -Detail "All required private DNS zones present and linked to '$ExistingVnetName'."
-            }
-            else {
-                Add-Result -Category "PrivateDns" -Check "Private DNS zones summary" -Result "Info" -Detail "$linkedCount of $($RequiredPrivateDnsZones.Count) required private DNS zones present and linked to '$ExistingVnetName'." -Message ($dnsZoneReport -join "; ")
+                Add-Result -Category "PrivateDns" -Check "Private DNS zones" -Result "Pass" -Detail "All required zones present and linked to '$ExistingVnetName'."
             }
             $ConfigSummary["Private DNS zones missing"] = if ($missingZones.Count -gt 0) { $missingZones -join "; " } else { "none - all required zones present" }
         }
@@ -1403,7 +1411,7 @@ function Test-PrivateDnsZones {
         # nothing to look up against - skip straight past the Get-AzPrivateDnsZone calls (which
         # would otherwise be called with a null resource group) rather than crashing or silently
         # reporting nothing.
-        Add-Result -Category "PrivateDns" -Check "Private DNS zones" -Result "Warn" -Detail "Not verified - the existing Private DNS zones' subscription/resource group weren't known at test time. Confirm the required zones exist and are linked before the actual NME POV installation."
+        Add-Result -Category "PrivateDns" -Check "Private DNS zones" -Result "Warn" -Detail "Not verified - zone subscription/resource group not provided. Confirm the required zones exist and are linked to the VNet before installing."
     }
     else {
         # New zones (either VNet path): the installer/runbook is expected to create and link the
@@ -1439,7 +1447,7 @@ function Test-PrivateDnsZones {
             $zr = $zoneJobResults | Where-Object { $_.Zone -eq $rz.Zone } | Select-Object -First 1
             if ($zr -and $zr.Ok) {
                 Add-TrackedResource -Type "privatednszone" -ResourceGroupName $ResourceGroupName -Name $rz.Zone
-                Add-Result -Category "PrivateDns" -Check "Private DNS zone: $($rz.Zone)" -Result "Pass" -Detail "created successfully"
+                Add-Result -Category "PrivateDns" -Check "Private DNS zone: $($rz.Zone)" -Result "Pass" -Detail "Created successfully."
             }
             else {
                 $zoneErrMsg = if ($zr) { $zr.Error } else { "No result returned from the create job." }
@@ -1544,7 +1552,7 @@ function Test-PrivateEndpoints {
             $jr = $peJobResults | Where-Object { $_.Label -eq $svc.Service } | Select-Object -First 1
             if ($jr -and $jr.Ok) {
                 Add-TrackedResource -Type "privateendpoint" -ResourceGroupName $ResourceGroupName -Name $jr.Name -Id $jr.Id
-                Add-Result -Category "PrivateEndpoint" -Check "Private endpoint: $($svc.Service)" -Result "Pass" -Detail "Deployed into subnet '$PeSubnetName'$(if ($jr.PrivateIp) { " (private IP $($jr.PrivateIp))" })."
+                Add-Result -Category "PrivateEndpoint" -Check "Private endpoint: $($svc.Service)" -Result "Pass" -Detail "Created successfully$(if ($jr.PrivateIp) { " ($($jr.PrivateIp))" })."
                 if ($jr.PrivateIp) { $PeTargets += [pscustomobject]@{ Service = $svc.Service; PrivateIp = $jr.PrivateIp; Port = $jr.Port } }
             }
             else {
@@ -1632,26 +1640,16 @@ function Invoke-DnsResolutionProbe {
                 Add-Result -Category "Connectivity" -Check "Private DNS resolution: $($t.Service)" -Result "Pass" -Detail "$($t.Fqdn) resolves to the private endpoint IP ($resolvedIp)."
             }
             elseif ($resolvedIp) {
-                Add-Result -Category "Connectivity" -Check "Private DNS resolution: $($t.Service)" -Result "Warn" -Detail "$($t.Fqdn) resolves to $resolvedIp, not the private endpoint IP ($($t.ExpectedIp)). DNS is still returning a public/other address."
+                Add-Result -Category "Connectivity" -Check "Private DNS resolution: $($t.Service)" -Result "Warn" -Detail "$($t.Fqdn) resolves to $resolvedIp instead of the private endpoint IP $($t.ExpectedIp)."
             }
             else {
-                Add-Result -Category "Connectivity" -Check "Private DNS resolution: $($t.Service)" -Result "Warn" -Detail "$($t.Fqdn) did not resolve from the VNet. The private endpoint IP is $($t.ExpectedIp)."
+                Add-Result -Category "Connectivity" -Check "Private DNS resolution: $($t.Service)" -Result "Warn" -Detail "$($t.Fqdn) does not resolve from the VNet; it must resolve to $($t.ExpectedIp)."
             }
         }
     }
     catch {
-        Add-Result -Category "Connectivity" -Check "Private DNS resolution" -Result "Warn" -Detail "Could not run the in-worker DNS resolution test via Kudu." -Message $_.Exception.Message
+        Add-Result -Category "Connectivity" -Check "Private DNS resolution" -Result "Warn" -Detail "Not tested: $($_.Exception.Message)" -Message $_.Exception.Message
         return [pscustomobject]@{ Probed = 0; Confirmed = 0; UsesCustomDns = $usesCustomDns }
-    }
-
-    if ($probed -gt 0 -and $confirmed -eq $probed) {
-        Add-Result -Category "Connectivity" -Check "Private endpoint DNS resolution (overall)" -Result "Pass" -Detail "All $probed private-endpoint FQDNs resolve to their private IPs from the VNet."
-    }
-    elseif ($confirmed -gt 0) {
-        Add-Result -Category "Connectivity" -Check "Private endpoint DNS resolution (overall)" -Result "Warn" -Detail "$confirmed of $probed private-endpoint FQDNs resolve privately; the rest still need DNS configured (see guidance)."
-    }
-    else {
-        Add-Result -Category "Connectivity" -Check "Private endpoint DNS resolution (overall)" -Result "Warn" -Detail "None of the $probed private-endpoint FQDNs resolve to their private IPs from the VNet yet (see guidance to configure DNS)."
     }
 
     return [pscustomobject]@{ Probed = $probed; Confirmed = $confirmed; UsesCustomDns = $usesCustomDns }
@@ -1718,8 +1716,7 @@ function Test-OutboundConnectivityViaKudu {
         [Parameter(Mandatory = $true)] $Web,
         [Parameter(Mandatory = $true)][string] $webName,
         [Parameter(Mandatory = $true)][string] $AppSubnetName,
-        [Parameter(Mandatory = $true)][string] $PeSubnetName,
-        [Parameter(Mandatory = $true)][string] $NmeNetworkTestHint
+        [Parameter(Mandatory = $true)][string] $PeSubnetName
     )
 
     # Give the VNet integration a moment to finish propagating before the live test below.
@@ -1797,7 +1794,7 @@ function Test-OutboundConnectivityViaKudu {
                     Add-Result -Category "Connectivity" -Check $t.Label -Result "Pass" -Detail "$($t.Key):$($t.Port) reachable."
                 }
                 elseif ($line -and $line -match "\|BLOCKED\|") {
-                    Add-Result -Category "Connectivity" -Check $t.Label -Result "Warn" -Detail "NOT reachable at $($t.Key):$($t.Port) from the VNet-integrated worker - check NSG / UDR / routing between subnet '$AppSubnetName' and subnet '$PeSubnetName'."
+                    Add-Result -Category "Connectivity" -Check $t.Label -Result "Warn" -Detail "$($t.Key):$($t.Port) not reachable - allow traffic from subnet '$AppSubnetName' to subnet '$PeSubnetName' (NSG / UDR / firewall)."
                 }
                 else {
                     Add-Result -Category "Connectivity" -Check $t.Label -Result "Warn" -Detail "No result returned from the worker for this target."
@@ -1812,13 +1809,13 @@ function Test-OutboundConnectivityViaKudu {
                     # Pass row above is unchanged.
                     $issuer = ($line -split "\|")[4]
                     if ($issuer -and -not (Test-PublicCaIssuer -Issuer $issuer)) {
-                        Add-Result -Category "Connectivity" -Check $t.Label -Result "Warn" -Detail "SSL inspection on path - the certificate for $($t.Key) was issued by '$issuer', not a public CA. A TLS-inspecting proxy (e.g. Zscaler) is intercepting HTTPS on the worker's egress."
+                        Add-Result -Category "Connectivity" -Check $t.Label -Result "Warn" -Detail "TLS inspection detected (issuer '$issuer') - exempt this host from TLS inspection for subnet '$AppSubnetName'."
                     }
                 }
                 elseif ($line -and $line -match "\|BLOCKED\|") {
                     $parts = $line -split "\|"
                     $ip = $parts[2]
-                    Add-Result -Category "Connectivity" -Check $t.Label -Result "Warn" -Detail "$($t.Purpose) - NOT reachable from the VNet-integrated worker$(if ($ip) { " (resolved $ip)" } else { " (DNS did not resolve)" })."
+                    Add-Result -Category "Connectivity" -Check $t.Label -Result "Warn" -Detail "$($t.Purpose) - $(if ($ip) { "not reachable (resolved $ip)" } else { "DNS did not resolve" }). Allow outbound HTTPS from subnet '$AppSubnetName' to this host."
                 }
                 else {
                     Add-Result -Category "Connectivity" -Check $t.Label -Result "Warn" -Detail "No result returned from the worker for this target."
@@ -1827,7 +1824,7 @@ function Test-OutboundConnectivityViaKudu {
         }
     }
     catch {
-        Add-Result -Category "Connectivity" -Check "Kudu outbound test" -Result "Warn" -Detail "Could not run the in-worker connectivity test via Kudu. From the App Service Kudu console for '$webName': $NmeNetworkTestHint Endpoints to test: $(($endpoints | ForEach-Object { $_.Uri }) -join ', ')." -Message $_.Exception.Message
+        Add-Result -Category "Connectivity" -Check "Kudu outbound test" -Result "Warn" -Detail "Not tested: $($_.Exception.Message). Required outbound HTTPS endpoints: $(($endpoints | ForEach-Object { $_.Uri }) -join ', ')." -Message $_.Exception.Message
     }
 }
 #endregion
@@ -1961,19 +1958,9 @@ try {
             catch { Write-Host -ForegroundColor "Red" "Re-authentication failed: $(Get-MaskedText $_.Exception.Message)" }
         }
     }
-    if ($TenantId -and $activeTenant -eq $TenantId) {
-        Write-Host -ForegroundColor "Green" "[$([char]0x2713)] Context pinned to the subscription's tenant $TenantId."
-    }
-    elseif ($TenantId) {
-        Write-Host -ForegroundColor "Yellow" "Proceeding on tenant '$activeTenant' (not the subscription's owning tenant '$TenantId'); Key Vault checks may report an issuer mismatch."
-    }
-    # Promote the pin outcome to a report row (the Write-Host lines above are console-only and never
-    # reach the JSON/HTML) so the SE can see tenant topology after the fact, not just on-screen.
-    if ($TenantId -and $activeTenant -eq $TenantId) {
-        Add-Result -Category "Info" -Check "Tenant context" -Result "Pass" -Detail "Context pinned to the subscription's owning tenant $TenantId."
-    }
-    elseif ($TenantId) {
-        Add-Result -Category "Info" -Check "Tenant context" -Result "Warn" -Detail "Active context tenant '$activeTenant' does not match the subscription's owning tenant '$TenantId' - expect the Key Vault and SQL steps to fail with an issuer mismatch."
+    # Only a mismatch is a finding; the tenant id itself is recorded in the configuration summary.
+    if ($TenantId -and $activeTenant -ne $TenantId) {
+        Add-Result -Category "Info" -Check "Tenant context" -Result "Warn" -Detail "Session is on tenant '$activeTenant', not the subscription's tenant '$TenantId' - expect Key Vault and SQL checks to fail. Run 'Connect-AzAccount -TenantId $TenantId -UseDeviceAuthentication' and re-run."
     }
 
     # Cloud environment (Commercial / Gov / China) drives Graph endpoint and DNS suffixes.
@@ -2019,30 +2006,20 @@ try {
     $AccountTypeSummary = if ($IsGuestAccount) {
         "Guest / external (B2B) user"
     }
-    elseif ($meUserType -eq "Member") { "Member (native account in the subscription's tenant $TenantId)" }
-    else { "Member / home-tenant account (directory user type not confirmed)" }
+    elseif ($meUserType -eq "Member") { "Member" }
+    else { "Member (not confirmed)" }
 
     # Promote the guest/B2B determination to a report row - a common source of "works for a native
     # admin but not for this account" install issues.
     if ($IsGuestAccount) {
         Add-Result -Category "Info" -Check "Signed-in account type" -Result "Info" -Detail $AccountTypeSummary
     }
-    else {
-        Add-Result -Category "Info" -Check "Signed-in account type" -Result "Pass" -Detail $AccountTypeSummary
-    }
 
     # Enumerate the account's Entra tenant memberships so multi-tenant/guest operators are warned to
     # pin -Tenant on install day. Best-effort - Get-AzTenant can be slow or restricted; never fatal.
     try { $tenants = @(Get-AzTenant -ErrorAction Stop) } catch { $tenants = @() }
-    if ($tenants.Count -gt 0) {
-        $tenantIdList = ($tenants | ForEach-Object { $_.Id }) -join ", "
-        if ($tenants.Count -gt 1) {
-            Add-Result -Category "Info" -Check "Entra tenant access" -Result "Info" -Detail "This is a multi-tenant account, with access to $($tenants.Count) tenants"
-        }
-        else {
-            Add-Result -Category "Info" -Check "Entra tenant access" -Result "Info" -Detail "Account has access to $($tenants.Count) Entra tenant: $tenantIdList."
-        }
-        $ConfigSummary["Entra tenants accessible"] = $tenants.Count
+    if ($tenants.Count -gt 1) {
+        Add-Result -Category "Info" -Check "Entra tenant access" -Result "Info" -Detail "Account has access to $($tenants.Count) tenants - pin -Tenant $TenantId when connecting on install day."
     }
     $SqlSuffix = $SqlSuffix.TrimStart(".")
 
@@ -2066,19 +2043,18 @@ try {
     # E11 - PowerShell integrity check: wrong PS version/edition, and a mixed Windows PowerShell
     # 5.1 / PowerShell 7 module path both silently break Az/installer behavior.
     $script:PsIntegrity = @{ Version = $PSVersionTable.PSVersion; Edition = $PSVersionTable.PSEdition }
-    $psVersionResult = if ($PSVersionTable.PSVersion.Major -ge 7) { "Pass" } else { "Warn" }
-    $psVersionDetail = "PSVersion=$($PSVersionTable.PSVersion), PSEdition=$($PSVersionTable.PSEdition)"
-    if ($psVersionResult -eq "Warn") { $psVersionDetail += ". PowerShell 7+ recommended; Az behavior on 5.1 is not validated by this test." }
-    Add-Result -Category "Info" -Check "PowerShell version" -Result $psVersionResult -Detail $psVersionDetail
+    if ($PSVersionTable.PSVersion.Major -lt 7) {
+        Add-Result -Category "Info" -Check "PowerShell version" -Result "Warn" -Detail "PowerShell $($PSVersionTable.PSVersion) ($($PSVersionTable.PSEdition)) - run from PowerShell 7+."
+    }
 
     try { Import-Module Microsoft.PowerShell.Security -ErrorAction Stop }
-    catch { Add-Result -Category "Info" -Check "PowerShell module import" -Result "Warn" -Detail "Microsoft.PowerShell.Security failed to import - a corrupted/locked module state; Az cmdlets may misbehave. $($_.Exception.Message)" }
+    catch { Add-Result -Category "Info" -Check "PowerShell module import" -Result "Warn" -Detail "Microsoft.PowerShell.Security failed to import; Az cmdlets may misbehave. Run from a clean PowerShell 7 session. $($_.Exception.Message)" }
 
     if ($PSVersionTable.PSEdition -eq "Desktop") {
         # PS7's module directory leaking into a 5.1 session makes module resolution unpredictable.
         $ps7ModulePaths = @($env:PSModulePath -split [IO.Path]::PathSeparator | Where-Object { $_ -match '\\PowerShell\\7\\' })
         if ($ps7ModulePaths.Count -gt 0) {
-            Add-Result -Category "Info" -Check "PowerShell module path" -Result "Fail" -Detail "mixed 5.1/7 module path - the session is Windows PowerShell 5.1 but PowerShell 7 module paths are present; module resolution is unpredictable. Run this script from a clean PowerShell 7 session. Offending path(s): $($ps7ModulePaths -join '; ')"
+            Add-Result -Category "Info" -Check "PowerShell module path" -Result "Fail" -Detail "Windows PowerShell 5.1 session with PowerShell 7 module paths loaded - run from a clean PowerShell 7 session. Path(s): $($ps7ModulePaths -join '; ')"
         }
     }
 
@@ -2087,14 +2063,14 @@ try {
     if (-not $script:IsCloudShell) {
         $script:EgressInfo = Get-EgressFingerprint
         if ($script:EgressInfo.Ip) {
-            $egressDetail = "Egress IP $($script:EgressInfo.Ip) - $($script:EgressInfo.Org)."
+            $egressDetail = "$($script:EgressInfo.Ip) ($($script:EgressInfo.Org))."
             if ($script:EgressInfo.IsZscaler) {
-                $egressDetail += " Egressing via ZSCALER (AS22616/AS53813) - expect non-web (SQL/1433) filtering and rotating source IPs."
+                $egressDetail += " Zscaler egress - expect SQL/1433 filtering and rotating source IPs."
             }
             Add-Result -Category "Info" -Check "Internet egress" -Result "Info" -Detail $egressDetail
         }
         else {
-            Add-Result -Category "Info" -Check "Internet egress" -Result "Warn" -Detail "Could not determine public egress IP (no HTTPS path to an IP-echo service) - this itself may indicate restrictive egress filtering."
+            Add-Result -Category "Info" -Check "Internet egress" -Result "Warn" -Detail "Could not determine this machine's public IP - outbound HTTPS may be filtered."
         }
     }
 
@@ -2109,14 +2085,14 @@ try {
     try {
         $ipinfoResp = Invoke-RestMethod -Uri "https://ipinfo.io/json" -TimeoutSec 8 -ErrorAction Stop
         if ($ipinfoResp -and $ipinfoResp.ip) {
-            Add-Result -Category "Connectivity" -Check "Client IP detection (ipinfo.io)" -Result "Pass" -Detail "Reachable, resolved $($ipinfoResp.ip)$ipinfoPathNote."
+            Add-Result -Category "Connectivity" -Check "Client IP detection (ipinfo.io)" -Result "Pass" -Detail "Resolved $($ipinfoResp.ip)$ipinfoPathNote."
         }
         else {
-            Add-Result -Category "Connectivity" -Check "Client IP detection (ipinfo.io)" -Result "Fail" -Detail "Responded without an .ip property$ipinfoPathNote - the installer has no fallback; expect the install to fail here."
+            Add-Result -Category "Connectivity" -Check "Client IP detection (ipinfo.io)" -Result "Fail" -Detail "ipinfo.io returned no IP$ipinfoPathNote - the installer requires it to detect its client IP and will fail."
         }
     }
     catch {
-        Add-Result -Category "Connectivity" -Check "Client IP detection (ipinfo.io)" -Result "Fail" -Detail "Unreachable$ipinfoPathNote - the installer resolves its client IP here and has no fallback."
+        Add-Result -Category "Connectivity" -Check "Client IP detection (ipinfo.io)" -Result "Fail" -Detail "ipinfo.io unreachable$ipinfoPathNote - the installer requires it; allow outbound HTTPS to ipinfo.io."
     }
 
     # E16 - operator-side TLS issuer probe: local runs only (in Cloud Shell the path tested would be
@@ -2149,16 +2125,15 @@ try {
                 $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($sslStream.RemoteCertificate)
                 $issuer = $cert.Issuer
                 if (Test-PublicCaIssuer -Issuer $issuer) {
-                    Add-Result -Category "Connectivity" -Check "TLS issuer ($tlsHost)" -Result "Pass" -Detail "TLS to $tlsHost presents a public-CA certificate (issuer '$issuer') - no SSL inspection detected on this path."
+                    Add-Result -Category "Connectivity" -Check "TLS issuer ($tlsHost)" -Result "Pass" -Detail "No TLS inspection detected."
                 }
                 else {
-                    $zscalerNote = if ($script:EgressInfo -and $script:EgressInfo.IsZscaler) { " This corroborates the ZSCALER egress signal above." } else { "" }
-                    Add-Result -Category "Connectivity" -Check "TLS issuer ($tlsHost)" -Result "Warn" -Detail "SSL inspection on path - $tlsHost presents a certificate issued by '$issuer' (enterprise/private root), i.e. a TLS-inspecting proxy is intercepting HTTPS from this machine. Expect this to also affect the installer's HTTPS and SQL/1433 paths.$zscalerNote"
+                    Add-Result -Category "Connectivity" -Check "TLS issuer ($tlsHost)" -Result "Warn" -Detail "TLS inspection detected (issuer '$issuer'). Exempt Azure and Entra endpoints from TLS inspection for the machine running the installer."
                     $script:TlsIssuerFindings = @($script:TlsIssuerFindings) + $issuer
                 }
             }
             catch {
-                Add-Result -Category "Connectivity" -Check "TLS issuer ($tlsHost)" -Result "Warn" -Detail "Could not complete a TLS issuer probe to $tlsHost. $($_.Exception.Message)"
+                Add-Result -Category "Connectivity" -Check "TLS issuer ($tlsHost)" -Result "Warn" -Detail "Not confirmed: $($_.Exception.Message)"
             }
             finally {
                 if ($sslStream) { $sslStream.Dispose() }
@@ -2173,7 +2148,6 @@ try {
     # SQL resource-id doesn't have a clean $AzEnv property across clouds (unlike Key Vault's
     # AzureKeyVaultServiceEndpointResourceId) - fall back to the commercial audience and note the cloud.
     $SqlAudience = "https://database.windows.net/"
-    $sqlAudienceCloudNote = if ($AzEnv.Name -and $AzEnv.Name -ne "AzureCloud") { " (cloud '$($AzEnv.Name)' - using the commercial database audience; verify this is correct for Gov/China if this check fails)" } else { "" }
     try {
         try {
             Get-AzAccessToken -ResourceUrl $SqlAudience -TenantId $TenantId -AsSecureString -ErrorAction Stop | Out-Null
@@ -2183,15 +2157,15 @@ try {
             # value is never inspected either way, only acquisition success/failure matters.
             Get-AzAccessToken -ResourceUrl $SqlAudience -TenantId $TenantId -ErrorAction Stop | Out-Null
         }
-        Add-Result -Category "Info" -Check "SQL/database access token" -Result "Pass" -Detail "Acquired a database-audience token for tenant $TenantId.$sqlAudienceCloudNote"
+        Add-Result -Category "Info" -Check "SQL/database access token" -Result "Pass" -Detail "Acquired."
     }
     catch {
         $sqlTokErrMsg = Get-DetailedErrorMessage -ErrorRecord $_
-        Add-Result -Category "Info" -Check "SQL/database access token" -Result "Fail" -Detail "Could not acquire a database-audience ($SqlAudience) token for the subscription's tenant $TenantId. The installer's SQL configuration step will fail. Inner error surfaced below.$sqlAudienceCloudNote" -Message $sqlTokErrMsg -RawMessage $sqlTokErrMsg
+        Add-Result -Category "Info" -Check "SQL/database access token" -Result "Fail" -Detail "Could not acquire a token for tenant $TenantId - the installer's SQL step will fail: $(Get-ConciseErrorMessage -RawMessage $sqlTokErrMsg)" -Message $sqlTokErrMsg -RawMessage $sqlTokErrMsg
         # Same issuer/tenant-mismatch pattern used by the later Key Vault AKV10032 check (that
         # classifier isn't defined yet at this point in the script, so it's inlined here).
         if ($sqlTokErrMsg -and ($sqlTokErrMsg -match "AKV10032" -or $sqlTokErrMsg -match "Invalid issuer" -or $sqlTokErrMsg -match "wrong issuer" -or $sqlTokErrMsg -match "tenant.*mismatch" -or $sqlTokErrMsg -match "AADSTS700016|AADSTS50020")) {
-            $NextSteps.Add("Could not acquire a database-audience token for tenant ${TenantId}: this account has access to multiple Entra tenants (guest/B2B) and the session could not be pinned to the subscription's owning tenant, so the SQL token was minted for/rejected by the wrong tenant. Reconnect to the correct tenant with 'Connect-AzAccount -TenantId $TenantId -UseDeviceAuthentication', then re-run this script to confirm the SQL/database access token check passes.")
+            $NextSteps.Add("SQL token was issued by the wrong tenant. Run 'Connect-AzAccount -TenantId $TenantId -UseDeviceAuthentication', then re-run this script.")
         }
     }
     #endregion Operator environment pre-checks
@@ -2355,7 +2329,7 @@ try {
                 $TestPrivate = $false
                 $TestVnetIntegration = $false
                 Write-Host -ForegroundColor "Cyan" "  Skipping private endpoint / VNet integration testing on existing VNet '$ExistingVnetName' by choice."
-                $ConfigSummary["Private endpoint scenario"] = "Declined - user did not consent to private endpoint / VNet integration testing on existing VNet '$ExistingVnetName'"
+                $ConfigSummary["Private endpoint scenario"] = "Yes - existing VNet '$ExistingVnetName'; NOT tested (testing declined)"
             }
             else {
                 # If the VNet resolves via custom DNS servers (rather than Azure DNS), Azure Private DNS
@@ -2365,7 +2339,7 @@ try {
                 if ($intakeUsesCustomDns) {
                     $dnsServersStr = $intakeVnet.DhcpOptions.DnsServers -join ", "
                     Write-Host -ForegroundColor "Cyan" "  VNet '$ExistingVnetName' uses custom DNS servers ($dnsServersStr); Azure Private DNS zone questions are not applicable and will be skipped."
-                    $ConfigSummary["Private DNS zones plan"] = "N/A - VNet '$ExistingVnetName' uses custom DNS servers ($dnsServersStr); resolution is handled by the custom DNS provider"
+                    $ConfigSummary["Private DNS zones plan"] = "N/A - VNet uses custom DNS servers ($dnsServersStr)"
                 }
                 else {
                     # Existing-vs-new Private DNS zones question. Asked here even though we don't yet know
@@ -2436,12 +2410,10 @@ try {
                     do { $PrivateDnsZoneSubId = Read-Host -Prompt "    Subscription ID where the Azure Private DNS zones live" } while ($PrivateDnsZoneSubId -notmatch $script:GuidRegex)
                     do { $PrivateDnsZoneRg = Read-Host -Prompt "    Resource group name for the Azure Private DNS zones" } while ([string]::IsNullOrWhiteSpace($PrivateDnsZoneRg))
                     $ConfigSummary["Private DNS zones plan"] = "Existing (subscription '$PrivateDnsZoneSubId', resource group '$PrivateDnsZoneRg')"
-                    $ConfigSummary["Private DNS resolution (new VNet)"] = "Azure Private DNS Zones - subscription '$PrivateDnsZoneSubId', resource group '$PrivateDnsZoneRg' (recorded only; not verified or modified by this script)"
                 }
                 elseif ($dnsZonesChoice -eq 2) {
                     $PrivateDnsZonesMode = "New"
                     $ConfigSummary["Private DNS zones plan"] = "New (created at install)"
-                    $ConfigSummary["Private DNS resolution (new VNet)"] = "Azure Private DNS Zones - created at install (this script test-creates the required zones in the throwaway test resource group)"
                 }
                 else {
                     # Subscription/RG for the existing zones aren't known yet - nothing to prompt for
@@ -2450,7 +2422,6 @@ try {
                     $PrivateDnsZonesMode = "Unknown"
                     Write-Host -ForegroundColor "Yellow" "  Since the Private DNS zones' subscription/resource group aren't known yet, this script cannot verify the required Private DNS zones now. Have that information ready before the actual NME POV installation - NME's installer/runbook needs to know which existing zones to link."
                     $ConfigSummary["Private DNS zones plan"] = "Existing zones planned - subscription/resource group not yet known; NOT verified."
-                    $ConfigSummary["Private DNS resolution (new VNet)"] = "Azure Private DNS Zones - existing zones planned, subscription/resource group not yet known (not verified by this script)"
                 }
             }
             else {
@@ -2461,8 +2432,7 @@ try {
                 # value even though Test-PrivateDnsZones ignores it once $NewVnetDnsMode is "Custom".
                 $PrivateDnsZonesMode = "NotApplicable"
                 $zoneList = ($RequiredPrivateDnsZones | ForEach-Object { "$($_.Zone) ($($_.Purpose))" }) -join "; "
-                $ConfigSummary["Private DNS zones plan"] = "N/A - new VNet will use custom/on-prem DNS servers; resolution is handled by the custom DNS provider"
-                $ConfigSummary["Private DNS resolution (new VNet)"] = "Custom/on-prem DNS - the custom DNS server(s) must resolve: $zoneList"
+                $ConfigSummary["Private DNS zones plan"] = "Custom/on-prem DNS - must resolve: $zoneList"
             }
         }
     }
@@ -2561,13 +2531,6 @@ try {
     if ($TestVnetIntegration) { $connAspName = $NamePlan["ConnAsp"].Value; $connWebName = $NamePlan["ConnWebApp"].Value }
     if ($CreateNewVnet) { $NewVnetName = $NamePlan["Vnet"].Value; $PeSubnetName = $NamePlan["PeSubnet"].Value; $AppSubnetName = $NamePlan["AppSubnet"].Value }
 
-    # NmeNetworkTest.ps1 auto-derives Key Vault/SQL/DPS-storage FQDNs only when the App Service name
-    # matches the standard "nmw-app-*" pattern. Our test App Service doesn't, so if it's ever run
-    # manually against it, it needs -AdditionalTestUris with this run's own resource names.
-    $AdditionalTestUrisList = @("$kvName.$KeyVaultSuffix", "$sqlName.$SqlSuffix", "$stName.blob.$StorageSuffix")
-    $AdditionalTestUrisArg = ($AdditionalTestUrisList | ForEach-Object { "'$_'" }) -join ","
-    $NmeNetworkTestHint = "Run NmeNetworkTest.ps1 with -AdditionalTestUris $AdditionalTestUrisArg (this test App Service's name doesn't match the standard nmw-app-* pattern NmeNetworkTest.ps1 expects)."
-
     # Tags applied to every resource this script creates (never to a pre-existing resource group).
     # Only user-specified tags are applied - none are added by default.
     $Tags = @{}
@@ -2617,21 +2580,17 @@ try {
                 }
             }
 
-            $detail = if ($policySource) {
-                "Blocked by Azure Policy '$policyName' (identified via $policySource). The resource group could not be created$(if ($Tags.Count -gt 0) { ' - review the tags you supplied against required-tag/tag-value policies' })."
-            }
-            elseif ($policyName) {
-                "Blocked by Azure Policy id '$policyName' (display name could not be resolved). The resource group could not be created$(if ($Tags.Count -gt 0) { ' - review the tags you supplied against required-tag/tag-value policies' })."
-            }
-            else {
-                "The resource group could not be created$(if ($Tags.Count -gt 0) { ' (this often indicates a required-tag/tag-value Deny policy - review the supplied tags)' }). Could not identify the specific policy from the ARM error or the Activity Log after waiting up to 5 minutes for ingestion - check the Activity Log manually for '$ResourceGroupName'."
-            }
+            $tagHint = if ($Tags.Count -gt 0) { " Check the supplied tags against required-tag/tag-value policies." } else { "" }
+            $detail = if ($policySource) { "Blocked by Azure Policy '$policyName'.$tagHint" }
+            elseif ($policyName) { "Blocked by Azure Policy (id '$policyName').$tagHint" }
+            else { "Failed: $(Get-ConciseErrorMessage -RawMessage $rgErrMsg)$tagHint" }
             Add-Result -Category "Deployability" -Check "Resource group creation" -Result "Fail" -Detail $detail -PolicyName $policyName -Message (Get-ConciseErrorMessage -RawMessage $rgErrMsg) -RawMessage $rgErrMsg
             # We return before the ConfigSummary is normally populated, so record enough here that the
             # report still shows the SE what was attempted.
             $ConfigSummary["Run by (signed-in account)"] = $SignedInAccountMasked
             $ConfigSummary["Signed-in account type"] = $AccountTypeSummary
             $ConfigSummary["Subscription"] = "$($Context.Subscription.Name) ($(Get-MaskedSubscriptionId $SubscriptionId))"
+            $ConfigSummary["Tenant"] = $TenantId
             $ConfigSummary["Cloud"] = $AzEnv.Name
             $ConfigSummary["Region"] = $Location
             $ConfigSummary["Resource group"] = "$ResourceGroupName (creation blocked)"
@@ -2665,13 +2624,14 @@ try {
     $ConfigSummary["Run by (signed-in account)"] = $SignedInAccountMasked
     $ConfigSummary["Signed-in account type"] = $AccountTypeSummary
     $ConfigSummary["Subscription"] = "$($Context.Subscription.Name) ($(Get-MaskedSubscriptionId $SubscriptionId))"
+    $ConfigSummary["Tenant"] = $TenantId
     $ConfigSummary["Cloud"] = $AzEnv.Name
     $ConfigSummary["Region"] = $Location
     $ConfigSummary["Resource group"] = "$ResourceGroupName $(if ($PendingRgCreate) { '(created by this script)' } else { '(existing, user-supplied)' })"
     if ($Tags.Count -gt 0) { $ConfigSummary["Tags applied"] = (($Tags.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join "; ") } else { $ConfigSummary["Tags applied"] = "(none specified)" }
     if ($PrivateEndpointOnly) { $ConfigSummary["Public network access on create"] = "Disabled (-PrivateEndpointOnly): Storage, SQL, and Key Vault created with public network access disabled" }
     if ($VnetInfoUnknown) {
-        $ConfigSummary["Private endpoint scenario"] = "Planned - existing VNet, details not yet known; NOT tested. Re-run this script once VNet details are known."
+        $ConfigSummary["Private endpoint scenario"] = "Yes - existing VNet, details not yet known; NOT tested"
     }
     elseif ($TestPrivate) {
         $ConfigSummary["Private endpoint scenario"] = "Yes - $(if ($CreateNewVnet) { 'new' } else { 'existing' }) VNet, 4 test private endpoints (SQL, Key Vault, Storage, Automation)"
@@ -2679,14 +2639,13 @@ try {
         $ConfigSummary["VNet RG"] = "'$ExistingVnetRg'"
         $ConfigSummary["Private endpoint subnet"] = "'$PeSubnetName'"
     }
-    else {
-        $ConfigSummary["Private endpoint scenario"] = "Not tested"
+    elseif (-not $ConfigSummary.Contains("Private endpoint scenario")) {
+        # (A declined existing-VNet consent already recorded its own value at intake - keep it.)
+        $ConfigSummary["Private endpoint scenario"] = "No (public endpoints)"
     }
-    $ConfigSummary["App Service VNet integration"] = if ($VnetInfoUnknown) { "Planned - existing VNet, details not yet known; NOT tested." } elseif ($TestVnetIntegration) { "Yes" } else { "Not tested" }
     if ($TestVnetIntegration) {
-        $ConfigSummary["Web app subnet"] = "'$AppSubnetName'"
+        $ConfigSummary["App Service integration subnet"] = "'$AppSubnetName'"
     }
-    $ConfigSummary["VNet DNS configuration"] = "Not tested"
     #endregion
 
     #region Fast checks --------------------------------------------------------------------------
@@ -2706,21 +2665,21 @@ try {
             $CAA = "158c047a-c907-4556-b7ef-446551a6b5f7"
             $roleNames = ($roles.displayName | Sort-Object -Unique) -join ", "
             if ($templateIds -contains $GA) {
-                Add-Result -Category "Permissions" -Check "Entra role for install" -Result "Pass" -Detail "User has Global Administrator."
+                Add-Result -Category "Permissions" -Check "Entra role for install" -Result "Pass" -Detail "Global Administrator."
             }
             elseif (($templateIds -contains $PRA) -and ($templateIds -contains $CAA)) {
-                Add-Result -Category "Permissions" -Check "Entra role for install" -Result "Pass" -Detail "User has Privileged Role Administrator + Cloud Application Administrator."
+                Add-Result -Category "Permissions" -Check "Entra role for install" -Result "Pass" -Detail "Privileged Role Administrator + Cloud Application Administrator."
             }
             else {
-                Add-Result -Category "Permissions" -Check "Entra role for install" -Result "Fail" -Detail "Missing Global Administrator (or Privileged Role Administrator + Cloud Application Administrator). Roles found: $($roleNames)."
+                Add-Result -Category "Permissions" -Check "Entra role for install" -Result "Fail" -Detail "Needs Global Administrator (or Privileged Role Administrator + Cloud Application Administrator) for the install. Current roles: $(if ($roleNames) { $roleNames } else { 'none' })."
             }
         }
         else {
-            Add-Result -Category "Permissions" -Check "Entra role for install" -Result "Warn" -Detail "Could not read Entra roles (Graph returned HTTP $($resp.StatusCode)). The tenant may restrict Microsoft Graph; verify roles manually." -Message ($resp.Content)
+            Add-Result -Category "Permissions" -Check "Entra role for install" -Result "Warn" -Detail "Could not read Entra roles (HTTP $($resp.StatusCode)) - confirm the account has Global Administrator." -Message ($resp.Content)
         }
     }
     catch {
-        Add-Result -Category "Permissions" -Check "Entra role for install" -Result "Warn" -Detail "Could not read Entra roles via Graph REST. The tenant may restrict Microsoft Graph; verify roles manually." -Message $_.Exception.Message
+        Add-Result -Category "Permissions" -Check "Entra role for install" -Result "Warn" -Detail "Could not read Entra roles - confirm the account has Global Administrator." -Message $_.Exception.Message
     }
 
     # Azure Owner on the subscription (required to install).
@@ -2752,7 +2711,7 @@ try {
         Add-Result -Category "Permissions" -Check "Azure Owner on subscription" -Result "Pass" -Detail "Owner via group membership."
     }
     elseif ($directError -and $viaGroupError) {
-        Add-Result -Category "Permissions" -Check "Azure Owner on subscription" -Result "Warn" -Detail "Could not evaluate subscription role assignments." -Message "$directError | $viaGroupError"
+        Add-Result -Category "Permissions" -Check "Azure Owner on subscription" -Result "Warn" -Detail "Could not read role assignments - confirm the account has Owner (or Contributor + User Access Administrator)." -Message "$directError | $viaGroupError"
     }
     else {
         # Owner ruled out; at least one query returned data. Evaluate the Contributor + User Access
@@ -2767,16 +2726,16 @@ try {
         $partialNote = if ($partialErr) { " One role query failed, so this may be incomplete." } else { "" }
 
         if ($hasContributor -and $hasUaa) {
-            Add-Result -Category "Permissions" -Check "Azure Owner on subscription" -Result "Pass" -Detail "Contributor + User Access Administrator (functionally equivalent to Owner for install).$partialNote" -Message $partialErr
+            Add-Result -Category "Permissions" -Check "Azure Owner on subscription" -Result "Pass" -Detail "Contributor + User Access Administrator (sufficient).$partialNote" -Message $partialErr
         }
         elseif ($hasContributor) {
-            Add-Result -Category "Permissions" -Check "Azure Owner on subscription" -Result "Fail" -Detail "Have Contributor but missing User Access Administrator; need Owner, or Contributor + User Access Administrator, to install.$partialNote" -Message $partialErr
+            Add-Result -Category "Permissions" -Check "Azure Owner on subscription" -Result "Fail" -Detail "Has Contributor but not User Access Administrator - grant Owner, or add User Access Administrator.$partialNote" -Message $partialErr
         }
         elseif ($hasUaa) {
-            Add-Result -Category "Permissions" -Check "Azure Owner on subscription" -Result "Fail" -Detail "Have User Access Administrator but missing Contributor; need Owner, or Contributor + User Access Administrator, to install.$partialNote" -Message $partialErr
+            Add-Result -Category "Permissions" -Check "Azure Owner on subscription" -Result "Fail" -Detail "Has User Access Administrator but not Contributor - grant Owner, or add Contributor.$partialNote" -Message $partialErr
         }
         else {
-            Add-Result -Category "Permissions" -Check "Azure Owner on subscription" -Result "Fail" -Detail "Owner not detected on the subscription (or you are a guest). Owner (or Contributor + User Access Administrator) is required to install Nerdio Manager.$partialNote" -Message $partialErr
+            Add-Result -Category "Permissions" -Check "Azure Owner on subscription" -Result "Fail" -Detail "Owner not found - grant Owner (or Contributor + User Access Administrator) on the subscription.$partialNote" -Message $partialErr
         }
     }
 
@@ -2811,11 +2770,11 @@ try {
         $rr = $rpJobResults | Where-Object { $_.Rp -eq $rp } | Select-Object -First 1
         if ($rr -and $rr.Ok) {
             if ($rr.State -eq "Registered") { Add-Result -Category "ResourceProviders" -Check $rp -Result "Pass" -Detail "Registered." }
-            else { Add-Result -Category "ResourceProviders" -Check $rp -Result "Warn" -Detail "Not registered (state: $($rr.State)). Register before installing." }
+            else { Add-Result -Category "ResourceProviders" -Check $rp -Result "Warn" -Detail "Not registered ($($rr.State)) - register it on the subscription before installing." }
         }
         else {
             $rpErr = if ($rr) { $rr.Error } else { "No result returned from the registration-state query job." }
-            Add-Result -Category "ResourceProviders" -Check $rp -Result "Warn" -Detail "Could not query registration state." -Message $rpErr
+            Add-Result -Category "ResourceProviders" -Check $rp -Result "Warn" -Detail "Could not read registration state: $rpErr" -Message $rpErr
         }
     }
 
@@ -3059,7 +3018,7 @@ try {
         # runs; never in Cloud Shell, see E12 above) - without one there is no IP to pin the rule to, and
         # inventing one would misrepresent the test rather than skip it.
         if (-not $kvToggle.AclAttempted) {
-            Add-Result -Category "Deployability" -Check "Key Vault firewall rule (temporary IP ACL)" -Result "Info" -Detail "Not tested - no egress IP known"
+            Add-Result -Category "Deployability" -Check "Key Vault firewall rule (temporary IP ACL)" -Result "Info" -Detail "Not tested (egress IP unknown)."
         }
         elseif ($kvToggle.AclOk) {
             Add-Result -Category "Deployability" -Check "Key Vault firewall rule (temporary IP ACL)" -Result "Pass" -Detail "Created successfully."
@@ -3072,7 +3031,7 @@ try {
             Add-Result -Category "Deployability" -Check "Key Vault temporary public access (confirmed allowed)" -Result "Pass"
         }
         elseif ($kvToggle.IsParamBind) {
-            Add-Result -Category "Deployability" -Check "Key Vault temporary public access (install step)" -Result "Warn" -Detail "Could not simulate - Update-AzKeyVault -PublicNetworkAccess not available in this Az version."
+            Add-Result -Category "Deployability" -Check "Key Vault temporary public access (install step)" -Result "Warn" -Detail "Not tested - the installed Az.KeyVault module is too old. Update the Az modules and re-run."
         }
         else {
             Add-PolicyFailureResult -Category "Deployability" -Check "Key Vault temporary public access (install step)" -RawMessage $kvToggle.Error
@@ -3099,20 +3058,20 @@ try {
         # and the remedy is to reconnect to that tenant and re-run - reported as a Fail + a next-step.
         $isTenantIssuerErr = { param($m) $m -and ($m -match "AKV10032" -or $m -match "Invalid issuer" -or $m -match "wrong issuer") }
         $hasTenantIssuer = { param($kv) (& $isTenantIssuerErr $kv.KeyError) -or (& $isTenantIssuerErr $kv.SecretError) }
-        $tenantIssuerDetail = "Failed: Key Vault rejected the token as issued by the wrong Entra tenant. This account has access to multiple tenants (e.g. guest/B2B) and the session could not be pinned to the subscription's owning tenant ($TenantId), so the throwaway vault was created under, or accessed from, the wrong tenant. A vault's tenant is fixed when it is created, so this cannot be fixed mid-run: reconnect to the correct tenant first ('Connect-AzAccount -TenantId $TenantId -UseDeviceAuthentication'), then re-run this script."
+        $tenantIssuerDetail = "Key Vault rejected the token as issued by the wrong tenant. Run 'Connect-AzAccount -TenantId $TenantId -UseDeviceAuthentication', then re-run this script."
 
         # Report the two data-plane write rows from a $kvToggle result.
         $reportKvDataPlane = {
             param($kv)
             if ($kv.KeyOk) { Add-Result -Category "Deployability" -Check "Key Vault key creation (RSA data-protection key)" -Result "Pass" -Detail "Created successfully." }
             elseif (& $isTenantIssuerErr $kv.KeyError) { Add-Result -Category "Deployability" -Check "Key Vault key creation (RSA data-protection key)" -Result "Fail" -Detail $tenantIssuerDetail -Message $kv.KeyError }
-            elseif (& $isKvFirewallErr $kv.KeyError) { Add-Result -Category "Deployability" -Check "Key Vault key creation (RSA data-protection key)" -Result "Fail" -Detail "Firewall rejected this network path (403) - expect the installer's Key Vault step to fail from here, likely split egress." -Message $kv.KeyError }
-            elseif (& $isDataPlanePermErr $kv.KeyError) { Add-Result -Category "Deployability" -Check "Key Vault key creation (RSA data-protection key)" -Result "Warn" -Detail "Not tested - could not grant data-plane access to the throwaway vault (test limitation, not a policy block)." -Message $kv.KeyError }
+            elseif (& $isKvFirewallErr $kv.KeyError) { Add-Result -Category "Deployability" -Check "Key Vault key creation (RSA data-protection key)" -Result "Fail" -Detail "Key Vault firewall rejected this machine although its egress IP was allowed - likely split egress (e.g. Zscaler). The installer's Key Vault step will fail from this network; route all HTTPS through one egress IP." -Message $kv.KeyError }
+            elseif (& $isDataPlanePermErr $kv.KeyError) { Add-Result -Category "Deployability" -Check "Key Vault key creation (RSA data-protection key)" -Result "Warn" -Detail "Not tested - could not grant this account data-plane access to the test vault." -Message $kv.KeyError }
             else { Add-PolicyFailureResult -Category "Deployability" -Check "Key Vault key creation (RSA data-protection key)" -RawMessage $kv.KeyError }
             if ($kv.SecretOk) { Add-Result -Category "Deployability" -Check "Key Vault secret creation" -Result "Pass" -Detail "Created successfully." }
             elseif (& $isTenantIssuerErr $kv.SecretError) { Add-Result -Category "Deployability" -Check "Key Vault secret creation" -Result "Fail" -Detail $tenantIssuerDetail -Message $kv.SecretError }
-            elseif (& $isKvFirewallErr $kv.SecretError) { Add-Result -Category "Deployability" -Check "Key Vault secret creation" -Result "Fail" -Detail "Firewall rejected this network path (403) - expect the installer's Key Vault step to fail from here, likely split egress." -Message $kv.SecretError }
-            elseif (& $isDataPlanePermErr $kv.SecretError) { Add-Result -Category "Deployability" -Check "Key Vault secret creation" -Result "Warn" -Detail "Not tested - could not grant data-plane access to the throwaway vault (test limitation, not a policy block)." -Message $kv.SecretError }
+            elseif (& $isKvFirewallErr $kv.SecretError) { Add-Result -Category "Deployability" -Check "Key Vault secret creation" -Result "Fail" -Detail "Key Vault firewall rejected this machine although its egress IP was allowed - likely split egress (e.g. Zscaler). The installer's Key Vault step will fail from this network; route all HTTPS through one egress IP." -Message $kv.SecretError }
+            elseif (& $isDataPlanePermErr $kv.SecretError) { Add-Result -Category "Deployability" -Check "Key Vault secret creation" -Result "Warn" -Detail "Not tested - could not grant this account data-plane access to the test vault." -Message $kv.SecretError }
             else { Add-PolicyFailureResult -Category "Deployability" -Check "Key Vault secret creation" -RawMessage $kv.SecretError }
         }
 
@@ -3126,7 +3085,7 @@ try {
             # is fixed at creation, so this cannot be fixed mid-run - record a next-step telling the user
             # to reconnect to the correct tenant and re-run.
             if (& $hasTenantIssuer $kvToggle) {
-                $NextSteps.Add("Key Vault key/secret creation could not be verified: this account has access to multiple Entra tenants (guest/B2B) and the session could not be pinned to the subscription's owning tenant, so the throwaway Key Vault was created under the wrong tenant. Reconnect to the correct tenant with 'Connect-AzAccount -TenantId $TenantId -UseDeviceAuthentication', then re-run this script to confirm the Key Vault data-plane checks pass.")
+                $NextSteps.Add("Key Vault checks hit a wrong-tenant token. Run 'Connect-AzAccount -TenantId $TenantId -UseDeviceAuthentication', then re-run this script.")
             }
         }
     }
@@ -3157,7 +3116,7 @@ try {
         }
     }
     else {
-        Add-Result -Category "Deployability" -Check "SQL Database (Standard S1, DTU)" -Result "Warn" -Detail "Skipped - SQL Server was not created."
+        Add-Result -Category "Deployability" -Check "SQL Database (Standard S1, DTU)" -Result "Info" -Detail "Skipped - SQL Server was not created."
     }
 
     # SQL "Allow Azure services" firewall rule (AllowAllWindowsAzureIps, 0.0.0.0-0.0.0.0). The installer
@@ -3167,12 +3126,12 @@ try {
     # template: test it when the SQL server has public access, skip it under -PrivateEndpointOnly.
     if ($sqlOk) {
         if ($PrivateEndpointOnly) {
-            Add-Result -Category "Deployability" -Check "SQL firewall rule (AllowAllWindowsAzureIps)" -Result "Info" -Detail "Not applicable (private-endpoint deployment)"
+            Add-Result -Category "Deployability" -Check "SQL firewall rule (AllowAllWindowsAzureIps)" -Result "Info" -Detail "Not applicable (private-endpoint deployment)."
         }
         else {
             try {
                 New-AzSqlServerFirewallRule -ResourceGroupName $ResourceGroupName -ServerName $sqlName -FirewallRuleName "AllowAllWindowsAzureIps" -StartIpAddress "0.0.0.0" -EndIpAddress "0.0.0.0" -ErrorAction Stop | Out-Null
-                Add-Result -Category "Deployability" -Check "SQL firewall rule (AllowAllWindowsAzureIps)" -Result "Pass" -Detail "Created successfully (0.0.0.0-0.0.0.0, 'Allow Azure services and resources')."
+                Add-Result -Category "Deployability" -Check "SQL firewall rule (AllowAllWindowsAzureIps)" -Result "Pass" -Detail "Created successfully."
                 # Child of the SQL server - removed when the server is removed at cleanup.
             }
             catch {
@@ -3183,8 +3142,8 @@ try {
         # The installer's ARM template creates the server with azureADOnlyAuthentication=true
         # (template-8.0.json); the throwaway server here uses SQL auth so the bogus-login probe below
         # can distinguish a real SQL response from a broken path. A policy that requires or forbids
-        # AAD-only SQL auth therefore still isn't exercised by this test.
-        Add-Result -Category "Deployability" -Check "SQL Entra-only authentication" -Result "Info" -Detail "Not exercised (test server uses SQL auth)"
+        # AAD-only SQL auth therefore still isn't exercised by this test (not reported - a fixed test
+        # limitation, not a finding about the environment).
 
         # Mirror ConfigureSqlServer's temporary public-access toggle (cloudshell-deploy.ps1:702-747):
         # the installer only flips PublicNetworkAccess to Enabled when the server was created Disabled
@@ -3221,7 +3180,7 @@ try {
                 Test-SqlOperatorDataPath -ResourceGroupName $ResourceGroupName -ServerName $sqlName -Fqdn "$sqlName.$SqlSuffix" -EgressIp $script:EgressInfo.Ip -IsCloudShell $script:IsCloudShell
             }
             else {
-                Add-Result -Category "Connectivity" -Check "SQL data path (operator -> 1433)" -Result "Info" -Detail "Not tested - could not enable public access"
+                Add-Result -Category "Connectivity" -Check "SQL data path (operator -> 1433)" -Result "Info" -Detail "Not tested (public access could not be enabled)."
             }
 
             # E-SQL-Entra - prove a token minted for this account is actually ACCEPTED by SQL, mirroring
@@ -3231,7 +3190,7 @@ try {
             # control-plane (ARM) call and does not need public data access, so it always runs; only the
             # actual connection needs $sqlPublicAccessReady.
             if (-not $meObjectId) {
-                Add-Result -Category "Deployability" -Check "SQL Entra token authentication" -Result "Info" -Detail "Not tested - signed-in identity object id unavailable"
+                Add-Result -Category "Deployability" -Check "SQL Entra token authentication" -Result "Info" -Detail "Not tested (signed-in user's object id unavailable)."
             }
             else {
                 $sqlAadAdminOk = $false
@@ -3246,7 +3205,7 @@ try {
 
                 if ($sqlAadAdminOk) {
                     if (-not $sqlPublicAccessReady) {
-                        Add-Result -Category "Deployability" -Check "SQL Entra token authentication" -Result "Info" -Detail "Not tested - could not enable public access"
+                        Add-Result -Category "Deployability" -Check "SQL Entra token authentication" -Result "Info" -Detail "Not tested (public access could not be enabled)."
                     }
                     else {
                         # DO NOT use Invoke-Sqlcmd - it ships in the SqlServer module, which is not on this
@@ -3254,7 +3213,7 @@ try {
                         # Test-SqlOperatorDataPath uses.
                         $hasSqlClientForAuth = [bool]([System.Management.Automation.PSTypeName]"System.Data.SqlClient.SqlConnection").Type
                         if (-not $hasSqlClientForAuth) {
-                            Add-Result -Category "Deployability" -Check "SQL Entra token authentication" -Result "Info" -Detail "Not tested - SqlClient unavailable"
+                            Add-Result -Category "Deployability" -Check "SQL Entra token authentication" -Result "Info" -Detail "Not tested (SqlClient unavailable in this PowerShell session)."
                         }
                         else {
                             $sqlAuthConn = $null
@@ -3342,7 +3301,7 @@ try {
         else { Add-PolicyFailureResult -Category "Deployability" -Check "Web App (httpsOnly, TLS 1.3, FTPS disabled)" -RawMessage $webRes.Error }
     }
     else {
-        Add-Result -Category "Deployability" -Check "Web App (httpsOnly, TLS 1.3, FTPS disabled)" -Result "Warn" -Detail "Skipped - App Service Plan was not created."
+        Add-Result -Category "Deployability" -Check "Web App (httpsOnly, TLS 1.3, FTPS disabled)" -Result "Info" -Detail "Skipped - App Service Plan was not created."
     }
 
     # Application Insights (workspace-based, linked to the Log Analytics workspace above).
@@ -3366,7 +3325,7 @@ try {
         else { Add-PolicyFailureResult -Category "Deployability" -Check "Application Insights (workspace-based)" -RawMessage $aiRes.Error }
     }
     else {
-        Add-Result -Category "Deployability" -Check "Application Insights (workspace-based)" -Result "Warn" -Detail "Skipped - Log Analytics workspace was not created."
+        Add-Result -Category "Deployability" -Check "Application Insights (workspace-based)" -Result "Info" -Detail "Skipped - Log Analytics workspace was not created."
     }
 
     # Storage blob container. The installer creates it as an ARM child (control plane), so use the
@@ -3375,7 +3334,7 @@ try {
     if ($storageOk) {
         try {
             New-AzRmStorageContainer -ResourceGroupName $ResourceGroupName -StorageAccountName $stName -ContainerName $dpContainerName -PublicAccess None -ErrorAction Stop | Out-Null
-            Add-Result -Category "Deployability" -Check "Storage blob container" -Result "Pass" -Detail "Created successfully (control-plane, publicAccess None)."
+            Add-Result -Category "Deployability" -Check "Storage blob container" -Result "Pass" -Detail "Created successfully."
             # Child of the storage account - removed when the account is removed at cleanup.
         }
         catch {
@@ -3410,13 +3369,13 @@ try {
                 @{ Ra = $ra; Error = $raErr }
             }
             if ($raResult.Ra) {
-                Add-Result -Category "Deployability" -Check "Role assignment" -Result "Pass" -Detail "Granted Contributor at resource-group scope to the updater Automation account's managed identity; removed at cleanup."
+                Add-Result -Category "Deployability" -Check "Role assignment" -Result "Pass" -Detail "Created successfully."
                 Add-TrackedResource -Type "roleassignment" -ResourceGroupName $ResourceGroupName -Name $raResult.Ra.RoleAssignmentId -Id $raScope -Note $aaPrincipalId
             }
             else { Add-PolicyFailureResult -Category "Deployability" -Check "Role assignment" -RawMessage $raResult.Error }
         }
         else {
-            Add-Result -Category "Deployability" -Check "Role assignment" -Result "Warn" -Detail "Skipped - could not resolve the updater Automation account's managed identity principal id."
+            Add-Result -Category "Deployability" -Check "Role assignment" -Result "Warn" -Detail "Not tested (Automation account managed identity not found)."
         }
     }
 
@@ -3458,9 +3417,7 @@ try {
     # private endpoint / DNS / VNet-integration checks can't run - surface that as WARN (not an
     # implicit PASS from simply skipping them) so the report flags the still-to-validate work.
     if ($VnetInfoUnknown) {
-        Add-Result -Category "PrivateEndpoint" -Check "Private endpoint deployment" -Result "Warn" -Detail "Not validated - private VNet intended but VNet/subnet details were not known at test time. Re-run this script once the VNet exists to validate private endpoints."
-        Add-Result -Category "PrivateDns" -Check "Private DNS zones" -Result "Warn" -Detail "Not validated - VNet details were not known at test time. Confirm the required private DNS zones exist and are linked once the VNet is available."
-        Add-Result -Category "Connectivity" -Check "App Service VNet integration" -Result "Warn" -Detail "Not validated - VNet details were not known at test time. Re-run once the VNet/subnets are available."
+        Add-Result -Category "PrivateEndpoint" -Check "Private endpoints, DNS, and VNet integration" -Result "Warn" -Detail "Not tested - VNet not yet available. Re-run this script once the VNet and both subnets exist."
     }
 
     #region Private endpoint + DNS ---------------------------------------------------------------
@@ -3473,7 +3430,7 @@ try {
             $PeTargets = Test-PrivateEndpoints -Vnet $vnet -PeSubnetName $PeSubnetName -ExistingVnetName $ExistingVnetName -ResourceGroupName $ResourceGroupName -sqlName $sqlName -kvName $kvName -stName $stName -aaUpdaterName $aaUpdaterName -peName $peName -Location $Location -Tags $Tags
         }
         catch {
-            Add-Result -Category "PrivateEndpoint" -Check "Private endpoint / DNS test" -Result "Warn" -Detail "Could not complete private endpoint / DNS test." -Message $_.Exception.Message
+            Add-Result -Category "PrivateEndpoint" -Check "Private endpoint / DNS test" -Result "Warn" -Detail "Not completed: $($_.Exception.Message)" -Message $_.Exception.Message
         }
         Write-Host ""
     }
@@ -3491,10 +3448,10 @@ try {
             else {
                 $deleg = $appSubnet.Delegations | Where-Object { $_.ServiceName -eq "Microsoft.Web/serverFarms" }
                 if (-not $deleg) {
-                    Add-Result -Category "Connectivity" -Check "App subnet delegation" -Result "Warn" -Detail "Subnet '$AppSubnetName' lacks 'Microsoft.Web/serverFarms' delegation required for VNet integration. Skipping the live connectivity test."
+                    Add-Result -Category "Connectivity" -Check "App subnet delegation" -Result "Warn" -Detail "Subnet '$AppSubnetName' is not delegated to Microsoft.Web/serverFarms - add the delegation (required for VNet integration). Connectivity test skipped."
                 }
                 else {
-                    Add-Result -Category "Connectivity" -Check "App subnet delegation" -Result "Pass" -Detail "Subnet '$AppSubnetName' is delegated to Microsoft.Web/serverFarms."
+                    Add-Result -Category "Connectivity" -Check "App subnet delegation" -Result "Pass" -Detail "Delegated to Microsoft.Web/serverFarms."
 
                     # Ensure an App Service Plan + Web App exist to integrate.
                     $planName = $connAspName
@@ -3509,7 +3466,7 @@ try {
                     $swiftBody = @{ properties = @{ subnetResourceId = $appSubnet.Id; swiftSupported = $true } } | ConvertTo-Json -Depth 5
                     $swift = Invoke-AzRestMethod -Method PUT -Uri $swiftUri -Payload $swiftBody -ErrorAction Stop
                     if ($swift.StatusCode -ge 200 -and $swift.StatusCode -lt 300) {
-                        Add-Result -Category "Connectivity" -Check "VNet integration" -Result "Pass" -Detail "Regional VNet integration enabled to '$AppSubnetName'."
+                        Add-Result -Category "Connectivity" -Check "VNet integration" -Result "Pass" -Detail "Enabled on subnet '$AppSubnetName'."
                         # Route all traffic through the VNet so the test reflects NME behavior.
                         try { Set-AzWebApp -ResourceGroupName $ResourceGroupName -Name $webName -AppSettings @{ WEBSITE_VNET_ROUTE_ALL = "1" } -ErrorAction SilentlyContinue | Out-Null } catch {}
 
@@ -3521,7 +3478,7 @@ try {
                         Add-Result -Category "Connectivity" -Check "Outbound connectivity test" -Result "Info" -Detail "Skipped; new VNet using Azure DNS"
                     }
                     else {
-                        Test-OutboundConnectivityViaKudu -AzEnv $AzEnv -PeTargets $PeTargets -Web $web -webName $webName -AppSubnetName $AppSubnetName -PeSubnetName $PeSubnetName -NmeNetworkTestHint $NmeNetworkTestHint
+                        Test-OutboundConnectivityViaKudu -AzEnv $AzEnv -PeTargets $PeTargets -Web $web -webName $webName -AppSubnetName $AppSubnetName -PeSubnetName $PeSubnetName
 
                         # DNS-resolution probe + same-run retry loop (existing-VNet only; PEs must exist).
                         # When the privatelink FQDNs don't resolve to their private IPs, print the exact
@@ -3534,7 +3491,7 @@ try {
                                 Show-DnsResolutionGuidance -UsesCustomDns ([bool]$dnsRollup.UsesCustomDns) -DnsTargets $dnsTargets -VnetName $ExistingVnetName
                                 if (-not (Read-YesNo -Prompt "Re-run the DNS resolution test now? Make your DNS changes first, then choose Y. [y/N]" -Default "n")) { break }
                                 # Drop the prior DNS rows so the report shows only the latest attempt.
-                                [void]$Results.RemoveAll({ param($r) $r.Category -eq "Connectivity" -and ($r.Check -like "Private DNS resolution:*" -or $r.Check -eq "Private endpoint DNS resolution (overall)") })
+                                [void]$Results.RemoveAll({ param($r) $r.Category -eq "Connectivity" -and $r.Check -like "Private DNS resolution*" })
                                 # Re-read the VNet in case the customer just linked a zone / changed DNS servers.
                                 try { $vnet = Get-AzVirtualNetwork -ResourceGroupName $ExistingVnetRg -Name $ExistingVnetName -ErrorAction Stop } catch {}
                                 $dnsRollup = Invoke-DnsResolutionProbe -Vnet $vnet -AzEnv $AzEnv -DnsTargets $dnsTargets -Web $web -webName $webName
@@ -3543,13 +3500,14 @@ try {
                     }
                     }
                     else {
-                        Add-Result -Category "Connectivity" -Check "VNet integration" -Result "Warn" -Detail "Could not enable VNet integration (HTTP $($swift.StatusCode)) on the test App Service. After the real NME install has working VNet integration, verify outbound access with NmeNetworkTest.ps1." -Message $swift.Content
+                        # A private install needs VNet integration, so this is a Fail - named by policy when one blocked it.
+                        Add-PolicyFailureResult -Category "Connectivity" -Check "VNet integration" -RawMessage ([string]$swift.Content) -FailedPrefix "Could not enable VNet integration on subnet '$AppSubnetName'"
                     }
                 }
             }
         }
         catch {
-            Add-Result -Category "Connectivity" -Check "App Service connectivity test" -Result "Warn" -Detail "Could not complete the App Service connectivity test." -Message $_.Exception.Message
+            Add-Result -Category "Connectivity" -Check "App Service connectivity test" -Result "Warn" -Detail "Not completed: $(Get-ConciseErrorMessage -RawMessage (Get-DetailedErrorMessage -ErrorRecord $_))" -Message $_.Exception.Message
         }
         Write-Host ""
     }
@@ -3618,13 +3576,13 @@ finally {
     Write-Host ""
     Write-Host "## Nerdio Manager Deployment Readiness Report"
     Write-Host "- Date: $($summaryMeta.TimestampUtc)"
-    Write-Host "- Subscription: $($summaryMeta.SubscriptionId)"
-    Write-Host "- Cloud / Region: $($summaryMeta.Cloud) / $($summaryMeta.Region)"
     Write-Host "- Summary: $($counts -join '  ')"
-    Write-Host ""
-    Write-Host "Configuration used (reference for install)"
-    Write-Host ("-" * 60)
-    Write-KeyValueTable -Table $ConfigSummary
+    if ($ConfigSummary.Count -gt 0) {
+        Write-Host ""
+        Write-Host "Configuration used (reference for install)"
+        Write-Host ("-" * 60)
+        Write-KeyValueTable -Table $ConfigSummary
+    }
     if ($CustomResourceNames.Count -gt 0) {
         Write-Host ""
         Write-Host "Custom resource names"
@@ -3654,23 +3612,23 @@ finally {
         Write-Host ""
     }
 
-    Write-Host -ForegroundColor "Cyan" "Detailed results written to: $OutFile"
-    Write-Host -ForegroundColor "Cyan" "HTML report written to:      $HtmlOutFile"
+    Write-Host -ForegroundColor "Cyan" "JSON results: $OutFile"
+    if ($HtmlOutFile) { Write-Host -ForegroundColor "Cyan" "HTML report:  $HtmlOutFile" }
     Write-Host ""
-    if ($script:IsCloudShell) {
+    if ($script:IsCloudShell -and $HtmlOutFile) {
         Invoke-CloudShellDownload -Path $HtmlOutFile
-        Write-Host -ForegroundColor "Cyan" "You should now see an option to download the html report. If you do not, you can download the html from from the current session or copy the above report. Send the report to your Nerdio SE for validation."
+        Write-Host -ForegroundColor "Cyan" "Download the HTML report (use Manage files > Download if no prompt appears) and send it to your Nerdio SE."
     }
     elseif ($HtmlOutFile) {
-        Write-Host -ForegroundColor "Cyan" "The HTML report was written to the current directory: $HtmlOutFile"
-        Write-Host -ForegroundColor "Cyan" "Send that file to your Nerdio SE for validation."
+        Write-Host -ForegroundColor "Cyan" "Send the HTML report to your Nerdio SE."
     }
     #endregion
 
     #region Cleanup ------------------------------------------------------------------------------
     $removeAll = Read-YesNo -Prompt "Remove all resources created by this test? [Y/n]" -Default "y"
     if ($removeAll) {
-        Write-Host -ForegroundColor "Cyan" "Removing created resources in parallel waves..."
+        Write-Host -ForegroundColor "Cyan" "Removing created resources..."
+        $removedCount = 0
         # Per-resource removal as a scriptblock so each can run in its own ThreadJob (which shares the
         # Az context in-process, like the deployability jobs). Only direct Az cmdlet calls - no script
         # functions - so no InitializationScript is needed. Returns a plain result the main thread
@@ -3746,17 +3704,17 @@ finally {
             $rmResults = Wait-JobsWithDots -Jobs $rmJobs -Activity "Removing $($wave.Label)"
             $rmJobs | Remove-Job -Force -ErrorAction SilentlyContinue
             foreach ($rr in $rmResults) {
-                if ($rr.Ok) { Write-Host "  removed $($rr.Type): $($rr.Name)" }
+                if ($rr.Ok) { $removedCount++ }
                 else { Write-Host -ForegroundColor "Yellow" "  could not remove $($rr.Type) '$($rr.Name)': $($rr.Error)" }
             }
         }
         if ($CreatedResourceGroup) {
             if (Read-YesNo -Prompt "Also remove the temporary resource group '$ResourceGroupName'? [Y/n]" -Default "y") {
-                Write-Host -ForegroundColor "Cyan" "Removing resource group '$ResourceGroupName' (runs in background)."
+                Write-Host -ForegroundColor "Cyan" "Removing resource group '$ResourceGroupName' in the background."
                 Remove-AzResourceGroup -Name $ResourceGroupName -Force -AsJob -ErrorAction Continue | Out-Null
             }
         }
-        Write-Host -ForegroundColor "Cyan" "Cleanup complete. Verify the resource group to confirm."
+        Write-Host -ForegroundColor "Cyan" "Removed $removedCount of $($Tracker.Count) test resources."
     }
     else {
         Write-Host -ForegroundColor "Yellow" "Left the following resources in resource group '$ResourceGroupName':"
