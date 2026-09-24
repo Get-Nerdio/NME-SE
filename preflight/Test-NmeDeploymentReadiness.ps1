@@ -107,8 +107,8 @@ function Add-Result {
         [string] $RawMessage = $null
     )
     # Every check funnels through here for both console printing and the stored $Results (which
-    # feed the JSON/HTML report), so redacting subscription ids here - rather than at each call site -
-    # catches them even when they arrive embedded in an opaque ARM error message or resource id.
+    # feed the JSON/HTML report), so redacting subscription/tenant ids here - rather than at each call
+    # site - catches them even when they arrive embedded in an opaque ARM error message or resource id.
     $Detail = Get-MaskedText $Detail
     $PolicyName = Get-MaskedText $PolicyName
     $Message = Get-MaskedText $Message
@@ -889,9 +889,9 @@ function Get-MaskedAccount {
     return "$masked$domain"
 }
 
-function Get-MaskedSubscriptionId {
-    # Mask a subscription id for display: keep the first 8 alphanumeric characters, replace every
-    # remaining alphanumeric character with '#', and leave hyphens in place. e.g.
+function Get-MaskedGuid {
+    # Mask a GUID (subscription or tenant id) for display: keep the first 8 alphanumeric characters,
+    # replace every remaining alphanumeric character with '#', and leave hyphens in place. e.g.
     # 17c99779-9397-4bd4-b7c0-2cde094b9646 -> 17c99779-####-####-####-############
     param([string] $Id)
     if ([string]::IsNullOrWhiteSpace($Id)) { return $Id }
@@ -905,18 +905,19 @@ function Get-MaskedSubscriptionId {
 }
 
 function Get-MaskedText {
-    # Redact every occurrence of a known subscription id (the target -SubscriptionId, and the
-    # Private DNS zone subscription id if the intake flow captured one) inside arbitrary report
-    # text - ARM error messages, resource ids, config summary values - using the same scheme as
-    # Get-MaskedSubscriptionId. Looks up $SubscriptionId / $PrivateDnsZoneSubId from the enclosing
-    # script scope, so it stays correct even before/without the latter being set. No-op if the text
-    # doesn't contain a known subscription id.
+    # Redact every occurrence of a known subscription or tenant id (the target -SubscriptionId, the
+    # Private DNS zone subscription id if the intake flow captured one, the subscription's owning
+    # tenant, and the account's active tenant if it ever differed) inside arbitrary report text - ARM
+    # error messages, resource ids, config summary values - using the same scheme as Get-MaskedGuid.
+    # Looks up $SubscriptionId / $PrivateDnsZoneSubId / $TenantId / $activeTenant from the enclosing
+    # script scope, so it stays correct even before/without any of them being set. No-op if the text
+    # doesn't contain a known id.
     param([string] $Text)
     if ([string]::IsNullOrWhiteSpace($Text)) { return $Text }
     $result = $Text
-    foreach ($sid in (@($SubscriptionId, $PrivateDnsZoneSubId) | Where-Object { $_ } | Select-Object -Unique)) {
+    foreach ($sid in (@($SubscriptionId, $PrivateDnsZoneSubId, $TenantId, $activeTenant) | Where-Object { $_ } | Select-Object -Unique)) {
         if ($result -match [regex]::Escape($sid)) {
-            $result = $result -replace [regex]::Escape($sid), (Get-MaskedSubscriptionId $sid)
+            $result = $result -replace [regex]::Escape($sid), (Get-MaskedGuid $sid)
         }
     }
     return $result
@@ -1918,7 +1919,7 @@ try {
         Write-Host -ForegroundColor "Green" "[$([char]0x2713)] Subscription context set: '$($Context.Subscription.Name)'."
     }
     catch {
-        Write-Host -ForegroundColor "Red" "Could not set context to subscription '$(Get-MaskedSubscriptionId $SubscriptionId)': $(Get-MaskedText $_.Exception.Message)"
+        Write-Host -ForegroundColor "Red" "Could not set context to subscription '$(Get-MaskedGuid $SubscriptionId)': $(Get-MaskedText $_.Exception.Message)"
         return
     }
 
@@ -1955,9 +1956,9 @@ try {
         # NOW (before creating anything) so every resource is stamped with the correct tenant. Device
         # code works everywhere including Cloud Shell (a plain Connect there would silently reuse the
         # same wrong-tenant SSO credential). Non-interactive runs skip this and surface the mismatch.
-        Write-Host -ForegroundColor "Yellow" "The active Azure context is on tenant '$activeTenant', but subscription '$(Get-MaskedSubscriptionId $SubscriptionId)' is owned by tenant '$TenantId'."
+        Write-Host -ForegroundColor "Yellow" "The active Azure context is on tenant '$(Get-MaskedGuid $activeTenant)', but subscription '$(Get-MaskedGuid $SubscriptionId)' is owned by tenant '$(Get-MaskedGuid $TenantId)'."
         Write-Host -ForegroundColor "Yellow" "Resources (notably Key Vault) must be created under the subscription's own tenant, or the Key Vault checks will fail with an 'Invalid issuer' (AKV10032) error."
-        if (-not [Console]::IsInputRedirected -and (Read-YesNo -Prompt "Re-authenticate (device code) to tenant $TenantId now, before creating resources? [Y/n]" -Default "y")) {
+        if (-not [Console]::IsInputRedirected -and (Read-YesNo -Prompt "Re-authenticate (device code) to tenant $(Get-MaskedGuid $TenantId) now, before creating resources? [Y/n]" -Default "y")) {
             try {
                 Write-Host -ForegroundColor "Cyan" "A sign-in URL and code will be shown below - complete it as the account that has access to this tenant/subscription."
                 Connect-AzAccount -Tenant $TenantId -UseDeviceAuthentication -ErrorAction Stop | Out-Null
@@ -2598,7 +2599,7 @@ try {
             # report still shows the SE what was attempted.
             $ConfigSummary["Run by (signed-in account)"] = $SignedInAccountMasked
             $ConfigSummary["Signed-in account type"] = $AccountTypeSummary
-            $ConfigSummary["Subscription"] = "$($Context.Subscription.Name) ($(Get-MaskedSubscriptionId $SubscriptionId))"
+            $ConfigSummary["Subscription"] = "$($Context.Subscription.Name) ($(Get-MaskedGuid $SubscriptionId))"
             $ConfigSummary["Tenant"] = $TenantId
             $ConfigSummary["Cloud"] = $AzEnv.Name
             $ConfigSummary["Region"] = $Location
@@ -2632,7 +2633,7 @@ try {
     # once it's time to actually install NME.
     $ConfigSummary["Run by (signed-in account)"] = $SignedInAccountMasked
     $ConfigSummary["Signed-in account type"] = $AccountTypeSummary
-    $ConfigSummary["Subscription"] = "$($Context.Subscription.Name) ($(Get-MaskedSubscriptionId $SubscriptionId))"
+    $ConfigSummary["Subscription"] = "$($Context.Subscription.Name) ($(Get-MaskedGuid $SubscriptionId))"
     $ConfigSummary["Tenant"] = $TenantId
     $ConfigSummary["Cloud"] = $AzEnv.Name
     $ConfigSummary["Region"] = $Location
@@ -3533,7 +3534,7 @@ finally {
     #region Reporting ----------------------------------------------------------------------------
     $summaryMeta = [pscustomobject]@{
         TimestampUtc    = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss 'UTC'")
-        SubscriptionId  = (Get-MaskedSubscriptionId $SubscriptionId)
+        SubscriptionId  = (Get-MaskedGuid $SubscriptionId)
         Cloud           = $(try { (Get-AzContext).Environment.Name } catch { "unknown" })
         Region          = $Location
         ResourceGroup   = $ResourceGroupName
@@ -3544,10 +3545,12 @@ finally {
         TlsIssuers      = $(if ($script:TlsIssuerFindings) { ($script:TlsIssuerFindings -join "; ") } else { "none (public CA or not probed)" })
     }
 
-    # Belt-and-suspenders sweep: redact any subscription id that made it into a ConfigSummary value
-    # via a path not already covered above (e.g. a blocking policy assignment id, which is a full ARM
-    # resource id rather than a bare GUID).
+    # Belt-and-suspenders sweep: redact any subscription/tenant id that made it into a ConfigSummary
+    # value or a next-step instruction via a path not already covered above (e.g. a blocking policy
+    # assignment id, which is a full ARM resource id rather than a bare GUID, or the wrong-tenant
+    # remediation text built while $TenantId/$activeTenant were still in scope).
     foreach ($cfgKey in @($ConfigSummary.Keys)) { $ConfigSummary[$cfgKey] = Get-MaskedText ([string]$ConfigSummary[$cfgKey]) }
+    for ($i = 0; $i -lt $NextSteps.Count; $i++) { $NextSteps[$i] = Get-MaskedText $NextSteps[$i] }
 
     # $Tracker itself must keep its real resource ids - Cleanup below deletes by them - so build a
     # redacted copy for the JSON/HTML report only.
