@@ -106,6 +106,13 @@ function Add-Result {
         [string] $Message = $null,
         [string] $RawMessage = $null
     )
+    # Every check funnels through here for both console printing and the stored $Results (which
+    # feed the JSON/HTML report), so redacting subscription ids here - rather than at each call site -
+    # catches them even when they arrive embedded in an opaque ARM error message or resource id.
+    $Detail = Get-MaskedText $Detail
+    $PolicyName = Get-MaskedText $PolicyName
+    $Message = Get-MaskedText $Message
+    $RawMessage = Get-MaskedText $RawMessage
     $obj = [pscustomobject]@{
         Category   = $Category
         Check      = $Check
@@ -873,6 +880,24 @@ function Get-MaskedSubscriptionId {
         else { '#' }
     }
     return -join $chars
+}
+
+function Get-MaskedText {
+    # Redact every occurrence of a known subscription id (the target -SubscriptionId, and the
+    # Private DNS zone subscription id if the intake flow captured one) inside arbitrary report
+    # text - ARM error messages, resource ids, config summary values - using the same scheme as
+    # Get-MaskedSubscriptionId. Looks up $SubscriptionId / $PrivateDnsZoneSubId from the enclosing
+    # script scope, so it stays correct even before/without the latter being set. No-op if the text
+    # doesn't contain a known subscription id.
+    param([string] $Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $Text }
+    $result = $Text
+    foreach ($sid in (@($SubscriptionId, $PrivateDnsZoneSubId) | Where-Object { $_ } | Select-Object -Unique)) {
+        if ($result -match [regex]::Escape($sid)) {
+            $result = $result -replace [regex]::Escape($sid), (Get-MaskedSubscriptionId $sid)
+        }
+    }
+    return $result
 }
 
 # Reused wherever a subscription id (or another bare GUID) is validated/re-prompted-for.
@@ -1887,7 +1912,7 @@ try {
         Write-Host -ForegroundColor "Green" "[$([char]0x2713)] Subscription context set: '$($Context.Subscription.Name)'."
     }
     catch {
-        Write-Host -ForegroundColor "Red" "Could not set context to subscription '$SubscriptionId': $($_.Exception.Message)"
+        Write-Host -ForegroundColor "Red" "Could not set context to subscription '$(Get-MaskedSubscriptionId $SubscriptionId)': $(Get-MaskedText $_.Exception.Message)"
         return
     }
 
@@ -1924,7 +1949,7 @@ try {
         # NOW (before creating anything) so every resource is stamped with the correct tenant. Device
         # code works everywhere including Cloud Shell (a plain Connect there would silently reuse the
         # same wrong-tenant SSO credential). Non-interactive runs skip this and surface the mismatch.
-        Write-Host -ForegroundColor "Yellow" "The active Azure context is on tenant '$activeTenant', but subscription '$SubscriptionId' is owned by tenant '$TenantId'."
+        Write-Host -ForegroundColor "Yellow" "The active Azure context is on tenant '$activeTenant', but subscription '$(Get-MaskedSubscriptionId $SubscriptionId)' is owned by tenant '$TenantId'."
         Write-Host -ForegroundColor "Yellow" "Resources (notably Key Vault) must be created under the subscription's own tenant, or the Key Vault checks will fail with an 'Invalid issuer' (AKV10032) error."
         if (-not [Console]::IsInputRedirected -and (Read-YesNo -Prompt "Re-authenticate (device code) to tenant $TenantId now, before creating resources? [Y/n]" -Default "y")) {
             try {
@@ -1933,7 +1958,7 @@ try {
                 $Context = Set-AzContext -Subscription $SubscriptionId -Tenant $TenantId -ErrorAction Stop
                 $activeTenant = (Get-AzContext).Tenant.Id
             }
-            catch { Write-Host -ForegroundColor "Red" "Re-authentication failed: $($_.Exception.Message)" }
+            catch { Write-Host -ForegroundColor "Red" "Re-authentication failed: $(Get-MaskedText $_.Exception.Message)" }
         }
     }
     if ($TenantId -and $activeTenant -eq $TenantId) {
@@ -2185,7 +2210,7 @@ try {
             }
             catch {
                 # Can't enumerate (e.g. permissions) - warn but don't block; accept the RG as-is.
-                Write-Host -ForegroundColor "Yellow" "  Could not verify whether '$ResourceGroupName' is empty: $($_.Exception.Message)"
+                Write-Host -ForegroundColor "Yellow" "  Could not verify whether '$ResourceGroupName' is empty: $(Get-MaskedText $_.Exception.Message)"
             }
         } while (-not $ResourceGroup)
         $Location = $ResourceGroup.Location
@@ -3382,9 +3407,27 @@ finally {
         EgressAsn       = $(if ($script:IsCloudShell) { "Cloud Shell (n/a)" } elseif ($script:EgressInfo -and $script:EgressInfo.Asn) { $script:EgressInfo.Asn } else { "unknown" })
         TlsIssuers      = $(if ($script:TlsIssuerFindings) { ($script:TlsIssuerFindings -join "; ") } else { "none (public CA or not probed)" })
     }
+
+    # Belt-and-suspenders sweep: redact any subscription id that made it into a ConfigSummary value
+    # via a path not already covered above (e.g. a blocking policy assignment id, which is a full ARM
+    # resource id rather than a bare GUID).
+    foreach ($cfgKey in @($ConfigSummary.Keys)) { $ConfigSummary[$cfgKey] = Get-MaskedText ([string]$ConfigSummary[$cfgKey]) }
+
+    # $Tracker itself must keep its real resource ids - Cleanup below deletes by them - so build a
+    # redacted copy for the JSON/HTML report only.
+    $TrackerForReport = @($Tracker | ForEach-Object {
+            [pscustomobject]@{
+                Type              = $_.Type
+                ResourceGroupName = $_.ResourceGroupName
+                Name              = $_.Name
+                Id                = Get-MaskedText $_.Id
+                Note              = Get-MaskedText $_.Note
+            }
+        })
+
     $rawJson = $null
     try {
-        $rawJson = [pscustomobject]@{ Metadata = $summaryMeta; Configuration = $ConfigSummary; Results = $Results; NextSteps = $NextSteps; CreatedResources = $Tracker } |
+        $rawJson = [pscustomobject]@{ Metadata = $summaryMeta; Configuration = $ConfigSummary; Results = $Results; NextSteps = $NextSteps; CreatedResources = $TrackerForReport } |
             ConvertTo-Json -Depth 8
         $rawJson | Out-File -FilePath $OutFile -Force
     }
@@ -3395,7 +3438,7 @@ finally {
     # (and Ctrl+P -> Save as PDF if they want a PDF, no extra tooling required).
     $HtmlOutFile = [System.IO.Path]::ChangeExtension($OutFile, ".html")
     try {
-        $html = New-ReadinessHtmlReport -Results $Results -ConfigSummary $ConfigSummary -CustomResourceNames $CustomResourceNames -Meta $summaryMeta -CreatedResources $Tracker -NextSteps $NextSteps -RawJson $rawJson
+        $html = New-ReadinessHtmlReport -Results $Results -ConfigSummary $ConfigSummary -CustomResourceNames $CustomResourceNames -Meta $summaryMeta -CreatedResources $TrackerForReport -NextSteps $NextSteps -RawJson $rawJson
         $html | Out-File -FilePath $HtmlOutFile -Force -Encoding utf8
     }
     catch { Write-Host -ForegroundColor "Yellow" "Could not write HTML report: $($_.Exception.Message)"; $HtmlOutFile = $null }
