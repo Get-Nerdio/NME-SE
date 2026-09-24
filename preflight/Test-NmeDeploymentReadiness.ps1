@@ -2957,10 +2957,26 @@ try {
         function Invoke-KvInstallSimulation {
             param(
                 [string] $VaultName, [string] $ResourceGroupName, [string] $MeObjectId,
-                [string] $SignedInAccount, [string] $KeyVaultAudience, [string] $TenantId
+                [string] $SignedInAccount, [string] $KeyVaultAudience, [string] $TenantId, [string] $EgressIp
             )
             try { Update-AzKeyVault -VaultName $VaultName -ResourceGroupName $ResourceGroupName -PublicNetworkAccess "Disabled" -ErrorAction Stop | Out-Null } catch {}
             $result = @{}
+            # Installer order: pin the network ACL to the local IP BEFORE flipping public access on
+            # (Unlock-KeyVaultNetworkAccess, cloudshell-deploy.ps1:649-650), so the data-plane writes
+            # below actually traverse an IP-restricted vault instead of an effectively allow-all one.
+            # $EgressIp is only known on local runs (never in Cloud Shell) - skip rather than invent one.
+            if ($EgressIp) {
+                try {
+                    Update-AzKeyVaultNetworkRuleSet -VaultName $VaultName -ResourceGroupName $ResourceGroupName -IPAddressRange $EgressIp -DefaultAction Deny -Bypass None -ErrorAction Stop | Out-Null
+                    $result.AclAttempted = $true
+                    $result.AclOk = $true
+                }
+                catch {
+                    $result.AclAttempted = $true
+                    $result.AclOk = $false
+                    $result.AclError = Get-DetailedErrorMessage -ErrorRecord $_
+                }
+            }
             try {
                 Update-AzKeyVault -VaultName $VaultName -ResourceGroupName $ResourceGroupName -PublicNetworkAccess "Enabled" -ErrorAction Stop | Out-Null
                 $result.Ok = $true
@@ -3013,9 +3029,22 @@ try {
             return $result
         }
 
-        # Run the install simulation (harden -> enable -> data-plane writes -> harden) under a spinner.
+        # Run the install simulation (harden -> ACL -> enable -> data-plane writes -> harden) under a spinner.
         $kvToggle = Invoke-WithSpinner -Activity "Testing Key Vault public-access toggle and data-plane writes" -ScriptBlock {
-            Invoke-KvInstallSimulation -VaultName $kvName -ResourceGroupName $ResourceGroupName -MeObjectId $meObjectId -SignedInAccount $SignedInAccount -KeyVaultAudience $KeyVaultAudience -TenantId $TenantId
+            Invoke-KvInstallSimulation -VaultName $kvName -ResourceGroupName $ResourceGroupName -MeObjectId $meObjectId -SignedInAccount $SignedInAccount -KeyVaultAudience $KeyVaultAudience -TenantId $TenantId -EgressIp $script:EgressInfo.Ip
+        }
+
+        # Report the network-rule-set (IP ACL) write. Only attempted when an egress IP is known (local
+        # runs; never in Cloud Shell, see E12 above) - without one there is no IP to pin the rule to, and
+        # inventing one would misrepresent the test rather than skip it.
+        if (-not $kvToggle.AclAttempted) {
+            Add-Result -Category "Deployability" -Check "Key Vault firewall rule (temporary IP ACL)" -Result "Info" -Detail "Not tested - no egress IP known"
+        }
+        elseif ($kvToggle.AclOk) {
+            Add-Result -Category "Deployability" -Check "Key Vault firewall rule (temporary IP ACL)" -Result "Pass" -Detail "Created successfully."
+        }
+        else {
+            Add-PolicyFailureResult -Category "Deployability" -Check "Key Vault firewall rule (temporary IP ACL)" -RawMessage $kvToggle.AclError
         }
 
         if ($kvToggle.Ok) {
@@ -3029,6 +3058,12 @@ try {
         }
 
         # Classifiers for the data-plane write outcomes.
+        # A Key Vault firewall rejection (ForbiddenByFirewall) is distinct from both of the below: it is
+        # not an Azure Policy block and not a test limitation - it means the data-plane write left this
+        # machine via an IP the vault's ACL does not cover (commonly split egress, e.g. Zscaler routing
+        # HTTPS and data-plane traffic differently), which is a genuine finding: the installer's Key
+        # Vault step will fail from this network path the same way.
+        $isKvFirewallErr = { param($m) $m -and ($m -match "ForbiddenByFirewall" -or $m -match "Client address is not authorized") }
         # A vault data-plane permission refusal ("does not have keys/secrets ... permission", Forbidden
         # from the access policy) is NOT an Azure Policy block - report it as a WARN test limitation
         # rather than a misleading policy Fail. A genuine Azure Policy denial (RequestDisallowedByPolicy)
@@ -3050,10 +3085,12 @@ try {
             param($kv)
             if ($kv.KeyOk) { Add-Result -Category "Deployability" -Check "Key Vault key creation (RSA data-protection key)" -Result "Pass" -Detail "Created successfully." }
             elseif (& $isTenantIssuerErr $kv.KeyError) { Add-Result -Category "Deployability" -Check "Key Vault key creation (RSA data-protection key)" -Result "Fail" -Detail $tenantIssuerDetail -Message $kv.KeyError }
+            elseif (& $isKvFirewallErr $kv.KeyError) { Add-Result -Category "Deployability" -Check "Key Vault key creation (RSA data-protection key)" -Result "Fail" -Detail "Firewall rejected this network path (403) - expect the installer's Key Vault step to fail from here, likely split egress." -Message $kv.KeyError }
             elseif (& $isDataPlanePermErr $kv.KeyError) { Add-Result -Category "Deployability" -Check "Key Vault key creation (RSA data-protection key)" -Result "Warn" -Detail "Not tested - could not grant data-plane access to the throwaway vault (test limitation, not a policy block)." -Message $kv.KeyError }
             else { Add-PolicyFailureResult -Category "Deployability" -Check "Key Vault key creation (RSA data-protection key)" -RawMessage $kv.KeyError }
             if ($kv.SecretOk) { Add-Result -Category "Deployability" -Check "Key Vault secret creation" -Result "Pass" -Detail "Created successfully." }
             elseif (& $isTenantIssuerErr $kv.SecretError) { Add-Result -Category "Deployability" -Check "Key Vault secret creation" -Result "Fail" -Detail $tenantIssuerDetail -Message $kv.SecretError }
+            elseif (& $isKvFirewallErr $kv.SecretError) { Add-Result -Category "Deployability" -Check "Key Vault secret creation" -Result "Fail" -Detail "Firewall rejected this network path (403) - expect the installer's Key Vault step to fail from here, likely split egress." -Message $kv.SecretError }
             elseif (& $isDataPlanePermErr $kv.SecretError) { Add-Result -Category "Deployability" -Check "Key Vault secret creation" -Result "Warn" -Detail "Not tested - could not grant data-plane access to the throwaway vault (test limitation, not a policy block)." -Message $kv.SecretError }
             else { Add-PolicyFailureResult -Category "Deployability" -Check "Key Vault secret creation" -RawMessage $kv.SecretError }
         }
@@ -3122,21 +3159,131 @@ try {
                 Add-PolicyFailureResult -Category "Deployability" -Check "SQL firewall rule (AllowAllWindowsAzureIps)" -RawMessage $fwErrMsg
             }
         }
-        # The throwaway server uses SQL auth; the real installer uses Entra-only auth. Flag the gap.
-        Add-Result -Category "Deployability" -Check "SQL Entra-only authentication" -Result "Info" -Detail "Not exercised"
+        # The installer's ARM template creates the server with azureADOnlyAuthentication=true
+        # (template-8.0.json); the throwaway server here uses SQL auth so the bogus-login probe below
+        # can distinguish a real SQL response from a broken path. A policy that requires or forbids
+        # AAD-only SQL auth therefore still isn't exercised by this test.
+        Add-Result -Category "Deployability" -Check "SQL Entra-only authentication" -Result "Info" -Detail "Not exercised (test server uses SQL auth)"
 
-        # Operator-machine SQL data-path probe (E13): everything above proves the SQL server can be
-        # created and firewalled, but never actually opens a connection to it from THIS machine - the
-        # only test that exercises the operator's own network path to 1433. AllowAllWindowsAzureIps
-        # (above) permits Azure services, not the operator's public IP, so without this probe a 1433
-        # block, a TLS-inspecting proxy on the SQL path, or a split-egress mismatch (web IP != SQL IP)
-        # would go undetected until install day. Not applicable under -PrivateEndpointOnly - there is
-        # no public data path to test.
-        if ($PrivateEndpointOnly) {
-            Add-Result -Category "Connectivity" -Check "SQL data path (operator -> 1433)" -Result "Info" -Detail "Not applicable (-PrivateEndpointOnly)"
+        # Mirror ConfigureSqlServer's temporary public-access toggle (cloudshell-deploy.ps1:702-747):
+        # the installer only flips PublicNetworkAccess to Enabled when the server was created Disabled
+        # (i.e. -PrivateEndpointOnly here), does its SQL work, then restores it in a finally. Query the
+        # live server rather than trusting $PrivateEndpointOnly directly, so this stays correct even if
+        # something else changed the property after create.
+        $sqlServerForToggle = $null
+        try { $sqlServerForToggle = Get-AzSqlServer -ResourceGroupName $ResourceGroupName -ServerName $sqlName -ErrorAction Stop } catch {}
+        $sqlHardened = [bool]($sqlServerForToggle -and $sqlServerForToggle.PublicNetworkAccess -eq "Disabled")
+        $sqlPublicAccessReady = -not $sqlHardened
+
+        if ($sqlHardened) {
+            try {
+                Set-AzSqlServer -ResourceGroupName $ResourceGroupName -ServerName $sqlName -PublicNetworkAccess "Enabled" -ErrorAction Stop | Out-Null
+                Add-Result -Category "Deployability" -Check "SQL temporary public access (confirmed allowed)" -Result "Pass"
+                $sqlPublicAccessReady = $true
+            }
+            catch {
+                Add-PolicyFailureResult -Category "Deployability" -Check "SQL temporary public access (install step)" -RawMessage (Get-DetailedErrorMessage -ErrorRecord $_)
+            }
         }
-        else {
-            Test-SqlOperatorDataPath -ResourceGroupName $ResourceGroupName -ServerName $sqlName -Fqdn "$sqlName.$SqlSuffix" -EgressIp $script:EgressInfo.Ip -IsCloudShell $script:IsCloudShell
+
+        try {
+            # Operator-machine SQL data-path probe (E13): everything above proves the SQL server can be
+            # created and firewalled, but never actually opens a connection to it from THIS machine - the
+            # only test that exercises the operator's own network path to 1433. AllowAllWindowsAzureIps
+            # (above) permits Azure services, not the operator's public IP, so without this probe a 1433
+            # block, a TLS-inspecting proxy on the SQL path, or a split-egress mismatch (web IP != SQL IP)
+            # would go undetected until install day. Previously skipped entirely under
+            # -PrivateEndpointOnly, which is exactly the configuration where the installer's own toggle
+            # (above) occurs and a "deny public access" policy would otherwise go undetected - now it
+            # runs whenever public access is (or was made) available.
+            if ($sqlPublicAccessReady) {
+                Test-SqlOperatorDataPath -ResourceGroupName $ResourceGroupName -ServerName $sqlName -Fqdn "$sqlName.$SqlSuffix" -EgressIp $script:EgressInfo.Ip -IsCloudShell $script:IsCloudShell
+            }
+            else {
+                Add-Result -Category "Connectivity" -Check "SQL data path (operator -> 1433)" -Result "Info" -Detail "Not tested - could not enable public access"
+            }
+
+            # E-SQL-Entra - prove a token minted for this account is actually ACCEPTED by SQL, mirroring
+            # ConfigureSqlServer steps 1 and 4 (Set-AzSqlServerActiveDirectoryAdministrator, then a
+            # token-authenticated connection). Acquiring a database-audience token (done above at intake)
+            # only proves Entra will mint one - not that SQL accepts it. The AD admin assignment is a
+            # control-plane (ARM) call and does not need public data access, so it always runs; only the
+            # actual connection needs $sqlPublicAccessReady.
+            if (-not $meObjectId) {
+                Add-Result -Category "Deployability" -Check "SQL Entra token authentication" -Result "Info" -Detail "Not tested - signed-in identity object id unavailable"
+            }
+            else {
+                $sqlAadAdminOk = $false
+                try {
+                    Set-AzSqlServerActiveDirectoryAdministrator -ResourceGroupName $ResourceGroupName -ServerName $sqlName -DisplayName $SignedInAccount -ObjectId $meObjectId -ErrorAction Stop | Out-Null
+                    Add-Result -Category "Deployability" -Check "SQL Entra admin assignment (install step)" -Result "Pass" -Detail "Set successfully."
+                    $sqlAadAdminOk = $true
+                }
+                catch {
+                    Add-PolicyFailureResult -Category "Deployability" -Check "SQL Entra admin assignment (install step)" -RawMessage (Get-DetailedErrorMessage -ErrorRecord $_)
+                }
+
+                if ($sqlAadAdminOk) {
+                    if (-not $sqlPublicAccessReady) {
+                        Add-Result -Category "Deployability" -Check "SQL Entra token authentication" -Result "Info" -Detail "Not tested - could not enable public access"
+                    }
+                    else {
+                        # DO NOT use Invoke-Sqlcmd - it ships in the SqlServer module, which is not on this
+                        # script's required-module list. Guarded by the same SqlClient availability check
+                        # Test-SqlOperatorDataPath uses.
+                        $hasSqlClientForAuth = [bool]([System.Management.Automation.PSTypeName]"System.Data.SqlClient.SqlConnection").Type
+                        if (-not $hasSqlClientForAuth) {
+                            Add-Result -Category "Deployability" -Check "SQL Entra token authentication" -Result "Info" -Detail "Not tested - SqlClient unavailable"
+                        }
+                        else {
+                            $sqlAuthConn = $null
+                            try {
+                                # A freshly-assigned Entra admin can take a few seconds to propagate; one
+                                # short retry avoids a false Fail on that lag alone.
+                                $sqlAuthMaxAttempts = 2
+                                for ($sqlAuthAttempt = 1; $sqlAuthAttempt -le $sqlAuthMaxAttempts; $sqlAuthAttempt++) {
+                                    try {
+                                        # Get-AzAccessToken returns a SecureString in newer Az, a plain
+                                        # string in older ones (same fork used for the E14 token check
+                                        # above) - here the plain value is actually needed for .AccessToken,
+                                        # which must be set WITHOUT a "Bearer " prefix.
+                                        try {
+                                            $secureSqlAuthTok = Get-AzAccessToken -ResourceUrl $SqlAudience -TenantId $TenantId -AsSecureString -ErrorAction Stop
+                                            $sqlAuthToken = [System.Net.NetworkCredential]::new("", $secureSqlAuthTok.Token).Password
+                                        }
+                                        catch [System.Management.Automation.ParameterBindingException] {
+                                            $sqlAuthToken = (Get-AzAccessToken -ResourceUrl $SqlAudience -TenantId $TenantId -ErrorAction Stop).Token
+                                        }
+                                        $sqlAuthConn = New-Object System.Data.SqlClient.SqlConnection("Server=tcp:$sqlName.$SqlSuffix,1433;Database=master;Encrypt=True;TrustServerCertificate=False;Connection Timeout=15")
+                                        $sqlAuthConn.AccessToken = $sqlAuthToken
+                                        $sqlAuthConn.Open()
+                                        $sqlAuthCmd = $sqlAuthConn.CreateCommand()
+                                        $sqlAuthCmd.CommandText = "SELECT 1"
+                                        $sqlAuthCmd.ExecuteScalar() | Out-Null
+                                        Add-Result -Category "Deployability" -Check "SQL Entra token authentication" -Result "Pass" -Detail "Token accepted."
+                                        break
+                                    }
+                                    catch {
+                                        if ($sqlAuthConn) { $sqlAuthConn.Dispose(); $sqlAuthConn = $null }
+                                        if ($sqlAuthAttempt -lt $sqlAuthMaxAttempts) { Start-Sleep -Seconds 5; continue }
+                                        $sqlAuthErrMsg = Get-DetailedErrorMessage -ErrorRecord $_
+                                        Add-Result -Category "Deployability" -Check "SQL Entra token authentication" -Result "Fail" -Detail "Token rejected: $(Get-ConciseErrorMessage -RawMessage $sqlAuthErrMsg)" -Message $sqlAuthErrMsg -RawMessage $sqlAuthErrMsg
+                                    }
+                                }
+                            }
+                            finally {
+                                if ($sqlAuthConn) { $sqlAuthConn.Dispose() }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        finally {
+            # Always restore the server to its original state, even on error above.
+            if ($sqlHardened -and $sqlPublicAccessReady) {
+                try { Set-AzSqlServer -ResourceGroupName $ResourceGroupName -ServerName $sqlName -PublicNetworkAccess "Disabled" -ErrorAction Stop | Out-Null } catch {}
+            }
         }
     }
 
