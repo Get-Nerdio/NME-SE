@@ -2025,11 +2025,11 @@ try {
         Add-Result -Category "Info" -Check "Signed-in account type" -Result "Info" -Detail $AccountTypeSummary
     }
 
-    # Enumerate the account's Entra tenant memberships so multi-tenant/guest operators are warned to
-    # pin -Tenant on install day. Best-effort - Get-AzTenant can be slow or restricted; never fatal.
+    # Enumerate the account's Entra tenant memberships - flags a multi-tenant/guest account as context
+    # for the tenant-pin checks above. Best-effort - Get-AzTenant can be slow or restricted; never fatal.
     try { $tenants = @(Get-AzTenant -ErrorAction Stop) } catch { $tenants = @() }
     if ($tenants.Count -gt 1) {
-        Add-Result -Category "Info" -Check "Entra tenant access" -Result "Info" -Detail "Account has access to $($tenants.Count) tenants - pin -Tenant $TenantId when connecting on install day."
+        Add-Result -Category "Info" -Check "Entra tenant access" -Result "Info" -Detail "Account has access to $($tenants.Count) tenants."
     }
     $SqlSuffix = $SqlSuffix.TrimStart(".")
 
