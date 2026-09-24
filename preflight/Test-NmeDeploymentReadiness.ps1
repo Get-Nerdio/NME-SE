@@ -729,7 +729,7 @@ function Test-SqlOperatorDataPath {
         # torn down with it (same as AllowAllWindowsAzureIps above), so no separate tracker entry.
         if ($EgressIp) {
             try {
-                New-AzSqlServerFirewallRule -ResourceGroupName $ResourceGroupName -ServerName $ServerName -FirewallRuleName "nmepf-operator" -StartIpAddress $EgressIp -EndIpAddress $EgressIp -ErrorAction Stop | Out-Null
+                New-AzSqlServerFirewallRule -ResourceGroupName $ResourceGroupName -ServerName $ServerName -FirewallRuleName $EgressIp -StartIpAddress $EgressIp -EndIpAddress $EgressIp -ErrorAction Stop | Out-Null
             }
             catch {}
         }
@@ -812,7 +812,7 @@ function Test-SqlOperatorDataPath {
                         Add-Result -Category "Connectivity" -Check $check -Result "Fail" -Detail "split egress: web IP != SQL IP$pathNote - your HTTPS egress is $EgressIp but the SQL path left this machine via $foundIp. Your outbound path differs by destination (common with Zscaler); the firewall rule created for $EgressIp does not cover the SQL path."
                         # Best-effort: allow the IP SQL actually saw and retry once so the rest of the path
                         # can still be validated.
-                        try { New-AzSqlServerFirewallRule -ResourceGroupName $ResourceGroupName -ServerName $ServerName -FirewallRuleName "nmepf-operator-actual" -StartIpAddress $foundIp -EndIpAddress $foundIp -ErrorAction Stop | Out-Null } catch {}
+                        try { New-AzSqlServerFirewallRule -ResourceGroupName $ResourceGroupName -ServerName $ServerName -FirewallRuleName $foundIp -StartIpAddress $foundIp -EndIpAddress $foundIp -ErrorAction Stop | Out-Null } catch {}
                         if ($attempt -lt $maxAttempts) { Start-Sleep -Seconds 5; continue }
                         return
                     }
@@ -2096,6 +2096,27 @@ try {
         else {
             Add-Result -Category "Info" -Check "Internet egress" -Result "Warn" -Detail "Could not determine public egress IP (no HTTPS path to an IP-echo service) - this itself may indicate restrictive egress filtering."
         }
+    }
+
+    # E17 - ipinfo.io client-IP probe: cloudshell-deploy.ps1 resolves its own client IP with
+    # "(Invoke-RestMethod -Uri "https://ipinfo.io/json").ip" and NO try/catch or fallback, then reuses
+    # that IP for both the SQL firewall rule and the Key Vault network ACL - if this one call fails,
+    # the installer throws before either gets configured. Unlike E12/E13/E16 this does NOT skip Cloud
+    # Shell: the installer is itself commonly run from Cloud Shell, where this exact call/path is what
+    # matters, so the probe always runs from wherever this script is executing and is labelled with
+    # which path that was.
+    $ipinfoPathNote = if ($script:IsCloudShell) { " (tested from Cloud Shell's egress)" } else { " (tested from this machine's egress)" }
+    try {
+        $ipinfoResp = Invoke-RestMethod -Uri "https://ipinfo.io/json" -TimeoutSec 8 -ErrorAction Stop
+        if ($ipinfoResp -and $ipinfoResp.ip) {
+            Add-Result -Category "Connectivity" -Check "Client IP detection (ipinfo.io)" -Result "Pass" -Detail "Reachable, resolved $($ipinfoResp.ip)$ipinfoPathNote."
+        }
+        else {
+            Add-Result -Category "Connectivity" -Check "Client IP detection (ipinfo.io)" -Result "Fail" -Detail "Responded without an .ip property$ipinfoPathNote - the installer has no fallback; expect the install to fail here."
+        }
+    }
+    catch {
+        Add-Result -Category "Connectivity" -Check "Client IP detection (ipinfo.io)" -Result "Fail" -Detail "Unreachable$ipinfoPathNote - the installer resolves its client IP here and has no fallback."
     }
 
     # E16 - operator-side TLS issuer probe: local runs only (in Cloud Shell the path tested would be
