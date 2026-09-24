@@ -860,6 +860,21 @@ function Get-MaskedAccount {
     return "$masked$domain"
 }
 
+function Get-MaskedSubscriptionId {
+    # Mask a subscription id for display: keep the first 8 alphanumeric characters, replace every
+    # remaining alphanumeric character with '#', and leave hyphens in place. e.g.
+    # 17c99779-9397-4bd4-b7c0-2cde094b9646 -> 17c99779-####-####-####-############
+    param([string] $Id)
+    if ([string]::IsNullOrWhiteSpace($Id)) { return $Id }
+    $alnumSeen = 0
+    $chars = $Id.ToCharArray() | ForEach-Object {
+        if ($_ -eq '-') { $_ }
+        elseif ($alnumSeen -lt 8) { $alnumSeen++; $_ }
+        else { '#' }
+    }
+    return -join $chars
+}
+
 # Reused wherever a subscription id (or another bare GUID) is validated/re-prompted-for.
 $script:GuidRegex = "^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$"
 
@@ -2570,7 +2585,7 @@ try {
             # report still shows the SE what was attempted.
             $ConfigSummary["Run by (signed-in account)"] = $SignedInAccountMasked
             $ConfigSummary["Signed-in account type"] = $AccountTypeSummary
-            $ConfigSummary["Subscription"] = "$($Context.Subscription.Name) ($SubscriptionId)"
+            $ConfigSummary["Subscription"] = "$($Context.Subscription.Name) ($(Get-MaskedSubscriptionId $SubscriptionId))"
             $ConfigSummary["Cloud"] = $AzEnv.Name
             $ConfigSummary["Region"] = $Location
             $ConfigSummary["Resource group"] = "$ResourceGroupName (creation blocked)"
@@ -2603,7 +2618,7 @@ try {
     # once it's time to actually install NME.
     $ConfigSummary["Run by (signed-in account)"] = $SignedInAccountMasked
     $ConfigSummary["Signed-in account type"] = $AccountTypeSummary
-    $ConfigSummary["Subscription"] = "$($Context.Subscription.Name) ($SubscriptionId)"
+    $ConfigSummary["Subscription"] = "$($Context.Subscription.Name) ($(Get-MaskedSubscriptionId $SubscriptionId))"
     $ConfigSummary["Cloud"] = $AzEnv.Name
     $ConfigSummary["Region"] = $Location
     $ConfigSummary["Resource group"] = "$ResourceGroupName $(if ($PendingRgCreate) { '(created by this script)' } else { '(existing, user-supplied)' })"
@@ -3357,7 +3372,7 @@ finally {
     #region Reporting ----------------------------------------------------------------------------
     $summaryMeta = [pscustomobject]@{
         TimestampUtc    = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss 'UTC'")
-        SubscriptionId  = $SubscriptionId
+        SubscriptionId  = (Get-MaskedSubscriptionId $SubscriptionId)
         Cloud           = $(try { (Get-AzContext).Environment.Name } catch { "unknown" })
         Region          = $Location
         ResourceGroup   = $ResourceGroupName
