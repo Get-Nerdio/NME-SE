@@ -1977,7 +1977,7 @@ try {
     # marker (for when the directory query is unavailable).
     $IsGuestAccount = ($meUserType -eq "Guest") -or ($SignedInAccount -match "#EXT#")
     $AccountTypeSummary = if ($IsGuestAccount) {
-        "Guest / external (B2B) user - signed in to the tenant as a guest."
+        "Guest / external (B2B) user"
     }
     elseif ($meUserType -eq "Member") { "Member (native account in the subscription's tenant $TenantId)" }
     else { "Member / home-tenant account (directory user type not confirmed)" }
@@ -1985,7 +1985,7 @@ try {
     # Promote the guest/B2B determination to a report row - a common source of "works for a native
     # admin but not for this account" install issues.
     if ($IsGuestAccount) {
-        Add-Result -Category "Info" -Check "Signed-in account type" -Result "Warn" -Detail "$AccountTypeSummary Silent auth to foreign tenants will fail - pin -Tenant on install day."
+        Add-Result -Category "Info" -Check "Signed-in account type" -Result "Info" -Detail $AccountTypeSummary
     }
     else {
         Add-Result -Category "Info" -Check "Signed-in account type" -Result "Pass" -Detail $AccountTypeSummary
@@ -3083,7 +3083,7 @@ try {
             }
         }
         # The throwaway server uses SQL auth; the real installer uses Entra-only auth. Flag the gap.
-        Add-Result -Category "Deployability" -Check "SQL Entra-only authentication" -Result "Info" -Detail "Not exercised - this test uses SQL authentication for the throwaway server, but the real installer configures Entra-only authentication (azureADOnlyAuthentication=true) with the app's managed identity as SQL admin. A policy requiring or forbidding AAD-only SQL auth is not validated here."
+        Add-Result -Category "Deployability" -Check "SQL Entra-only authentication" -Result "Info" -Detail "Not exercised"
 
         # Operator-machine SQL data-path probe (E13): everything above proves the SQL server can be
         # created and firewalled, but never actually opens a connection to it from THIS machine - the
@@ -3310,7 +3310,7 @@ try {
                         # the resources above confirm the VNet, subnet delegation, and integration are configured
                         # correctly, but running the live Kudu outbound test here would only be testing Azure's
                         # default (wide-open) egress, not anything the customer will actually configure.
-                        Add-Result -Category "Connectivity" -Check "Outbound connectivity test" -Result "Info" -Detail "Skipped - VNet '$ExistingVnetName' is brand-new with no customer-configured routing/firewall/DNS yet. VNet integration, subnet delegation, and the test App Service were created and confirmed configured correctly. Once the customer's real egress controls (firewall, UDRs, custom DNS) are in place, run NmeNetworkTest.ps1 against the real NME App Service to validate outbound connectivity."
+                        Add-Result -Category "Connectivity" -Check "Outbound connectivity test" -Result "Info" -Detail "Skipped; new VNet using Azure DNS"
                     }
                     else {
                         Test-OutboundConnectivityViaKudu -AzEnv $AzEnv -PeTargets $PeTargets -Web $web -webName $webName -AppSubnetName $AppSubnetName -PeSubnetName $PeSubnetName -NmeNetworkTestHint $NmeNetworkTestHint
