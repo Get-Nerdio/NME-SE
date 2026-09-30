@@ -118,10 +118,20 @@
     ],
     "adConfigs": [
       {
-        "name": "OnPremAD"
+        "name": "OnPremAD",
+        "adIdentityType": "AD",
+        "domain": "nerdiomanagerdemo.com",
+        "username": "domainjoin@nerdiomanagerdemo.com",
+        "organizationUnit": "OU=NME-26H1,DC=nerdiomanagerdemo,DC=com",
+        "enrollWithIntune": false,
+        "isDefault": false,
+        "passwordVariable": "SalesDemoOnPremADPassword"
       },
       {
-        "name": "EntraID"
+        "name": "EntraID",
+        "adIdentityType": "AzureAD",
+        "enrollWithIntune": false,
+        "isDefault": true
       }
     ],
     "vmProfiles": [

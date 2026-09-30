@@ -1,6 +1,6 @@
 NerdioManagerPreflightOutput.json
 .DS_Store
-swagger.json
+swagger*
 template-8.0.json
 preflight/specs/
 NME-SE.code-workspace

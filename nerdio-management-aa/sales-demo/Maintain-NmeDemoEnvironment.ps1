@@ -16,8 +16,12 @@
    8. Reconcile auto-scale profiles (create or update)
    9. Reconcile scripted actions (create if missing; stray actions are skipped if linked to a
       git repo; stray unlinked actions are removed if -RemoveUndefinedResources)
-  10. Reconcile other NME profiles (RDP configs, AD configs, VM profiles, capacity profiles,
-      scripted action profiles, CCL cost configs) — create if missing
+  10. Reconcile AD configs via SQL + Key Vault (create if missing, correct drift on non-secret
+      fields) — see region 8b; the REST API has no create endpoint for this object type
+  10b. Reconcile other SQL-only NME profiles (RDP configs, VM profiles, capacity profiles,
+      scripted action profiles) — remove stray only, if -RemoveUndefinedResources (no create
+      path exists for these; see region 13b)
+  10c. Reconcile CCL cost configs (create or update) via REST API
   11. Reconcile host pools scoped to the demo resource group:
         - Create missing host pools and apply full desired configuration
         - Correct drifted settings (WVD props, FSLogix assignment, auto-scale config)
@@ -56,6 +60,7 @@
     - Az.Resources            (Update-AzTag, Get-AzResource)
     - Az.Storage              (New-AzStorageAccount, New-AzRmStorageShare)
     - Az.Websites             (Get-AzWebApp — for NME App Service restart after SQL cleanup)
+    - Az.KeyVault             (Set-AzKeyVaultSecret — for AD config password storage)
 
   Automation Account Variables (prefixed with VariablePrefix, default 'SalesDemo'):
     Required:
@@ -77,8 +82,18 @@
                                     If not set, app is discovered via Get-AzWebApp by name.
                                     Required for profile-cache flush after SQL cleanup.
     - {Prefix}SqlServer             Azure SQL server FQDN for NME database (e.g.
-                                    myserver.database.windows.net). Required for profile cleanup.
-    - {Prefix}SqlDatabase           NME SQL database name. Required for profile cleanup.
+                                    myserver.database.windows.net). Required for AD config
+                                    reconciliation and profile cleanup.
+    - {Prefix}SqlDatabase           NME SQL database name. Required for AD config
+                                    reconciliation and profile cleanup.
+    - {Prefix}KeyVaultName          Name of the NME app's own Key Vault. Required only if any
+                                    adConfigs entry has adIdentityType 'AD' (on-prem domain
+                                    join needs a password, stored as a Key Vault secret).
+    - {Prefix}<PasswordVariable>    One secure variable per 'AD'-type adConfigs entry, named
+                                    whatever that entry's desired-state.json passwordVariable
+                                    field says (e.g. SalesDemoOnPremADPassword) — the plaintext
+                                    domain-join password. Only read/used on initial creation;
+                                    never rotated by this script.
 
   Automation Account Managed Identity Permissions:
     Azure RBAC (on ScopedResourceGroup):
@@ -101,10 +116,20 @@
                                     permissions must be granted as app roles on the MI.
 
     Azure SQL database roles (on NME database, optional):
-    - db_datareader                 Read FSLogix profile records for cleanup reporting.
-    - db_datawriter                 Delete stale profile records during cleanup.
+    - db_datareader                 Read AD config / FSLogix profile records.
+    - db_datawriter                 Create/update AD configs; delete stale profile records
+                                    during cleanup.
                                     Grant both roles to the MI's object ID in the NME database.
-                                    Only required if profile cleanup is enabled.
+                                    Required for AD config reconciliation (every run) and
+                                    profile cleanup (-RemoveUndefinedResources runs).
+
+    Key Vault access policy (on the NME app's own Key Vault, optional):
+    - Secrets: Get, Set              Create the domain-join password secret for a new 'AD'-type
+                                    adConfigs entry. Only required if any adConfigs entry has
+                                    adIdentityType 'AD'. This is a classic access-policy vault
+                                    (not RBAC) — grant via
+                                    az keyvault set-policy --name <vault> --object-id <MI object id>
+                                      --secret-permissions get set
 
   NME Service Principal Permissions:
     Azure RBAC (on ScopedResourceGroup):
@@ -602,12 +627,17 @@ if (-not $LocalDesiredStateFile) {
 $script:NonFatalErrors = @()
 $script:DesiredStateSha = $null
 
-# SQL variables — optional; SQL-based profile cleanup is skipped if not set.
+# SQL variables — optional; SQL-based profile reconciliation is skipped if not set.
 # Set {Prefix}SqlServer (FQDN) and {Prefix}SqlDatabase in the Automation Account.
 $SqlServerFqdn   = $null
 $SqlDatabaseName = $null
 try { $SqlServerFqdn   = Get-AutomationVariable -Name "${VariablePrefix}SqlServer"   -ErrorAction Stop } catch {}
 try { $SqlDatabaseName = Get-AutomationVariable -Name "${VariablePrefix}SqlDatabase" -ErrorAction Stop } catch {}
+
+# Key Vault name — optional; only needed to create AD config secrets (adConfigs with
+# adIdentityType 'AD'). Set {Prefix}KeyVaultName to the NME app's own Key Vault name.
+$KeyVaultName = $null
+try { $KeyVaultName = Get-AutomationVariable -Name "${VariablePrefix}KeyVaultName" -ErrorAction Stop } catch {}
 
 # NME App Service resource group — used to restart the app after SQL profile cleanup,
 # which is required to flush the NME in-memory profile cache.
@@ -627,6 +657,8 @@ $asCreated              = 0
 $asRemoved              = 0
 $scriptedActionsRemoved = 0
 $sqlProfilesRemoved     = 0
+$adConfigsCreated       = 0
+$adConfigsUpdated       = 0
 $imagesRemoved          = 0
 $storageUnlinked        = 0
 $vnetsUnlinked          = 0
@@ -662,15 +694,15 @@ try {
 
 $ErrorActionPreference = 'Continue'
 
-# SQL connection (optional — only needed for SQL-based profile cleanup)
+# SQL connection — needed for AD config reconciliation (every run) and stray SQL-only
+# profile cleanup (RemoveUndefinedResources runs only). Connect whenever configured,
+# regardless of -RemoveUndefinedResources, so AD configs get created/repaired on every run.
 $SqlConnection = $null
-if ($RemoveUndefinedResources) {
-    if ($SqlServerFqdn -and $SqlDatabaseName) {
-        $SqlConnection = Get-NmeSqlConnection -ServerFqdn $SqlServerFqdn -DatabaseName $SqlDatabaseName
-        if ($SqlConnection) { Write-Log "Connected to NME SQL ($SqlServerFqdn / $SqlDatabaseName)." }
-    } else {
-        Write-Log "SQL variables ${VariablePrefix}SqlServer / ${VariablePrefix}SqlDatabase not set — SQL-based profile cleanup will be skipped." 'WARN'
-    }
+if ($SqlServerFqdn -and $SqlDatabaseName) {
+    $SqlConnection = Get-NmeSqlConnection -ServerFqdn $SqlServerFqdn -DatabaseName $SqlDatabaseName
+    if ($SqlConnection) { Write-Log "Connected to NME SQL ($SqlServerFqdn / $SqlDatabaseName)." }
+} else {
+    Write-Log "SQL variables ${VariablePrefix}SqlServer / ${VariablePrefix}SqlDatabase not set — SQL-based profile reconciliation will be skipped." 'WARN'
 }
 
 #endregion
@@ -979,6 +1011,129 @@ foreach ($live in $liveFslogix) {
             }
         } else {
             Write-Log "FSLogix config '$($live.name)' is not in desired state (stray). Run with -RemoveUndefinedResources to remove." 'WARN'
+        }
+    }
+}
+
+#endregion
+
+#region 8b — Reconcile AD Configs (via SQL + Key Vault — no REST create endpoint exists)
+
+# NME's REST API only exposes GET /api/v1/ad/config — there is no create/update/delete
+# endpoint for the shared, named AD Configuration entries this region manages. The NME UI
+# creates them by inserting into the ADConfigurations table directly and, for identity type
+# 'AD', storing the domain-join password as a Key Vault secret named
+# "ApplicationADSecrets--<new guid>" with PasswordIdentifier set to that secret's name.
+# This region replicates that exact mechanism so create-if-missing works without a REST path.
+#
+# Only non-secret fields are drift-corrected on update; a config's password is set once, at
+# creation, and never rotated by this region. 'AzureAD' identity type needs no domain/
+# username/password at all. Runs on every invocation (not just -RemoveUndefinedResources) so
+# a missing AD config self-heals on the next normal run, same as FSLogix/host pools/etc.
+
+Write-Log "--- Reconcile AD Configs ---"
+
+$AdIdentityTypeMap = @{ 'AD' = 0; 'AzureAD' = 1; 'AzureADDS' = 2 }
+
+if ($null -ne $DesiredState.profiles.adConfigs) {
+    if (-not $SqlConnection) {
+        Write-Log "SQL connection unavailable — skipping AD config reconciliation." 'WARN'
+    } else {
+        try {
+            $liveAdConfigs = @(Invoke-NmeSql -Connection $SqlConnection `
+                -Query "SELECT Id, FriendlyName, Domain, Username, OrganizationUnit, PasswordIdentifier, AdIdentityType, EnrollWithIntune, IsDefault FROM ADConfigurations" `
+                -AsDataTable)
+        } catch {
+            Add-NonFatalError "Failed to query ADConfigurations: $($_.Exception.Message)"
+            $liveAdConfigs = @()
+        }
+
+        foreach ($entry in $DesiredState.profiles.adConfigs) {
+            $desiredTypeInt = $AdIdentityTypeMap[$entry.adIdentityType]
+            if ($null -eq $desiredTypeInt) {
+                Add-NonFatalError "AD config '$($entry.name)' has unrecognized adIdentityType '$($entry.adIdentityType)' — skipping."
+                continue
+            }
+
+            $live = $liveAdConfigs | Where-Object { $_.FriendlyName -ieq $entry.name }
+
+            if (-not $live) {
+                Write-Log "AD config '$($entry.name)' not found. Creating..."
+                if (-not $WhatIf) {
+                    try {
+                        $passwordIdentifier = $null
+                        if ($entry.adIdentityType -eq 'AD') {
+                            if (-not $entry.passwordVariable) {
+                                throw "adIdentityType 'AD' requires a passwordVariable in desired state."
+                            }
+                            if (-not $KeyVaultName) {
+                                throw "${VariablePrefix}KeyVaultName AA variable not set — cannot store the domain-join password."
+                            }
+                            $adPassword = Get-AutomationVariable -Name $entry.passwordVariable
+                            $secretName = "ApplicationADSecrets--$([guid]::NewGuid().ToString())"
+                            Set-AzKeyVaultSecret -VaultName $KeyVaultName -Name $secretName `
+                                -SecretValue (ConvertTo-SecureString $adPassword -AsPlainText -Force) -ErrorAction Stop | Out-Null
+                            $passwordIdentifier = $secretName
+                        }
+
+                        Invoke-NmeSql -Connection $SqlConnection -Query @"
+INSERT INTO ADConfigurations (IsDefault, Domain, Username, OrganizationUnit, PasswordIdentifier, AdIdentityType, EnrollWithIntune, FriendlyName)
+VALUES (@IsDefault, @Domain, @Username, @OrganizationUnit, @PasswordIdentifier, @AdIdentityType, @EnrollWithIntune, @FriendlyName)
+"@ -Parameters @{
+                            '@IsDefault'          = [bool]$entry.isDefault
+                            '@Domain'             = $entry.domain
+                            '@Username'           = $entry.username
+                            '@OrganizationUnit'   = $entry.organizationUnit
+                            '@PasswordIdentifier' = $passwordIdentifier
+                            '@AdIdentityType'     = $desiredTypeInt
+                            '@EnrollWithIntune'   = [bool]$entry.enrollWithIntune
+                            '@FriendlyName'       = $entry.name
+                        } | Out-Null
+
+                        $adConfigsCreated++
+                        Write-Log "AD config '$($entry.name)' created."
+                    } catch {
+                        Add-NonFatalError "Failed to create AD config '$($entry.name)': $($_.Exception.Message)"
+                    }
+                } else {
+                    Write-Log "[WHATIF] Would create AD config '$($entry.name)'."
+                }
+                continue
+            }
+
+            $drift = $false
+            if ($null -ne $entry.domain           -and $live.Domain -ne $entry.domain)                     { $drift = $true }
+            if ($null -ne $entry.username          -and $live.Username -ne $entry.username)                 { $drift = $true }
+            if ($null -ne $entry.organizationUnit  -and $live.OrganizationUnit -ne $entry.organizationUnit) { $drift = $true }
+            if ($null -ne $entry.enrollWithIntune  -and [bool]$live.EnrollWithIntune -ne [bool]$entry.enrollWithIntune) { $drift = $true }
+            if ($live.AdIdentityType -ne $desiredTypeInt) { $drift = $true }
+
+            if (-not $drift) {
+                Write-Log "AD config '$($entry.name)' is correct."
+                continue
+            }
+
+            Write-Log "AD config '$($entry.name)' has drifted. Updating..."
+            if (-not $WhatIf) {
+                try {
+                    Invoke-NmeSql -Connection $SqlConnection -Query @"
+UPDATE ADConfigurations SET Domain = @Domain, Username = @Username, OrganizationUnit = @OrganizationUnit, AdIdentityType = @AdIdentityType, EnrollWithIntune = @EnrollWithIntune WHERE Id = @Id
+"@ -Parameters @{
+                        '@Domain'           = $entry.domain
+                        '@Username'         = $entry.username
+                        '@OrganizationUnit' = $entry.organizationUnit
+                        '@AdIdentityType'   = $desiredTypeInt
+                        '@EnrollWithIntune' = [bool]$entry.enrollWithIntune
+                        '@Id'               = $live.Id
+                    } | Out-Null
+                    $adConfigsUpdated++
+                    Write-Log "AD config '$($entry.name)' updated."
+                } catch {
+                    Add-NonFatalError "Failed to update AD config '$($entry.name)': $($_.Exception.Message)"
+                }
+            } else {
+                Write-Log "[WHATIF] Would update AD config '$($entry.name)'."
+            }
         }
     }
 }
@@ -2108,14 +2263,25 @@ if ($RemoveUndefinedResources) {
 # permissions on the NME database (db_datareader + db_datawriter). If the SQL connection
 # could not be established, this region is skipped and a WARN is logged in region 3.
 #
+# adConfigs has a real create/update path now — see region 8b. This region still handles
+# *removing* strays for it (safe now that recreation is possible), but creation happens
+# earlier, on every run, not just -RemoveUndefinedResources runs. The other types below
+# (rdpConfigs, vmProfiles, capacityProfiles, scriptedActionProfiles) still have no create
+# path at all — removing a stray here is permanent until someone recreates it in the NME UI.
+#
 # Supported profile types:
 #   rdpConfigs  → RdpPropertiesConfigurations table
-#   adConfigs   → ADConfigurations table  (domain join configs)
+#   adConfigs   → ADConfigurations table  (domain join configs; see region 8b for create/update)
 #
 # To enforce a type, add the section under "profiles" in desired-state.json:
 #   "profiles": {
 #     "rdpConfigs":             [{"name": "Default RDP"}],
-#     "adConfigs":              [{"name": "MyDomain-Config"}],
+#     "adConfigs":              [{"name": "OnPremAD", "adIdentityType": "AD", "domain": "...",
+#                                  "username": "...", "organizationUnit": "...",
+#                                  "enrollWithIntune": false, "isDefault": false,
+#                                  "passwordVariable": "SalesDemoOnPremADPassword"},
+#                                 {"name": "EntraID", "adIdentityType": "AzureAD",
+#                                  "enrollWithIntune": false, "isDefault": true}],
 #     "vmProfiles":             [{"name": "MyVmProfile"}],
 #     "capacityProfiles":       [{"name": "MyCapacityProfile"}],
 #     "scriptedActionProfiles": [{"name": "MyScriptedActionProfile"}]
@@ -2332,6 +2498,7 @@ Write-Log "=== Summary ==="
 Write-Log "Host pools       — imported: $hpImported, created: $hpCreated, updated: $hpUpdated, removed: $hpRemoved"
 Write-Log "FSLogix configs  — created: $fslCreated, updated: $fslUpdated, removed: $fslRemoved"
 Write-Log "Auto-scale       — created: $asCreated, removed: $asRemoved"
+Write-Log "AD configs       — created: $adConfigsCreated, updated: $adConfigsUpdated"
 Write-Log "Scripted actions — removed: $scriptedActionsRemoved (stray)"
 Write-Log "SQL profiles     — removed: $sqlProfilesRemoved (stray)"
 Write-Log "Images           — removed: $imagesRemoved (stray)"
