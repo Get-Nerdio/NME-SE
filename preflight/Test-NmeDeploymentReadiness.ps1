@@ -1571,7 +1571,10 @@ function Test-PrivateEndpoints {
             }
         }
     }
-    return $PeTargets
+    # Unary comma prevents PowerShell from unraveling an empty $PeTargets to $null on return -
+    # Test-OutboundConnectivityViaKudu and Get-PeDnsTarget both declare $PeTargets as a mandatory
+    # parameter, which rejects $null but accepts a legitimately empty array.
+    return , $PeTargets
 }
 
 # Builds the per-service DNS descriptor list (FQDN -> expected private IP -> owning privatelink zone)
@@ -2350,6 +2353,10 @@ try {
                     $dnsServersStr = $intakeVnet.DhcpOptions.DnsServers -join ", "
                     Write-Host -ForegroundColor "Cyan" "  VNet '$ExistingVnetName' uses custom DNS servers ($dnsServersStr); Azure Private DNS zone questions are not applicable and will be skipped."
                     $ConfigSummary["Private DNS zones plan"] = "N/A - VNet uses custom DNS servers ($dnsServersStr)"
+                    # Test-PrivateDnsZones's $PrivateDnsZonesMode parameter is mandatory, so it still
+                    # needs a non-null/non-empty value even though it ignores this value once it detects
+                    # the VNet's custom DNS servers itself. Same fix as the new-VNet custom DNS path below.
+                    $PrivateDnsZonesMode = "NotApplicable"
                 }
                 else {
                     # Existing-vs-new Private DNS zones question. Asked here even though we don't yet know
