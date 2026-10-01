@@ -114,6 +114,9 @@
       },
       {
         "name": "DenyCopyPaste"
+      },
+      {
+        "name": "EntraJoinedVMs"
       }
     ],
     "adConfigs": [
@@ -160,6 +163,32 @@
           "/subscriptions/5d4206f2-8af2-479a-b7f9-5fb434457d5f/resourceGroups/nme-demo-26h1-app-rg/providers/Microsoft.OperationalInsights/workspaces/nme26h1-law-572vsvtgsfozs"
         ],
         "isDefault": true
+      }
+    ],
+    "resourceRules": [
+      { "name": "Intel general-use VMs", "isEnabled": false },
+      { "name": "Intel RAM-optimized VMs", "isEnabled": false },
+      { "name": "Intel CPU-optimized VMs", "isEnabled": false },
+      { "name": "All VMs & Disks", "isEnabled": true },
+      { "name": "General use AVD VMs", "isEnabled": true },
+      { "name": "RAM optimized AVD VMs", "isEnabled": true },
+      { "name": "CPU optimized AVD VMs", "isEnabled": true },
+      { "name": "GPU AVD VMs", "isEnabled": true },
+      { "name": "SSD OS disks for AVD", "isEnabled": true },
+      { "name": "Ephemeral OS disks for AVD", "isEnabled": true },
+      { "name": "All", "isEnabled": false },
+      { "name": "All desktop images", "isEnabled": false },
+      { "name": "All disks performance tiers", "isEnabled": true },
+      {
+        "name": "Limit VM SKUs",
+        "isEnabled": true,
+        "vmSize": {
+          "isEnabled": true,
+          "checkQuota": false,
+          "family": ["standardDASv5Family", "standardDSv5Family"],
+          "cores": [2, 4],
+          "ram": [8, 16, 4]
+        }
       }
     ]
   },
@@ -238,7 +267,8 @@
       "description": "Personal desktop host pool with automatic assignment",
       "users": [],
       "groups": [
-        "SE - Sub Owners "
+        "SE - Sub Owners ",
+        "PersonalPoolDemoUsers"
       ],
       "poolType": "Personal",
       "personalAssignmentType": "Automatic",
@@ -257,6 +287,12 @@
         "autoGrow": {
           "unit": "Count",
           "unassignedThreshold": 2
+        },
+        "autoShrink": {
+          "hostIdleDaysThreshold": 1,
+          "deletionDelay": 1,
+          "excludeUnassigned": true,
+          "isNotificationsEnabled": false
         }
       }
     }

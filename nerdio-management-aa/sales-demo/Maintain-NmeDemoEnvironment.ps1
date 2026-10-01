@@ -23,13 +23,18 @@
       scripted action profiles) — remove stray only, if -RemoveUndefinedResources (no create
       path exists for these; see region 13b)
   10c. Reconcile CCL cost configs (create or update) via REST API
+  10d. Reconcile Resource Selection Rules via SQL (correct drift on IsEnabled and, for
+      non-built-in rules, the VmSize_* SKU-filter fields) — no REST API exists for this
+      object type at all, and no create path (Order/ScopesJson semantics unverified); see
+      region 9d
   11. Reconcile host pools scoped to the demo resource group:
         - Create missing host pools and apply full desired configuration
         - Correct drifted settings: WVD props (friendlyName, description, load
           balancing algorithm, max session limit, personal assignment type),
           FSLogix assignment, auto-scale config (including the VM template's
           desktop image, resolved from an 'imageName' referencing the
-          top-level 'images' list)
+          top-level 'images' list; and, for Personal pools, the
+          PersonalAutoGrow/PersonalAutoShrink auto-scale triggers)
         - Assign users (by UPN) and groups (by display name, resolved to GUID via Graph)
         - Apply environment ARM tag; confirm tag on existing pools
         - Remove stray host pools not in desired state (unless tagged ignore)
@@ -421,6 +426,15 @@ function Compare-HpAutoScale {
         if ($liveGrow.personalAutoGrow.unit               -ne $desiredUnit)                       { return $true }
         if ($liveGrow.personalAutoGrow.unassignedThreshold -ne $Desired.autoGrow.unassignedThreshold) { return $true }
     }
+    if ($Desired.autoShrink) {
+        $liveShrink = $Live.autoScaleTriggers | Where-Object { $_.triggerType -eq 'PersonalAutoShrink' } | Select-Object -First 1
+        $ds         = $Desired.autoShrink
+        if (-not $liveShrink) { return $true }
+        if ($null -ne $ds.hostIdleDaysThreshold  -and $liveShrink.personalAutoShrink.hostIdleDaysThreshold  -ne $ds.hostIdleDaysThreshold)                    { return $true }
+        if ($null -ne $ds.deletionDelay          -and $liveShrink.personalAutoShrink.deletionDelay          -ne $ds.deletionDelay)                            { return $true }
+        if ($null -ne $ds.excludeUnassigned      -and [bool]$liveShrink.personalAutoShrink.excludeUnassigned      -ne [bool]$ds.excludeUnassigned)      { return $true }
+        if ($null -ne $ds.isNotificationsEnabled -and [bool]$liveShrink.personalAutoShrink.isNotificationsEnabled -ne [bool]$ds.isNotificationsEnabled) { return $true }
+    }
     return $false
 }
 
@@ -433,6 +447,38 @@ function Compare-CclConfig {
     if ($null -ne $Desired.defaultReportType -and $Live.defaultReportType -ne $Desired.defaultReportType) { return $true }
     # NME API only accepts isDefault=true (omit to leave false); only flag drift when desired is true
     if ($Desired.isDefault -eq $true -and $Live.isDefault -ne $true) { return $true }
+    return $false
+}
+
+function Compare-ResourceRuleJsonArray {
+    # ResourceRules.VmSize_* columns store a JSON array as plain nvarchar (e.g. '[2,4]').
+    # Compares order-insensitively against a desired PowerShell array.
+    param([string]$LiveJson, [array]$DesiredArray)
+    $liveArray = if ($LiveJson) { @(ConvertFrom-Json $LiveJson) } else { @() }
+    $liveSorted    = @($liveArray    | ForEach-Object { "$_" } | Sort-Object)
+    $desiredSorted = @($DesiredArray | ForEach-Object { "$_" } | Sort-Object)
+    if ($liveSorted.Count -ne $desiredSorted.Count) { return $true }
+    for ($i = 0; $i -lt $liveSorted.Count; $i++) {
+        if ($liveSorted[$i] -ne $desiredSorted[$i]) { return $true }
+    }
+    return $false
+}
+
+function Compare-ResourceRule {
+    # Only compares fields explicitly set in desired state (null = don't care).
+    # VmSize_* filter fields are never compared/corrected on a built-in row — the NME UI
+    # itself refuses to edit those ("Built-in rules cannot be edited"); IsEnabled is the
+    # one property built-ins can be toggled on, so it's always in scope.
+    param([PSCustomObject]$Live, [PSCustomObject]$Desired)
+    if ($null -ne $Desired.isEnabled -and [bool]$Live.IsEnabled -ne [bool]$Desired.isEnabled) { return $true }
+    if ($Desired.vmSize -and -not [bool]$Live.IsBuiltIn) {
+        $dv = $Desired.vmSize
+        if ($null -ne $dv.isEnabled   -and [bool]$Live.VmSize_IsEnabled   -ne [bool]$dv.isEnabled)   { return $true }
+        if ($null -ne $dv.checkQuota  -and [bool]$Live.VmSize_CheckQuota  -ne [bool]$dv.checkQuota)  { return $true }
+        if ($null -ne $dv.family -and (Compare-ResourceRuleJsonArray -LiveJson $Live.VmSize_FamilyJson -DesiredArray $dv.family)) { return $true }
+        if ($null -ne $dv.cores  -and (Compare-ResourceRuleJsonArray -LiveJson $Live.VmSize_CoreJson   -DesiredArray $dv.cores))  { return $true }
+        if ($null -ne $dv.ram    -and (Compare-ResourceRuleJsonArray -LiveJson $Live.VmSize_RamJson    -DesiredArray $dv.ram))    { return $true }
+    }
     return $false
 }
 
@@ -687,6 +733,7 @@ $scriptedActionsRemoved = 0
 $sqlProfilesRemoved     = 0
 $adConfigsCreated       = 0
 $adConfigsUpdated       = 0
+$resourceRulesUpdated   = 0
 $imagesRemoved          = 0
 $storageUnlinked        = 0
 $vnetsUnlinked          = 0
@@ -1455,6 +1502,88 @@ if ($null -ne $DesiredState.profiles.cclConfigs) {
 
 #endregion
 
+#region 9d — Reconcile Resource Rules (via SQL — no REST API exists)
+
+# NME's "Resource Selection Rules" (Settings > Resources rules) have no REST API at all — no
+# tag, path, or schema in the published OpenAPI spec. They're backed by the ResourceRules SQL
+# table. This region is update-only (no create): Order and ScopesJson semantics aren't fully
+# understood from the table alone (the UI's 5 named scopes map to integer Type codes we
+# haven't verified), so inserting a new row risks silently misapplying it NME-instance-wide.
+# A rule must already exist (built-in or created by hand in the NME UI) before desired state
+# can track it. Built-in rows (IsBuiltIn=1) can still have IsEnabled corrected — the NME UI
+# allows enabling/disabling a built-in without "editing" it — but their VmSize_* filter
+# content is never touched, matching the UI's own "Built-in rules cannot be edited" rule.
+
+Write-Log "--- Reconcile Resource Rules ---"
+
+if ($null -ne $DesiredState.profiles.resourceRules) {
+    if (-not $SqlConnection) {
+        Write-Log "SQL connection unavailable — skipping Resource Rules reconciliation." 'WARN'
+    } else {
+        try {
+            $liveResourceRules = @(Invoke-NmeSql -Connection $SqlConnection `
+                -Query "SELECT Id, Name, IsEnabled, IsBuiltIn, VmSize_IsEnabled, VmSize_CheckQuota, VmSize_FamilyJson, VmSize_CoreJson, VmSize_RamJson FROM ResourceRules" `
+                -AsDataTable)
+        } catch {
+            Add-NonFatalError "Failed to query ResourceRules: $($_.Exception.Message)"
+            $liveResourceRules = @()
+        }
+
+        foreach ($entry in $DesiredState.profiles.resourceRules) {
+            $live = $liveResourceRules | Where-Object { $_.Name -ieq $entry.name }
+
+            if (-not $live) {
+                Add-NonFatalError "Resource Rule '$($entry.name)' not found in NME. No create path exists for this object type (Order/ScopesJson semantics unverified) — create it manually in the NME UI first."
+                continue
+            }
+
+            if ($entry.vmSize -and [bool]$live.IsBuiltIn) {
+                Write-Log "Resource Rule '$($entry.name)' is built-in — ignoring desired 'vmSize' filter content (only IsEnabled is corrected on built-ins)." 'WARN'
+            }
+
+            if (-not (Compare-ResourceRule -Live $live -Desired $entry)) {
+                Write-Log "Resource Rule '$($entry.name)' is correct."
+                continue
+            }
+
+            Write-Log "Resource Rule '$($entry.name)' has drifted. Updating..."
+            if (-not $WhatIf) {
+                try {
+                    $setClauses = @()
+                    $params     = @{ '@Id' = $live.Id }
+                    if ($null -ne $entry.isEnabled) {
+                        $setClauses += 'IsEnabled = @IsEnabled'
+                        $params['@IsEnabled'] = [bool]$entry.isEnabled
+                    }
+                    if ($entry.vmSize -and -not [bool]$live.IsBuiltIn) {
+                        $dv = $entry.vmSize
+                        if ($null -ne $dv.isEnabled)  { $setClauses += 'VmSize_IsEnabled = @VmSizeIsEnabled';   $params['@VmSizeIsEnabled']  = [bool]$dv.isEnabled }
+                        if ($null -ne $dv.checkQuota) { $setClauses += 'VmSize_CheckQuota = @VmSizeCheckQuota'; $params['@VmSizeCheckQuota'] = [bool]$dv.checkQuota }
+                        if ($null -ne $dv.family)     { $setClauses += 'VmSize_FamilyJson = @VmSizeFamilyJson'; $params['@VmSizeFamilyJson'] = (@($dv.family) | ConvertTo-Json -Compress) }
+                        if ($null -ne $dv.cores)      { $setClauses += 'VmSize_CoreJson = @VmSizeCoreJson';     $params['@VmSizeCoreJson']   = (@($dv.cores)  | ConvertTo-Json -Compress) }
+                        if ($null -ne $dv.ram)        { $setClauses += 'VmSize_RamJson = @VmSizeRamJson';       $params['@VmSizeRamJson']    = (@($dv.ram)    | ConvertTo-Json -Compress) }
+                    }
+                    if ($setClauses.Count -gt 0) {
+                        Invoke-NmeSql -Connection $SqlConnection `
+                            -Query "UPDATE ResourceRules SET $($setClauses -join ', ') WHERE Id = @Id" `
+                            -Parameters $params | Out-Null
+                    }
+                    $resourceRulesUpdated++
+                    Write-Log "Resource Rule '$($entry.name)' updated."
+                } catch {
+                    Add-NonFatalError "Failed to update Resource Rule '$($entry.name)': $($_.Exception.Message)"
+                }
+            } else {
+                Write-Log "[WHATIF] Would update Resource Rule '$($entry.name)'."
+            }
+        }
+    }
+} else {
+    Write-Log "No 'profiles.resourceRules' section in desired state — skipping Resource Rules enforcement."
+}
+
+#endregion
+
 #region 10 — Reconcile VNets
 
 Write-Log "--- Reconcile VNets ---"
@@ -2147,8 +2276,32 @@ foreach ($entry in $DesiredState.hostPools) {
                                 }
                             }
                         }
-                        $hasPersonalAutoGrow = $liveAs.autoScaleTriggers | Where-Object { $_.triggerType -eq 'PersonalAutoGrow' }
-                        $asPutUri = if ($hasPersonalAutoGrow) { "$hpUrl/auto-scale?multiTriggers=true" } else { "$hpUrl/auto-scale" }
+                        if ($entry.autoScale.autoShrink -and $entry.poolType -eq 'Personal') {
+                            $ds = $entry.autoScale.autoShrink
+                            if (-not $liveAs.autoScaleTriggers) { $liveAs.autoScaleTriggers = @() }
+                            $shrinkTrigger = $liveAs.autoScaleTriggers | Where-Object { $_.triggerType -eq 'PersonalAutoShrink' } | Select-Object -First 1
+                            if ($shrinkTrigger) {
+                                if ($null -ne $ds.hostIdleDaysThreshold)  { $shrinkTrigger.personalAutoShrink.hostIdleDaysThreshold  = $ds.hostIdleDaysThreshold }
+                                if ($null -ne $ds.deletionDelay)          { $shrinkTrigger.personalAutoShrink.deletionDelay          = $ds.deletionDelay }
+                                if ($null -ne $ds.excludeUnassigned)      { $shrinkTrigger.personalAutoShrink.excludeUnassigned      = [bool]$ds.excludeUnassigned }
+                                if ($null -ne $ds.isNotificationsEnabled) { $shrinkTrigger.personalAutoShrink.isNotificationsEnabled = [bool]$ds.isNotificationsEnabled }
+                            } elseif ($null -ne $ds.hostIdleDaysThreshold -and $null -ne $ds.deletionDelay) {
+                                $liveAs.autoScaleTriggers += [PSCustomObject]@{
+                                    triggerType        = 'PersonalAutoShrink'
+                                    personalAutoShrink = [PSCustomObject]@{
+                                        action                 = 'DeleteVm'
+                                        hostIdleDaysThreshold  = $ds.hostIdleDaysThreshold
+                                        deletionDelay          = $ds.deletionDelay
+                                        excludeUnassigned      = if ($null -ne $ds.excludeUnassigned)      { [bool]$ds.excludeUnassigned }      else { $false }
+                                        isNotificationsEnabled = if ($null -ne $ds.isNotificationsEnabled) { [bool]$ds.isNotificationsEnabled } else { $false }
+                                    }
+                                }
+                            } else {
+                                Add-NonFatalError "Cannot create PersonalAutoShrink trigger on '$hpName' — desired state must specify both 'hostIdleDaysThreshold' and 'deletionDelay' (required fields)."
+                            }
+                        }
+                        $hasMultiTriggers = $liveAs.autoScaleTriggers | Where-Object { $_.triggerType -in @('PersonalAutoGrow', 'PersonalAutoShrink') }
+                        $asPutUri = if ($hasMultiTriggers) { "$hpUrl/auto-scale?multiTriggers=true" } else { "$hpUrl/auto-scale" }
                         $asResult = Invoke-NmeApi -Method PUT -Uri $asPutUri -Body ($liveAs | ConvertTo-Json -Depth 20)
                         if ($asResult.job.id) {
                             Wait-NmeJob -JobId $asResult.job.id -Description "update auto-scale config on '$hpName'"
@@ -2555,7 +2708,7 @@ if (-not $SkipSessionHostCheck) {
                         if (-not $liveAs.isEnabled) {
                             Write-Log "Auto-scale is disabled on '$hpName'. Re-enabling..."
                             $liveAs.isEnabled = $true
-                            $reEnableUri = if ($liveAs.autoScaleTriggers | Where-Object { $_.triggerType -eq 'PersonalAutoGrow' }) { "$hpUrl/auto-scale?multiTriggers=true" } else { "$hpUrl/auto-scale" }
+                            $reEnableUri = if ($liveAs.autoScaleTriggers | Where-Object { $_.triggerType -in @('PersonalAutoGrow', 'PersonalAutoShrink') }) { "$hpUrl/auto-scale?multiTriggers=true" } else { "$hpUrl/auto-scale" }
                             Invoke-NmeApi -Method PUT -Uri $reEnableUri -Body ($liveAs | ConvertTo-Json -Depth 20) | Out-Null
                             Write-Log "Auto-scale re-enabled on '$hpName'."
                         }
@@ -2582,6 +2735,7 @@ Write-Log "Host pools       — imported: $hpImported, created: $hpCreated, upda
 Write-Log "FSLogix configs  — created: $fslCreated, updated: $fslUpdated, removed: $fslRemoved"
 Write-Log "Auto-scale       — created: $asCreated, removed: $asRemoved"
 Write-Log "AD configs       — created: $adConfigsCreated, updated: $adConfigsUpdated"
+Write-Log "Resource Rules   — updated: $resourceRulesUpdated"
 Write-Log "Scripted actions — removed: $scriptedActionsRemoved (stray)"
 Write-Log "SQL profiles     — removed: $sqlProfilesRemoved (stray)"
 Write-Log "Images           — removed: $imagesRemoved (stray)"
