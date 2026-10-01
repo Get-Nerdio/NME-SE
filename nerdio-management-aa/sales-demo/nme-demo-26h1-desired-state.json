@@ -35,21 +35,21 @@
     {
       "name": "MultiUserImg",
       "sourceImageId": "MicrosoftWindowsDesktop/windows-11/win11-24h2-avd/latest",
-      "vmSize": "Standard_D2s_v3",
+      "vmSize": "Standard_D2as_v5",
       "storageType": "StandardSSD_LRS",
       "description": "Windows 11 multi-session for pooled host pools"
     },
     {
       "name": "PersonalImg",
       "sourceImageId": "MicrosoftWindowsDesktop/windows-11/win11-24h2-ent/latest",
-      "vmSize": "Standard_D2s_v3",
+      "vmSize": "Standard_D2as_v5",
       "storageType": "StandardSSD_LRS",
       "description": "Windows 11 single-session for personal desktops"
     },
     {
       "name": "Img-64gb",
       "sourceImageId": "MicrosoftWindowsDesktop/windows-11/win11-24h2-ent/latest",
-      "vmSize": "Standard_D2s_v3",
+      "vmSize": "Standard_D2as_v5",
       "storageType": "StandardSSD_LRS",
       "description": "Windows 11 single-session for personal desktops"
     }
@@ -177,9 +177,10 @@
       "loadBalancingAlgorithm": "BreadthFirst",
       "maxSessionLimit": 10,
       "fslogixConfigName": "FSLogix-EntraStorage",
+      "imageName": "MultiUserImg",
       "autoScale": {
         "isEnabled": true,
-        "vmSize": "Standard_D2s_v3",
+        "vmSize": "Standard_D2as_v5",
         "vmNamePrefix": "mspooled",
         "hostPoolCapacity": 3,
         "minActiveHostsCount": 1
@@ -198,9 +199,10 @@
       "loadBalancingAlgorithm": "BreadthFirst",
       "maxSessionLimit": 10,
       "fslogixConfigName": "FSLogix-EntraStorage",
+      "imageName": "MultiUserImg",
       "autoScale": {
         "isEnabled": true,
-        "vmSize": "Standard_D2s_v3",
+        "vmSize": "Standard_D2as_v5",
         "vmNamePrefix": "remoteapp",
         "hostPoolCapacity": 3,
         "minActiveHostsCount": 1
@@ -219,9 +221,10 @@
       "loadBalancingAlgorithm": "DepthFirst",
       "maxSessionLimit": 1,
       "fslogixConfigName": "FSLogix-EntraStorage",
+      "imageName": "MultiUserImg",
       "autoScale": {
         "isEnabled": true,
-        "vmSize": "Standard_D2s_v3",
+        "vmSize": "Standard_D2as_v5",
         "vmNamePrefix": "supool",
         "hostPoolCapacity": 3,
         "minActiveHostsCount": 1
@@ -244,9 +247,10 @@
       "loadBalancingAlgorithm": "Persistent",
       "maxSessionLimit": 1,
       "fslogixConfigName": "FSLogix-EntraStorage",
+      "imageName": "PersonalImg",
       "autoScale": {
         "isEnabled": true,
-        "vmSize": "Standard_D2s_v3",
+        "vmSize": "Standard_D2as_v5",
         "vmNamePrefix": "personal",
         "hostPoolCapacity": 3,
         "minActiveHostsCount": 0,

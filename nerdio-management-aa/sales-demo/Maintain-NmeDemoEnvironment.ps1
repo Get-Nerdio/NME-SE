@@ -8,7 +8,8 @@
 
    1. Load desired state from GitHub (or a local file for testing)
    2. Import any host pools tagged NME-SE-Manage=import into desired state and commit to git
-   3. Reconcile the AVD workspace (create if missing, apply env tag)
+   3. Reconcile the AVD workspace (create if missing, apply env tag, remove stray
+      workspaces if -RemoveUndefinedResources)
    4. Reconcile VNet registrations in NME (add if missing, remove stray if -RemoveUndefinedResources)
    5. Reconcile storage accounts and Azure file shares (create if missing, apply env tag)
    6. Reconcile desktop images in NME (create if missing, apply env tag, remove stray if -RemoveUndefinedResources)
@@ -24,7 +25,11 @@
   10c. Reconcile CCL cost configs (create or update) via REST API
   11. Reconcile host pools scoped to the demo resource group:
         - Create missing host pools and apply full desired configuration
-        - Correct drifted settings (WVD props, FSLogix assignment, auto-scale config)
+        - Correct drifted settings: WVD props (friendlyName, description, load
+          balancing algorithm, max session limit, personal assignment type),
+          FSLogix assignment, auto-scale config (including the VM template's
+          desktop image, resolved from an 'imageName' referencing the
+          top-level 'images' list)
         - Assign users (by UPN) and groups (by display name, resolved to GUID via Graph)
         - Apply environment ARM tag; confirm tag on existing pools
         - Remove stray host pools not in desired state (unless tagged ignore)
@@ -152,8 +157,8 @@
 
 .PARAMETER RemoveUndefinedResources
   Actively remove resources not present in desired state: stray host pools (after disabling
-  auto-scale and removing session hosts), desktop images, unlinked storage shares, and VNets.
-  Without this switch, stray resources are only logged as warnings.
+  auto-scale and removing session hosts), desktop images, unlinked storage shares, VNets, and
+  AVD workspaces. Without this switch, stray resources are only logged as warnings.
 
 .PARAMETER SkipSessionHostCheck
   Skip the session host availability advisory at the end.
@@ -333,12 +338,33 @@ function Resolve-FslogixIdByName {
     return $match.id
 }
 
+function Resolve-DesktopImageIdByName {
+    param([string]$Name, [array]$DesiredImages, [array]$LiveImages)
+    $imgEntry = $DesiredImages | Where-Object { $_.name -eq $Name } | Select-Object -First 1
+    if (-not $imgEntry) { return $null }
+    # Mirrors the vmName derivation in region 12 (Check Desktop Images) — NME image list
+    # returns "vmname (timestamp)"; match by VM name as the last segment of the ARM id.
+    if ($imgEntry.vmName) {
+        $imgVmName = ($imgEntry.vmName -replace '[^a-zA-Z0-9-]', '-')
+    } else {
+        $imgVmName = ($imgEntry.name -replace '[^a-zA-Z0-9]', '-')
+    }
+    if ($imgVmName.Length -gt 15) { $imgVmName = $imgVmName.Substring(0, 15).TrimEnd('-') }
+    $match = $LiveImages | Where-Object { ($_.id -split '/')[-1] -ieq $imgVmName }
+    if (-not $match) { return $null }
+    return $match.id
+}
+
 function Compare-HostPoolWvdProps {
     param([PSCustomObject]$Live, [PSCustomObject]$Desired)
     # Only compare fields that are explicitly set in desired state (null = don't care)
     if ($null -ne $Desired.loadBalancingAlgorithm -and $Live.loadBalancerType -ne $Desired.loadBalancingAlgorithm) { return $true }
     # Personal pools: NME always overrides maxSessionLimit to 999999 internally — skip comparison
     if ($null -ne $Desired.maxSessionLimit -and $Desired.poolType -ne 'Personal' -and $Live.maxSessionLimit -ne $Desired.maxSessionLimit) { return $true }
+    if ($null -ne $Desired.friendlyName -and $Live.friendlyName -ne $Desired.friendlyName) { return $true }
+    if ($null -ne $Desired.description  -and $Live.description  -ne $Desired.description)  { return $true }
+    # assignmentType only applies to Personal pools
+    if ($Desired.poolType -eq 'Personal' -and $null -ne $Desired.personalAssignmentType -and $Live.assignmentType -ne $Desired.personalAssignmentType) { return $true }
     return $false
 }
 
@@ -374,9 +400,11 @@ function Compare-HpFslogixAssignment {
 
 function Compare-HpAutoScale {
     # $DesiredPrefix: pre-computed "{prefix}-{????}" string, or $null if vmNamePrefix not in desired state
-    param([PSCustomObject]$Live, [PSCustomObject]$Desired, [string]$DesiredPrefix = $null, [string]$PoolType = 'Pooled')
+    # $DesiredImageId: resolved ARM id of the desired desktop image, or $null if imageName not in desired state
+    param([PSCustomObject]$Live, [PSCustomObject]$Desired, [string]$DesiredPrefix = $null, [string]$PoolType = 'Pooled', [string]$DesiredImageId = $null)
     # Only compare fields that are explicitly set in desired state (null = don't care)
     if ($null -ne $Desired.isEnabled -and $Live.isEnabled -ne $Desired.isEnabled) { return $true }
+    if ($DesiredImageId -and $Live.vmTemplate.image -ne $DesiredImageId) { return $true }
     # Personal pools: NME does not surface hostPoolCapacity/minActiveHostsCount — skip comparison
     if ($PoolType -ne 'Personal') {
         if ($null -ne $Desired.hostPoolCapacity    -and $Live.hostPoolCapacity    -ne $Desired.hostPoolCapacity)    { return $true }
@@ -662,6 +690,7 @@ $adConfigsUpdated       = 0
 $imagesRemoved          = 0
 $storageUnlinked        = 0
 $vnetsUnlinked          = 0
+$workspacesRemoved      = 0
 
 # PS 5.1 defaults to TLS 1.0 — force TLS 1.2 for all Invoke-RestMethod calls in this session.
 [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
@@ -906,6 +935,32 @@ if (-not $wsMatch) {
     if ($DemoTagName -and $wsMatch) {
         $wsArmId = "/subscriptions/$wsEffSub/resourceGroups/$wsEffRg/providers/Microsoft.DesktopVirtualization/workspaces/$($ws.name)"
         Confirm-ArmTag -ResourceId $wsArmId -TagName $DemoTagName -TagValue $DemoTagValue
+    }
+}
+
+# Stray workspaces — desired state defines exactly one workspace; any other live workspace
+# this NME instance knows about is stray.
+foreach ($live in $liveWorkspaces) {
+    if ($live.id.name -eq $ws.name) { continue }
+
+    if ($RemoveUndefinedResources) {
+        Write-Log "Workspace '$($live.id.name)' not in desired state. Removing..."
+        if (-not $WhatIf) {
+            try {
+                $delResult = Invoke-NmeApi -Method DELETE -Uri "$NmeUri/api/v1/workspace/$($live.id.subscriptionId)/$($live.id.resourceGroup)/$([uri]::EscapeDataString($live.id.name))"
+                if ($delResult.job.id) {
+                    Wait-NmeJob -JobId $delResult.job.id -Description "remove stray workspace '$($live.id.name)'"
+                }
+                $workspacesRemoved++
+                Write-Log "Workspace '$($live.id.name)' removed."
+            } catch {
+                Add-NonFatalError "Failed to remove workspace '$($live.id.name)': $($_.Exception.Message)"
+            }
+        } else {
+            Write-Log "[WHATIF] Would remove workspace '$($live.id.name)'."
+        }
+    } else {
+        Write-Log "Workspace '$($live.id.name)' is not in desired state (stray). Run with -RemoveUndefinedResources to remove." 'WARN'
     }
 }
 
@@ -1782,6 +1837,15 @@ foreach ($entry in $DesiredState.hostPools) {
         }
     }
 
+    # Resolve desktop image ID
+    $resolvedImageId = $null
+    if ($entry.imageName) {
+        $resolvedImageId = Resolve-DesktopImageIdByName -Name $entry.imageName -DesiredImages $DesiredState.images -LiveImages $liveImages
+        if (-not $resolvedImageId) {
+            Add-NonFatalError "Cannot resolve desktop image '$($entry.imageName)' for host pool '$hpName'. Skipping image drift check."
+        }
+    }
+
     $liveHp = $liveHostPools | Where-Object { $_.Name -eq $hpName }
     $tag    = if ($liveHp) { Get-ArmTagValue -ResourceId $liveHp.Id -TagName 'NME-SE-Manage' } else { $null }
 
@@ -1835,11 +1899,18 @@ foreach ($entry in $DesiredState.hostPools) {
             Wait-NmeJob -JobId $createResult.job.id -Description "create host pool '$hpName'"
             Write-Log "Host pool '$hpName' created."
 
-            # Set loadBalancerType + maxSessionLimit (not part of create body)
-            $wvdBody = @{
+            # Set loadBalancerType + maxSessionLimit + friendlyName/description/assignmentType
+            # (none of these are reliably applied by the create body above)
+            $wvdPatch = @{
                 loadBalancerType = $entry.loadBalancingAlgorithm
                 maxSessionLimit  = $entry.maxSessionLimit
-            } | ConvertTo-Json
+                friendlyName     = $entry.friendlyName
+                description      = $entry.description
+            }
+            if ($entry.poolType -eq 'Personal' -and $entry.personalAssignmentType) {
+                $wvdPatch['assignmentType'] = $entry.personalAssignmentType
+            }
+            $wvdBody = $wvdPatch | ConvertTo-Json
             $wvdResult = Invoke-NmeApi -Method PATCH -Uri "$hpUrl/wvd" -Body $wvdBody
             if ($wvdResult.job.id) {
                 Wait-NmeJob -JobId $wvdResult.job.id -Description "set WVD props on '$hpName'"
@@ -1904,6 +1975,7 @@ foreach ($entry in $DesiredState.hostPools) {
                     if ($asConfig.vmTemplate) {
                         $asConfig.vmTemplate.size   = $entry.autoScale.vmSize
                         $asConfig.vmTemplate.prefix = $hpVmPrefixTemplate
+                        if ($resolvedImageId) { $asConfig.vmTemplate.image = $resolvedImageId }
                     }
                     if ($entry.autoScale.scalingMode)       { $asConfig.scalingMode       = $entry.autoScale.scalingMode }
                     if ($entry.autoScale.autoScaleCriteria) { $asConfig.autoScaleCriteria = $entry.autoScale.autoScaleCriteria }
@@ -1955,12 +2027,21 @@ foreach ($entry in $DesiredState.hostPools) {
             # WVD props
             $liveWvd = Invoke-NmeApi -Method GET -Uri "$hpUrl/wvd"
             if (Compare-HostPoolWvdProps -Live $liveWvd -Desired $entry) {
-                Write-Log "WVD props drifted on '$hpName' (loadBalancer='$($liveWvd.loadBalancerType)'→'$($entry.loadBalancingAlgorithm)', maxSession=$($liveWvd.maxSessionLimit)→$($entry.maxSessionLimit))."
+                $wvdDriftParts = @()
+                if ($null -ne $entry.loadBalancingAlgorithm -and $liveWvd.loadBalancerType -ne $entry.loadBalancingAlgorithm) { $wvdDriftParts += "loadBalancer='$($liveWvd.loadBalancerType)'→'$($entry.loadBalancingAlgorithm)'" }
+                if ($null -ne $entry.maxSessionLimit -and $entry.poolType -ne 'Personal' -and $liveWvd.maxSessionLimit -ne $entry.maxSessionLimit) { $wvdDriftParts += "maxSession=$($liveWvd.maxSessionLimit)→$($entry.maxSessionLimit)" }
+                if ($null -ne $entry.friendlyName -and $liveWvd.friendlyName -ne $entry.friendlyName) { $wvdDriftParts += "friendlyName='$($liveWvd.friendlyName)'→'$($entry.friendlyName)'" }
+                if ($null -ne $entry.description -and $liveWvd.description -ne $entry.description) { $wvdDriftParts += "description='$($liveWvd.description)'→'$($entry.description)'" }
+                if ($entry.poolType -eq 'Personal' -and $null -ne $entry.personalAssignmentType -and $liveWvd.assignmentType -ne $entry.personalAssignmentType) { $wvdDriftParts += "assignmentType='$($liveWvd.assignmentType)'→'$($entry.personalAssignmentType)'" }
+                Write-Log "WVD props drifted on '$hpName' ($($wvdDriftParts -join ', '))."
                 if (-not $WhatIf) {
                     # Only include fields that are explicitly set in desired state
                     $wvdPatch = @{}
                     if ($null -ne $entry.loadBalancingAlgorithm)                               { $wvdPatch['loadBalancerType'] = $entry.loadBalancingAlgorithm }
                     if ($null -ne $entry.maxSessionLimit -and $entry.poolType -ne 'Personal')  { $wvdPatch['maxSessionLimit']  = [int]$entry.maxSessionLimit }
+                    if ($null -ne $entry.friendlyName)                                         { $wvdPatch['friendlyName']     = $entry.friendlyName }
+                    if ($null -ne $entry.description)                                          { $wvdPatch['description']      = $entry.description }
+                    if ($entry.poolType -eq 'Personal' -and $null -ne $entry.personalAssignmentType) { $wvdPatch['assignmentType'] = $entry.personalAssignmentType }
                     $wvdBody   = $wvdPatch | ConvertTo-Json
                     $wvdResult = Invoke-NmeApi -Method PATCH -Uri "$hpUrl/wvd" -Body $wvdBody
                     if ($wvdResult.job.id) {
@@ -2032,8 +2113,8 @@ foreach ($entry in $DesiredState.hostPools) {
                     }
                     if (-not $liveAs) { throw "Auto-scale config unavailable on '$hpName' after conversion." }
                 }
-                if (Compare-HpAutoScale -Live $liveAs -Desired $entry.autoScale -DesiredPrefix $hpVmPrefixEnforce -PoolType $entry.poolType) {
-                    Write-Log "Auto-scale config drifted on '$hpName' (isEnabled=$($liveAs.isEnabled), vmSize=$($liveAs.vmTemplate.size), prefix='$($liveAs.vmTemplate.prefix)', capacity=$($liveAs.hostPoolCapacity), minActive=$($liveAs.minActiveHostsCount))."
+                if (Compare-HpAutoScale -Live $liveAs -Desired $entry.autoScale -DesiredPrefix $hpVmPrefixEnforce -PoolType $entry.poolType -DesiredImageId $resolvedImageId) {
+                    Write-Log "Auto-scale config drifted on '$hpName' (isEnabled=$($liveAs.isEnabled), vmSize=$($liveAs.vmTemplate.size), image='$($liveAs.vmTemplate.image)', prefix='$($liveAs.vmTemplate.prefix)', capacity=$($liveAs.hostPoolCapacity), minActive=$($liveAs.minActiveHostsCount))."
                     if (-not $WhatIf) {
                         # Read-modify-write: only overwrite fields that are explicitly set in desired state
                         # Personal pools don't support hostPoolCapacity/minActiveHostsCount
@@ -2045,6 +2126,7 @@ foreach ($entry in $DesiredState.hostPools) {
                         if ($liveAs.vmTemplate) {
                             if ($null -ne $entry.autoScale.vmSize)      { $liveAs.vmTemplate.size   = $entry.autoScale.vmSize }
                             if ($entry.autoScale.vmNamePrefix)          { $liveAs.vmTemplate.prefix = $hpVmPrefixTemplate }
+                            if ($resolvedImageId)                      { $liveAs.vmTemplate.image  = $resolvedImageId }
                         }
                         if ($null -ne $entry.autoScale.scalingMode)       { $liveAs.scalingMode       = $entry.autoScale.scalingMode }
                         if ($null -ne $entry.autoScale.autoScaleCriteria) { $liveAs.autoScaleCriteria = $entry.autoScale.autoScaleCriteria }
@@ -2495,6 +2577,7 @@ if (-not $SkipSessionHostCheck) {
 #region 15 — Summary
 
 Write-Log "=== Summary ==="
+Write-Log "Workspaces       — removed: $workspacesRemoved (stray)"
 Write-Log "Host pools       — imported: $hpImported, created: $hpCreated, updated: $hpUpdated, removed: $hpRemoved"
 Write-Log "FSLogix configs  — created: $fslCreated, updated: $fslUpdated, removed: $fslRemoved"
 Write-Log "Auto-scale       — created: $asCreated, removed: $asRemoved"
