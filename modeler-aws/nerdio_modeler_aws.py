@@ -14,8 +14,9 @@ Covers:
 
 Run it in AWS CloudShell (boto3 is preinstalled) or anywhere the AWS CLI is signed in:
 
-    curl -sSL https://raw.githubusercontent.com/dclawrence003/NME/main/modeler-aws/nerdio_modeler_aws.py -o nerdio_modeler_aws.py
-    python3 nerdio_modeler_aws.py
+    curl -sSL https://raw.githubusercontent.com/dclawrence003/NME/main/modeler-aws/nerdio_modeler_aws.py | python3 -
+
+Parameters go after the dash:  ... | python3 - --check --regions us-east-1
 
 Outputs one zip: the Modeler import JSON, a per-group review CSV, 15-minute concurrency
 buckets, the cost rows, the raw observation data, and the console log.
@@ -41,7 +42,7 @@ import time
 import uuid
 import zipfile
 
-SCRIPT_VERSION = 'v0.1.0'
+SCRIPT_VERSION = 'v0.1.1'
 TOOL_NAME = 'nerdio_modeler_aws.py'
 VERSION_URL = 'https://raw.githubusercontent.com/dclawrence003/NME/main/modeler-aws/VERSION'
 
@@ -356,33 +357,68 @@ def is_access_denied(exc):
     return error_code(exc) in ('AccessDenied', 'AccessDeniedException', 'UnauthorizedOperation', 'UnrecognizedClientException',
                                'AuthFailure', 'OptInRequired', 'InvalidClientTokenId', 'ExpiredToken', 'ExpiredTokenException')
 
+ACCESS = {}   # (service, region) -> 'ok' | 'denied' | 'unavailable' | 'error'; printed at the end so an empty account still shows what was reachable
+_REGION_RX = re.compile(r'^[a-z]{2}-[a-z]+-\d$')
+def _record_access(label, status):
+    words = label.split()
+    service = 'Cost Explorer' if words[0] == 'Cost' else words[0]
+    region = next((w for w in words if _REGION_RX.match(w)), 'global')
+    prev = ACCESS.get((service, region))
+    if prev in (None, 'ok') or status != 'ok': ACCESS[(service, region)] = status if prev != 'denied' else 'denied'
+
 def safe(label, fn, default=None, quiet=False, quiet_codes=()):
     """Runs one read. Access denied and unavailable endpoints are reported, never fatal."""
     import botocore.exceptions as be
     try:
-        return fn()
+        result = fn()
+        _record_access(label, 'ok')
+        return result
     except be.EndpointConnectionError:
+        _record_access(label, 'unavailable')
         if not quiet: LOG.info('%s: service endpoint not reachable here (region not enabled for it); skipped.' % label)
     except be.ClientError as e:
         code = error_code(e)
         if code in quiet_codes: return default
-        if is_access_denied(e): LOG.warn('%s: access denied (%s). Grant the read-only policy in the README and run again; everything else continues.' % (label, code))
-        else: LOG.warn('%s: %s: %s' % (label, code, str(e)[:200]))
+        if is_access_denied(e):
+            _record_access(label, 'denied')
+            LOG.warn('%s: access denied (%s). Grant the read-only policy in the README and run again; everything else continues.' % (label, code))
+        else:
+            _record_access(label, 'error')
+            LOG.warn('%s: %s: %s' % (label, code, str(e)[:200]))
     except be.NoCredentialsError:
         LOG.warn('%s: no AWS credentials in this shell. In CloudShell this cannot happen; locally run `aws configure` or `aws sso login` first.' % label)
         raise
     except be.BotoCoreError as e:
+        _record_access(label, 'error')
         LOG.warn('%s: %s' % (label, str(e)[:200]))
     except Exception as e:  # keep the run alive; name the failure
+        _record_access(label, 'error')
         LOG.warn('%s: %s: %s' % (label, e.__class__.__name__, str(e)[:200]))
     return default
+
+def print_access_check():
+    """One line per service: where the reads worked, where they were refused. The thing to look at on a first run."""
+    if not ACCESS: return
+    LOG.raw('')
+    LOG.ok('SERVICE ACCESS CHECK (reads attempted this run):')
+    by = collections.defaultdict(lambda: collections.defaultdict(list))
+    for (service, region), status in sorted(ACCESS.items()):
+        by[service][status].append(region)
+    for service in sorted(by):
+        parts = []
+        for status in ('ok', 'denied', 'unavailable', 'error'):
+            regs = by[service].get(status)
+            if regs: parts.append('%s: %s' % (status, ', '.join(regs) if len(regs) <= 6 else '%d regions' % len(regs)))
+        LOG.raw('    %-14s %s' % (service, '; '.join(parts)))
+    denied = sorted(set(s for (s, r), st in ACCESS.items() if st == 'denied'))
+    if denied: LOG.warn('Denied somewhere: %s. The README has the minimal read-only policy.' % ', '.join(denied))
 
 # ============================================================================ CloudWatch series
 class MetricPuller:
     """GetMetricData in batches. Each query is (key, namespace, metric, dimensions, stat). Returns
     {key: {slot_start_utc: value}} on the lookback's slot grid."""
-    def __init__(self, cw, lb, period):
-        self.cw = cw; self.lb = lb; self.period = period
+    def __init__(self, cw, lb, period, region='global'):
+        self.cw = cw; self.lb = lb; self.period = period; self.region = region
         self.calls = 0; self.datapoints = 0
     def pull(self, queries, batch=150):
         out = {}
@@ -399,7 +435,7 @@ class MetricPuller:
             while True:
                 kw = dict(MetricDataQueries=mdq, StartTime=self.lb.start, EndTime=self.lb.end, ScanBy='TimestampAscending')
                 if token: kw['NextToken'] = token
-                resp = safe('CloudWatch GetMetricData', lambda: self.cw.get_metric_data(**kw))
+                resp = safe('CloudWatch GetMetricData %s' % self.region, lambda: self.cw.get_metric_data(**kw))
                 self.calls += 1
                 if not resp: break
                 for r in resp.get('MetricDataResults', []):
@@ -414,7 +450,7 @@ class MetricPuller:
                 if not token: break
         return out
 
-def discover_dimension(cw, namespace, metric, want_dim):
+def discover_dimension(cw, namespace, metric, want_dim, region='global'):
     """ListMetrics tells us which dimension name a service uses (pools, fleets), instead of guessing."""
     found = {}
     def fn():
@@ -428,7 +464,7 @@ def discover_dimension(cw, namespace, metric, want_dim):
                     if d['Name'].lower() == want_dim.lower(): found[d['Value']] = d['Name']
             token = resp.get('NextToken')
             if not token: return found
-    safe('CloudWatch ListMetrics %s/%s' % (namespace, metric), fn)
+    safe('CloudWatch ListMetrics %s/%s %s' % (namespace, metric, region), fn)
     return found
 
 # ============================================================================ collectors
@@ -471,7 +507,7 @@ def collect_account(aws, est, acct, creds, args, lb, hasher):
     period = 900 if lb.days <= 60 else 3600
     for region in enabled:
         cw = aws.client('cloudwatch', region=region, credentials=creds)
-        puller = MetricPuller(cw, lb, period)
+        puller = MetricPuller(cw, lb, period, region)
         if region in ws_regions:
             collect_workspaces_region(aws, est, acct_id, creds, region, args, lb, hasher, puller)
         if region in as_regions:
@@ -566,7 +602,7 @@ def collect_workspaces_region(aws, est, acct_id, creds, region, args, lb, hasher
                               directory=p.get('DirectoryId'), running_mode=p.get('RunningMode'), capacity=p.get('CapacityStatus') or {},
                               timeouts=p.get('TimeoutSettings') or {}, created=iso(p.get('CreatedAt'))))
     if pools:
-        dim = discover_dimension(aws.client('cloudwatch', region=region, credentials=creds), 'AWS/WorkSpaces', 'ActiveUserSessionCapacity', 'PoolId')
+        dim = discover_dimension(aws.client('cloudwatch', region=region, credentials=creds), 'AWS/WorkSpaces', 'ActiveUserSessionCapacity', 'PoolId', region)
         queries = []
         for p in pools:
             pid = p['PoolId']; dname = dim.get(pid, 'PoolId')
@@ -640,7 +676,7 @@ def read_usage_reports(aws, est, acct_id, creds, region, subs, lb, hasher):
         last = to_local(lb.end, dt.timezone.utc).date()
         while d <= last:
             key = 'sessions/schedule=DAILY/year=%04d/month=%02d/day=%02d/daily-session-report-%04d-%02d-%02d.csv' % (d.year, d.month, d.day, d.year, d.month, d.day)
-            body = safe('S3 GetObject usage report %s' % d.isoformat(), lambda: s3.get_object(Bucket=bucket, Key=key)['Body'].read(), quiet=True, quiet_codes=('NoSuchKey', '404'))
+            body = safe('S3 GetObject usage report %s %s' % (d.isoformat(), region), lambda: s3.get_object(Bucket=bucket, Key=key)['Body'].read(), quiet=True, quiet_codes=('NoSuchKey', '404'))
             d += dt.timedelta(days=1)
             if not body: continue
             days += 1
@@ -1022,6 +1058,7 @@ def write_outputs(est, deployments, review, args, lb, stamp, run_meta):
                     for k, g in est.groups.items()}),
         ('costSummary', est.cost_summary), ('prices', {r: len(v) for r, v in est.prices.items()}), ('priceRows', est.prices),
         ('telemetry', est.telemetry), ('errors', est.errors),
+        ('serviceAccess', {'%s %s' % k: v for k, v in sorted(ACCESS.items())}),
     ])
     p = base + '-rawdata.json'; json.dump(raw, open(p, 'w'), indent=1, default=str); files.append(p)
     p = base + '-console.log'; open(p, 'w').write('\n'.join(LOG.lines) + '\n'); files.append(p)
@@ -1060,9 +1097,17 @@ def parse_args(argv):
     ap.add_argument('--azure-region', help='force one Azure region for every deployment (default: mapped from the AWS region)')
     ap.add_argument('--skip-costs', action='store_true'); ap.add_argument('--skip-prices', action='store_true'); ap.add_argument('--skip-usage-report', action='store_true')
     ap.add_argument('--out-dir', default=os.path.expanduser('~'))
+    ap.add_argument('--check', action='store_true', help='first-run mode: also probe the price list in this shell\'s region when no WorkSpaces exist; the service access check prints either way')
     ap.add_argument('--demo', action='store_true', help='run against a built-in synthetic estate (no AWS calls); for seeing the outputs')
     ap.add_argument('--demo-seed', type=int, default=7)
     return ap.parse_args(argv)
+
+def shell_region(aws, args):
+    if args.regions: return args.regions[0]
+    r = None
+    try: r = aws.session.region_name if aws.session else None
+    except Exception: r = None
+    return r or os.environ.get('AWS_REGION') or os.environ.get('AWS_DEFAULT_REGION') or 'us-east-1'
 
 def check_version():
     try:
@@ -1079,6 +1124,12 @@ def main(argv=None, client_factory=None):
     t0 = time.time()
     LOG.lines.clear()
     LOG.info('%s %s' % (TOOL_NAME, SCRIPT_VERSION))
+    try:
+        import boto3 as _b3, botocore as _bc
+        LOG.info('Python %d.%d.%d, boto3 %s, botocore %s' % (sys.version_info[0], sys.version_info[1], sys.version_info[2], _b3.__version__, _bc.__version__))
+    except Exception:
+        LOG.warn('boto3 is not installed. In CloudShell it is preinstalled; locally run: pip install boto3')
+        return 2
     if args.demo and client_factory is None:
         from nerdio_modeler_aws_demo import make_demo_factory  # noqa: F401 (separate file next to this script)
         client_factory = make_demo_factory(args.demo_seed)
@@ -1136,7 +1187,10 @@ def main(argv=None, client_factory=None):
     else: collect_costs(aws, est, None, args)
     LOG.info('[3/4] WorkSpaces price list for the per-WorkSpace estimate...')
     ws_regions = sorted(set(w['region'] for w in est.workspaces))
-    if args.skip_prices or not ws_regions: LOG.info('skipped (%s)' % ('--skip-prices' if args.skip_prices else 'no personal WorkSpaces found'))
+    if not ws_regions and args.check:
+        ws_regions = [shell_region(aws, args)]
+        LOG.info('--check: no WorkSpaces to price, probing the price list for %s anyway.' % ws_regions[0])
+    if args.skip_prices or not ws_regions: LOG.info('skipped (%s)' % ('--skip-prices' if args.skip_prices else 'no personal WorkSpaces found; add --check to probe the price list anyway'))
     else: collect_prices(aws, est, None, ws_regions)
     LOG.info('[4/4] Assembling deployments...')
     deployments, review = assemble(est, args, lb)
@@ -1148,6 +1202,7 @@ def main(argv=None, client_factory=None):
             ten['workspacesPersonal'], ten['pools'], ten['fleets'], ten['ec2']))
     if est.telemetry['groups_with_data'] == 0 and est.groups:
         LOG.warn('TELEMETRY NOT FOUND: no CloudWatch usage data came back for any group. Check that the signed-in principal can call cloudwatch:GetMetricData; every deployment is defaulted to 1 user.')
+    print_access_check()
     stamp = utcnow().strftime('%Y%m%d-%H%M')
     os.makedirs(args.out_dir, exist_ok=True)
     zp, files = write_outputs(est, deployments, review, args, lb, stamp, run_meta)
