@@ -103,6 +103,8 @@ $script:BlockedProviders = @{}
 $script:ProviderTestsSkipped = @{}          # blocked providers that actually caused a test to be skipped
 $script:PendingProviderRegistrations = @{}  # namespace -> @{ Job; Before } for registrations still running in the background
 $script:ProvidersRegisteredByScript = @()   # providers this run registered, at the user's request
+# Appended to a policy-blocked result when the Activity Log lookup for the policy name was skipped.
+$script:ActivityLogSkippedNote = " The blocking policy's name could not be looked up: that needs the Activity Log, and Microsoft.Insights is not registered on this subscription."
 
 function Add-Result {
     param(
@@ -182,9 +184,12 @@ $script:IsCloudShell = -not [string]::IsNullOrEmpty($env:ACC_CLOUD) -or
     ($env:AZUREPS_HOST_ENVIRONMENT -like "cloud-shell*")
 
 function Get-ReadinessVerdict {
-    # Overall verdict from the result set: any Fail -> FAIL; else any Warn -> WARN; else PASS.
-    # An empty result set (e.g. an aborted run that never populated $Results) must never read PASS.
-    param([System.Collections.IEnumerable] $Results)
+    # Overall verdict from the result set: any Fail -> FAIL; else tests skipped because a resource provider
+    # isn't registered ($SkippedProviders) -> INCOMPLETE; else any Warn -> WARN; else PASS.
+    # An empty result set (e.g. an aborted run that never populated $Results) must never read PASS, and
+    # neither may a run that skipped core tests - those skips are only Warn rows, so without the
+    # $SkippedProviders check a run that tested little would still read "READY WITH WARNINGS".
+    param([System.Collections.IEnumerable] $Results, [string[]] $SkippedProviders)
     if (@($Results).Count -eq 0) { return "Incomplete" }
     $hasFail = $false; $hasWarn = $false
     foreach ($r in $Results) {
@@ -192,6 +197,7 @@ function Get-ReadinessVerdict {
         elseif ($r.Result -eq "Warn") { $hasWarn = $true }
     }
     if ($hasFail) { return "Fail" }
+    elseif ($SkippedProviders -and $SkippedProviders.Count -gt 0) { return "Incomplete" }   # not @(...).Count: @($null) counts 1
     elseif ($hasWarn) { return "Warn" }
     else { return "Pass" }
 }
@@ -212,9 +218,10 @@ function New-ReadinessHtmlReport {
         [object] $Meta,
         [System.Collections.IEnumerable] $CreatedResources,
         [System.Collections.IEnumerable] $NextSteps,
-        [string] $RawJson
+        [string] $RawJson,
+        [string[]] $SkippedProviders
     )
-    $verdict = Get-ReadinessVerdict -Results $Results
+    $verdict = Get-ReadinessVerdict -Results $Results -SkippedProviders $SkippedProviders
     $vStyle = $script:StatusStyle[$verdict]
     $counts = @{ Pass = 0; Fail = 0; Warn = 0; Info = 0 }
     foreach ($r in $Results) { if ($counts.ContainsKey($r.Result)) { $counts[$r.Result]++ } }
@@ -269,6 +276,9 @@ font-family:ui-monospace,SFMono-Regular,Menlo,monospace;}
 
     $vColor = @{ Pass = "var(--pass)"; Fail = "var(--fail)"; Warn = "var(--warn)"; Incomplete = "var(--warn)" }[$verdict]
     $vText = @{ Pass = "READY: all checks passed"; Fail = "NOT READY: one or more checks failed"; Warn = "READY WITH WARNINGS: review the items below"; Incomplete = "INCOMPLETE: the readiness run did not produce any results — re-run and send the full output." }[$verdict]
+    if ($verdict -eq "Incomplete" -and @($Results).Count -gt 0) {
+        $vText = "INCOMPLETE: some checks were not run because these resource providers are not registered: $(ConvertTo-HtmlText ((@($SkippedProviders) | Sort-Object) -join ', ')). Register them and re-run."
+    }
     [void]$sb.AppendLine("<div class=`"banner`" style=`"background:$vColor`"><span>$($vStyle.Symbol)</span><span>$vText</span></div>")
 
     [void]$sb.AppendLine('<div class="chips">')
@@ -1062,8 +1072,14 @@ function Add-PolicyFailureResult {
         $policySource = if ($polName -and $polName -ne $p.PolicyDefinitionId -and $polName -ne $p.PolicyAssignmentId) { "the ARM error" } else { $null }
 
         # New-AzResourceGroup's RequestDisallowedByPolicy error usually omits the policy identifiers,
-        # so fall back to the Activity Log, which records the denied operation with the policy name.
-        if (-not $policySource) {
+        # so fall back to the Activity Log, which records the denied operation with the policy name -
+        # unless Microsoft.Insights isn't registered, in which case the lookup is skipped (reading it would
+        # register the provider) and the detail says why no policy name is shown.
+        $alNote = ""
+        if (-not $policySource -and @(Get-BlockedProvider -Providers "Microsoft.Insights").Count -gt 0) {
+            $alNote = $script:ActivityLogSkippedNote
+        }
+        elseif (-not $policySource) {
             Write-Host -ForegroundColor "Yellow" "  Resource group creation was blocked by policy. Querying the Activity Log for the specific policy - this can take up to 5 minutes while Azure ingests the event..."
             $startTime = if ($ActivityLogStartTime) { $ActivityLogStartTime } else { (Get-Date).ToUniversalTime().AddMinutes(-5) }
             $al = Get-PolicyFromActivityLog -ResourceGroupName $ResourceGroupNameForActivityLog -StartTime $startTime
@@ -1081,8 +1097,8 @@ function Add-PolicyFailureResult {
 
         $tagHint = if ($Tags -and $Tags.Count -gt 0) { " Check the supplied tags against required-tag/tag-value policies." } else { "" }
         $detail = if ($policySource) { "Blocked by Azure Policy '$polName'$assignmentNote.$tagHint" }
-        elseif ($polName) { "Blocked by Azure Policy (id '$polName').$tagHint" }
-        else { "Failed: $concise$tagHint" }
+        elseif ($polName) { "Blocked by Azure Policy (id '$polName').$tagHint$alNote" }
+        else { "Failed: $concise$tagHint$alNote" }
     }
     else {
         $detail = if ($polName) { "Blocked by Azure Policy '$polName'$assignmentNote." } else { "$FailedPrefix`: $concise" }
@@ -1362,11 +1378,24 @@ function Add-ProviderSkipResult {
     $blocked = @(Get-BlockedProvider -Providers $Providers)
     if ($blocked.Count -eq 0) { return $false }
     foreach ($ns in $blocked) { $script:ProviderTestsSkipped[$ns] = $true }
-    $reasons = ($blocked | ForEach-Object { "$_ $($script:BlockedProviders[$_])" }) -join " and "
-    $detail = "Not tested - $reasons on this subscription. Register the provider and re-run to test this."
+    $detail = "$(Get-ProviderSkipDetail -Providers $blocked) Register the provider and re-run to test this."
     if ($Also) { $detail += " Also skips $Also." }
     Add-Result -Category $Category -Check $Check -Result "Warn" -Detail $detail
     return $true
+}
+
+function Get-ProviderSkipDetail {
+    # "Not tested - <provider> is not registered on this subscription." when any of $Providers is blocked;
+    # otherwise $Fallback. Lets a dependent check whose prerequisite was never created say WHY, so a test
+    # skipped for an unregistered provider doesn't read like a resource that failed to deploy.
+    param(
+        [Parameter(Mandatory = $true)][string[]] $Providers,
+        [string] $Fallback
+    )
+    $blocked = @(Get-BlockedProvider -Providers $Providers)
+    if ($blocked.Count -eq 0) { return $Fallback }
+    $reasons = ($blocked | ForEach-Object { "$_ $($script:BlockedProviders[$_])" }) -join " and "
+    return "Not tested - $reasons on this subscription."
 }
 
 function Start-GatedThreadJob {
@@ -1478,7 +1507,10 @@ function Add-ProviderStateResult {
     }
     else {
         $why = if ($Registration) { " Registration did not complete: $($Registration.Error)." } elseif ($Declined) { " You declined to register it." } else { "" }
-        Add-Result -Category "ResourceProviders" -Check $Namespace -Result "Warn" -Detail "Not registered ($($ReadState.State)) - register it on the subscription before installing.$why$skipNote"
+        # A Fail, not a Warn: NME needs every one of these providers, so a subscription that doesn't have
+        # them registered (declined, or registration didn't complete) is not ready - whether or not a test
+        # happened to use the provider. (An unreadable state stays a Warn above: it isn't confirmed either way.)
+        Add-Result -Category "ResourceProviders" -Check $Namespace -Result "Fail" -Detail "Not registered ($($ReadState.State)) - register it on the subscription before installing.$why$skipNote"
         $script:BlockedProviders[$Namespace] = "is not registered"
     }
 }
@@ -1494,12 +1526,14 @@ function Resolve-ProviderRegistration {
     $targets = @($candidates | Where-Object { $script:PendingProviderRegistrations.ContainsKey($_) })
     if ($targets.Count -eq 0) { return }
     $jobs = @($targets | ForEach-Object { $script:PendingProviderRegistrations[$_].Job })
-    $results = Wait-JobsWithDots -Jobs $jobs -Activity "Waiting for resource provider registration"
+    # NOT "$results": PowerShell names are case-insensitive, so that would shadow the script-wide $Results
+    # list for Add-Result (called below via Add-ProviderStateResult) and its .Add() would throw.
+    $regResults = Wait-JobsWithDots -Jobs $jobs -Activity "Waiting for resource provider registration"
     $jobs | Remove-Job -Force -ErrorAction SilentlyContinue
     foreach ($ns in $targets) {
         $entry = $script:PendingProviderRegistrations[$ns]
         $script:PendingProviderRegistrations.Remove($ns)
-        $rr = $results | Where-Object { $_.Rp -eq $ns } | Select-Object -First 1
+        $rr = $regResults | Where-Object { $_.Rp -eq $ns } | Select-Object -First 1
         if (-not $rr) { $rr = @{ Rp = $ns; Ok = $false; State = $null; Error = "No result returned from the registration job." } }
         Add-ProviderStateResult -Namespace $ns -ReadState $entry.Before -Registration $rr
     }
@@ -1760,19 +1794,19 @@ function Test-PrivateEndpoints {
         # that isn't registered, since the read itself would make Az register it.
         $sqlResId = if (Get-BlockedProvider -Providers "Microsoft.Sql") { $null } else { (Get-AzResource -ResourceGroupName $ResourceGroupName -Name $sqlName -ResourceType "Microsoft.Sql/servers" -ErrorAction SilentlyContinue).ResourceId }
         if ($sqlResId) { $peServicePlan += @{ Service = "SQL Server"; PeName = "$peName-sql"; TargetId = $sqlResId; GroupId = "sqlServer"; Port = 1433 } }
-        else { Add-Result -Category "PrivateEndpoint" -Check "Private endpoint: SQL Server" -Result "Info" -Detail "Skipped - SQL Server was not created." }
+        else { Add-Result -Category "PrivateEndpoint" -Check "Private endpoint: SQL Server" -Result "Info" -Detail (Get-ProviderSkipDetail -Providers "Microsoft.Sql" -Fallback "Skipped - SQL Server was not created.") }
 
         $kvResId = if (Get-BlockedProvider -Providers "Microsoft.KeyVault") { $null } else { (Get-AzResource -ResourceGroupName $ResourceGroupName -Name $kvName -ResourceType "Microsoft.KeyVault/vaults" -ErrorAction SilentlyContinue).ResourceId }
         if ($kvResId) { $peServicePlan += @{ Service = "Key Vault"; PeName = "$peName-kv"; TargetId = $kvResId; GroupId = "vault"; Port = 443 } }
-        else { Add-Result -Category "PrivateEndpoint" -Check "Private endpoint: Key Vault" -Result "Info" -Detail "Skipped - Key Vault was not created." }
+        else { Add-Result -Category "PrivateEndpoint" -Check "Private endpoint: Key Vault" -Result "Info" -Detail (Get-ProviderSkipDetail -Providers "Microsoft.KeyVault" -Fallback "Skipped - Key Vault was not created.") }
 
         $stResId = if (Get-BlockedProvider -Providers "Microsoft.Storage") { $null } else { (Get-AzResource -ResourceGroupName $ResourceGroupName -Name $stName -ResourceType "Microsoft.Storage/storageAccounts" -ErrorAction SilentlyContinue).ResourceId }
         if ($stResId) { $peServicePlan += @{ Service = "Storage"; PeName = "$peName-blob"; TargetId = $stResId; GroupId = "blob"; Port = 443 } }
-        else { Add-Result -Category "PrivateEndpoint" -Check "Private endpoint: Storage" -Result "Info" -Detail "Skipped - Storage account was not created." }
+        else { Add-Result -Category "PrivateEndpoint" -Check "Private endpoint: Storage" -Result "Info" -Detail (Get-ProviderSkipDetail -Providers "Microsoft.Storage" -Fallback "Skipped - Storage account was not created.") }
 
         $aaResId = if (Get-BlockedProvider -Providers "Microsoft.Automation") { $null } else { (Get-AzResource -ResourceGroupName $ResourceGroupName -Name $aaUpdaterName -ResourceType "Microsoft.Automation/automationAccounts" -ErrorAction SilentlyContinue).ResourceId }
         if ($aaResId) { $peServicePlan += @{ Service = "Automation"; PeName = "$peName-auto"; TargetId = $aaResId; GroupId = "Webhook"; Port = 443 } }
-        else { Add-Result -Category "PrivateEndpoint" -Check "Private endpoint: Automation" -Result "Info" -Detail "Skipped - Automation Account was not created." }
+        else { Add-Result -Category "PrivateEndpoint" -Check "Private endpoint: Automation" -Result "Info" -Detail (Get-ProviderSkipDetail -Providers "Microsoft.Automation" -Fallback "Skipped - Automation Account was not created.") }
 
         # Fan the four PE creates out concurrently instead of paying per-PE create latency
         # serially. Each job does ONLY the create and returns a plain hashtable -
@@ -2874,8 +2908,13 @@ try {
             $policySource = if ($policyName -and $policyName -ne $policyInfo.PolicyDefinitionId -and $policyName -ne $policyInfo.PolicyAssignmentId) { "the ARM error" } else { $null }
 
             # New-AzResourceGroup's RequestDisallowedByPolicy error usually omits the policy identifiers,
-            # so fall back to the Activity Log, which records the denied operation with the policy name.
-            if (-not $policySource) {
+            # so fall back to the Activity Log, which records the denied operation with the policy name -
+            # skipped (and noted in the detail) when Microsoft.Insights isn't registered.
+            $alNote = ""
+            if (-not $policySource -and @(Get-BlockedProvider -Providers "Microsoft.Insights").Count -gt 0) {
+                $alNote = $script:ActivityLogSkippedNote
+            }
+            elseif (-not $policySource) {
                 Write-Host -ForegroundColor "Yellow" "  Resource group creation was blocked by policy. Querying the Activity Log for the specific policy - this can take up to 5 minutes while Azure ingests the event..."
                 $al = Get-PolicyFromActivityLog -ResourceGroupName $ResourceGroupName -StartTime $rgCreateStart
                 if ($al.Found) {
@@ -2892,8 +2931,8 @@ try {
 
             $tagHint = if ($Tags.Count -gt 0) { " Check the supplied tags against required-tag/tag-value policies." } else { "" }
             $detail = if ($policySource) { "Blocked by Azure Policy '$policyName'.$tagHint" }
-            elseif ($policyName) { "Blocked by Azure Policy (id '$policyName').$tagHint" }
-            else { "Failed: $(Get-ConciseErrorMessage -RawMessage $rgErrMsg)$tagHint" }
+            elseif ($policyName) { "Blocked by Azure Policy (id '$policyName').$tagHint$alNote" }
+            else { "Failed: $(Get-ConciseErrorMessage -RawMessage $rgErrMsg)$tagHint$alNote" }
             Add-Result -Category "Deployability" -Check "Resource group creation" -Result "Fail" -Detail $detail -PolicyName $policyName -Message (Get-ConciseErrorMessage -RawMessage $rgErrMsg) -RawMessage $rgErrMsg
             # We return before the ConfigSummary is normally populated, so record enough here that the
             # report still shows the SE what was attempted.
@@ -3361,7 +3400,7 @@ try {
         }
     }
     else {
-        Add-Result -Category "Deployability" -Check "SQL Database (Standard S1, DTU)" -Result "Info" -Detail "Skipped - SQL Server was not created."
+        Add-Result -Category "Deployability" -Check "SQL Database (Standard S1, DTU)" -Result "Info" -Detail (Get-ProviderSkipDetail -Providers "Microsoft.Sql" -Fallback "Skipped - SQL Server was not created.")
     }
 
     # SQL "Allow Azure services" firewall rule (AllowAllWindowsAzureIps, 0.0.0.0-0.0.0.0). The installer
@@ -3588,7 +3627,7 @@ try {
         else { Add-PolicyFailureResult -Category "Deployability" -Check "Web App (httpsOnly, TLS 1.3, FTPS disabled)" -RawMessage $webRes.Error }
     }
     else {
-        Add-Result -Category "Deployability" -Check "Web App (httpsOnly, TLS 1.3, FTPS disabled)" -Result "Info" -Detail "Skipped - App Service Plan was not created."
+        Add-Result -Category "Deployability" -Check "Web App (httpsOnly, TLS 1.3, FTPS disabled)" -Result "Info" -Detail (Get-ProviderSkipDetail -Providers "Microsoft.Web" -Fallback "Skipped - App Service Plan was not created.")
     }
 
     # Application Insights (workspace-based, linked to the Log Analytics workspace above).
@@ -3613,7 +3652,7 @@ try {
         else { Add-PolicyFailureResult -Category "Deployability" -Check "Application Insights (workspace-based)" -RawMessage $aiRes.Error }
     }
     else {
-        Add-Result -Category "Deployability" -Check "Application Insights (workspace-based)" -Result "Info" -Detail "Skipped - Log Analytics workspace was not created."
+        Add-Result -Category "Deployability" -Check "Application Insights (workspace-based)" -Result "Info" -Detail (Get-ProviderSkipDetail -Providers "Microsoft.OperationalInsights" -Fallback "Skipped - Log Analytics workspace was not created.")
     }
 
     # Storage blob container. The installer creates it as an ARM child (control plane), so use the
@@ -3867,7 +3906,7 @@ finally {
     # (and Ctrl+P -> Save as PDF if they want a PDF, no extra tooling required).
     $HtmlOutFile = [System.IO.Path]::ChangeExtension($OutFile, ".html")
     try {
-        $html = New-ReadinessHtmlReport -Results $Results -ConfigSummary $ConfigSummary -CustomResourceNames $CustomResourceNames -Meta $summaryMeta -CreatedResources $TrackerForReport -NextSteps $NextSteps -RawJson $rawJson
+        $html = New-ReadinessHtmlReport -Results $Results -ConfigSummary $ConfigSummary -CustomResourceNames $CustomResourceNames -Meta $summaryMeta -CreatedResources $TrackerForReport -NextSteps $NextSteps -RawJson $rawJson -SkippedProviders @($script:ProviderTestsSkipped.Keys)
         $html | Out-File -FilePath $HtmlOutFile -Force -Encoding utf8
     }
     catch { Write-Host -ForegroundColor "Yellow" "Could not write HTML report: $($_.Exception.Message)"; $HtmlOutFile = $null }
