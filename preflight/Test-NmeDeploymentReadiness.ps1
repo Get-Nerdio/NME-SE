@@ -1040,6 +1040,36 @@ $script:ErrorHelperInitScript = {
         try { if ($ErrorRecord.Exception.Body) { $errMsg = "$errMsg`n$($ErrorRecord.Exception.Body | ConvertTo-Json -Depth 10 -Compress)" } } catch {}
         return $errMsg
     }
+
+    # Az's HTTP client gives up on any single request after 100 seconds ("The request was canceled due to
+    # the configured HttpClient.Timeout of 100 seconds elapsing"). That is CLIENT-side only: Azure keeps
+    # creating the resource, which SQL servers in a slow region routinely outlast. So a create that fails
+    # with that message is not a failure of the environment - wait for the resource to show up instead.
+    # Takes the failed job result; returns it unchanged for any other error. For a timeout it sets TimedOut
+    # and Exists, and flips Ok to $true (Recovered) when the resource turned up and finished provisioning.
+    function Resolve-CreateTimeout {
+        param(
+            [Parameter(Mandatory = $true)] $Result,
+            [Parameter(Mandatory = $true)][string] $ResourceGroupName,
+            [Parameter(Mandatory = $true)][string] $ResourceType,
+            [int] $WaitSeconds = 300
+        )
+        if ($Result.Error -notmatch "HttpClient\.Timeout|The request was canceled|TaskCanceledException") { return $Result }
+        $Result.TimedOut = $true
+        $Result.Exists = $false
+        $pollSeconds = 10
+        for ($i = 0; $i -lt [Math]::Ceiling($WaitSeconds / $pollSeconds); $i++) {
+            Start-Sleep -Seconds $pollSeconds
+            $res = $null
+            try { $res = Get-AzResource -ResourceGroupName $ResourceGroupName -Name $Result.Name -ResourceType $ResourceType -ExpandProperties -ErrorAction Stop } catch {}
+            if (-not $res) { continue }
+            $Result.Exists = $true
+            $ps = $res.Properties.provisioningState
+            if (-not $ps -or $ps -eq "Succeeded") { $Result.Ok = $true; $Result.Recovered = $true; break }
+            if ($ps -eq "Failed") { break }
+        }
+        return $Result
+    }
 }
 
 function Add-PolicyFailureResult {
@@ -3124,7 +3154,7 @@ try {
         try { New-AzOperationalInsightsWorkspace -ResourceGroupName $rg -Name $name -Location $loc -Sku "PerGB2018" -RetentionInDays 30 -Tag $tags -ErrorAction Stop | Out-Null; @{ Target = "Log Analytics workspace"; Ok = $true; Name = $name; Kind = "law" } }
         catch {
             $errMsg = Get-DetailedErrorMessage -ErrorRecord $_
-            @{ Target = "Log Analytics workspace"; Ok = $false; Error = $errMsg; Name = $name; Kind = "law" }
+            Resolve-CreateTimeout -Result @{ Target = "Log Analytics workspace"; Ok = $false; Error = $errMsg; Name = $name; Kind = "law" } -ResourceGroupName $rg -ResourceType "Microsoft.OperationalInsights/workspaces"
         }
     } -ArgumentList $ResourceGroupName, $lawName, $Location, $Tags -InitializationScript $script:ErrorHelperInitScript
 
@@ -3137,7 +3167,7 @@ try {
         }
         catch {
             $errMsg = Get-DetailedErrorMessage -ErrorRecord $_
-            @{ Target = "Storage account ($sku)"; Ok = $false; Error = $errMsg; Name = $name; Kind = "storage" }
+            Resolve-CreateTimeout -Result @{ Target = "Storage account ($sku)"; Ok = $false; Error = $errMsg; Name = $name; Kind = "storage" } -ResourceGroupName $rg -ResourceType "Microsoft.Storage/storageAccounts"
         }
     } -ArgumentList $ResourceGroupName, $stName, $Location, $StorageSku, $Tags, $pna -InitializationScript $script:ErrorHelperInitScript
 
@@ -3150,7 +3180,7 @@ try {
         }
         catch {
             $errMsg = Get-DetailedErrorMessage -ErrorRecord $_
-            @{ Target = "SQL Server"; Ok = $false; Error = $errMsg; Name = $name; Kind = "sqlserver" }
+            Resolve-CreateTimeout -Result @{ Target = "SQL Server"; Ok = $false; Error = $errMsg; Name = $name; Kind = "sqlserver" } -ResourceGroupName $rg -ResourceType "Microsoft.Sql/servers"
         }
     } -ArgumentList $ResourceGroupName, $sqlName, $Location, $sqlCred, $Tags, $pna -InitializationScript $script:ErrorHelperInitScript
 
@@ -3163,7 +3193,7 @@ try {
         }
         catch {
             $errMsg = Get-DetailedErrorMessage -ErrorRecord $_
-            @{ Target = "App Service Plan (B3, Windows)"; Ok = $false; Error = $errMsg; Name = $name; Kind = "asp" }
+            Resolve-CreateTimeout -Result @{ Target = "App Service Plan (B3, Windows)"; Ok = $false; Error = $errMsg; Name = $name; Kind = "asp" } -ResourceGroupName $rg -ResourceType "Microsoft.Web/serverfarms"
         }
     } -ArgumentList $ResourceGroupName, $aspName, $Location, $Tags -InitializationScript $script:ErrorHelperInitScript
 
@@ -3195,7 +3225,7 @@ try {
         }
         catch {
             $errMsg = Get-DetailedErrorMessage -ErrorRecord $_
-            @{ Target = "Key Vault"; Ok = $false; Error = $errMsg; Name = $name; Kind = "kv" }
+            Resolve-CreateTimeout -Result @{ Target = "Key Vault"; Ok = $false; Error = $errMsg; Name = $name; Kind = "kv" } -ResourceGroupName $rg -ResourceType "Microsoft.KeyVault/vaults"
         }
     } -ArgumentList $ResourceGroupName, $kvName, $Location, $Tags, $pna, $AzEnv.ResourceManagerUrl, $SubscriptionId, $TenantId -InitializationScript $script:ErrorHelperInitScript
 
@@ -3209,7 +3239,7 @@ try {
         }
         catch {
             $errMsg = Get-DetailedErrorMessage -ErrorRecord $_
-            @{ Target = "Automation Account (updater)"; Ok = $false; Error = $errMsg; Name = $name; Kind = "automation" }
+            Resolve-CreateTimeout -Result @{ Target = "Automation Account (updater)"; Ok = $false; Error = $errMsg; Name = $name; Kind = "automation" } -ResourceGroupName $rg -ResourceType "Microsoft.Automation/automationAccounts"
         }
     } -ArgumentList $ResourceGroupName, $aaUpdaterName, $Location, $Tags -InitializationScript $script:ErrorHelperInitScript
 
@@ -3221,7 +3251,7 @@ try {
         }
         catch {
             $errMsg = Get-DetailedErrorMessage -ErrorRecord $_
-            @{ Target = "Automation Account (scripted actions)"; Ok = $false; Error = $errMsg; Name = $name; Kind = "automation" }
+            Resolve-CreateTimeout -Result @{ Target = "Automation Account (scripted actions)"; Ok = $false; Error = $errMsg; Name = $name; Kind = "automation" } -ResourceGroupName $rg -ResourceType "Microsoft.Automation/automationAccounts"
         }
     } -ArgumentList $ResourceGroupName, $aaScriptedActionsName, $Location, $Tags -InitializationScript $script:ErrorHelperInitScript
 
@@ -3234,7 +3264,8 @@ try {
 
     foreach ($jr in $jobResults) {
         if ($jr.Ok) {
-            Add-Result -Category "Deployability" -Check $jr.Target -Result "Pass" -Detail "Created successfully."
+            $passDetail = if ($jr.Recovered) { "Created successfully (Azure took longer than the 100-second client request timeout; confirmed by checking for the resource afterwards)." } else { "Created successfully." }
+            Add-Result -Category "Deployability" -Check $jr.Target -Result "Pass" -Detail $passDetail
             Add-TrackedResource -Type $jr.Kind -ResourceGroupName $ResourceGroupName -Name $jr.Name
             if ($jr.Kind -eq "kv") {
                 New-PreflightLock -ResourceId "/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.KeyVault/vaults/$($jr.Name)" -LockName "$($jr.Name)-lock" -Label "Key Vault"
@@ -3242,6 +3273,14 @@ try {
             elseif ($jr.Kind -eq "storage") {
                 New-PreflightLock -ResourceId "/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.Storage/storageAccounts/$($jr.Name)" -LockName "$($jr.Name)-lock" -Label "Storage account"
             }
+        }
+        elseif ($jr.TimedOut) {
+            # Not a policy block or a real failure - the client gave up waiting and the resource never
+            # finished appearing. Say it is unconfirmed (and re-runnable) rather than failing the subscription.
+            # If it did start to appear it is tracked so cleanup removes it.
+            if ($jr.Exists) { Add-TrackedResource -Type $jr.Kind -ResourceGroupName $ResourceGroupName -Name $jr.Name }
+            Add-Result -Category "Deployability" -Check $jr.Target -Result "Warn" -Detail "Not confirmed - the request to Azure timed out (Az's 100-second client timeout) and the resource had not finished provisioning after 5 more minutes. This is not a policy block. Re-run to test it again; tests that depend on it were skipped." -Message $jr.Error -RawMessage $jr.Error
+            $NextSteps.Add("$($jr.Target) could not be confirmed (Azure was too slow to respond), so it and the tests that depend on it were not verified. Re-run this script.")
         }
         else {
             Add-PolicyFailureResult -Category "Deployability" -Check $jr.Target -RawMessage $jr.Error
