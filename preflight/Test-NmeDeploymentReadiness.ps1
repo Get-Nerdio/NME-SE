@@ -7,7 +7,9 @@
         deployment. It runs, in parallel where possible:
           * Permission checks   - Entra directory roles (WITHOUT the Microsoft.Graph module) and
                                    Azure Owner on the subscription.
-          * Resource providers  - registration state of the providers NME requires.
+          * Resource providers  - registration state of the providers NME requires. Reports any that are
+                                   unregistered and asks before registering them; registers nothing unless
+                                   told to, and skips the tests that need a provider left unregistered.
           * Deployability tests  - deploys throwaway copies of the exact resources (matching SKUs)
                                    NME's installer creates, to surface Azure Policy blocks. Reports
                                    the blocking policy by name where possible. This is how blocking
@@ -95,6 +97,12 @@ if (-not $OutFile) {
 $Results = [System.Collections.Generic.List[object]]::new()
 # Resources we create, recorded as we go, removed in reverse order during cleanup.
 $Tracker = [System.Collections.Generic.List[object]]::new()
+# Resource providers this run must not touch (not registered, or state unconfirmed) -> the phrase used in
+# skip messages. Filled by Invoke-ResourceProviderCheck; see "Resource provider gating" below.
+$script:BlockedProviders = @{}
+$script:ProviderTestsSkipped = @{}          # blocked providers that actually caused a test to be skipped
+$script:PendingProviderRegistrations = @{}  # namespace -> @{ Job; Before } for registrations still running in the background
+$script:ProvidersRegisteredByScript = @()   # providers this run registered, at the user's request
 
 function Add-Result {
     param(
@@ -610,6 +618,10 @@ function Get-PolicyFromActivityLog {
         Found                  = $false
     }
     if (-not $StartTime) { $StartTime = (Get-Date).ToUniversalTime().AddMinutes(-15) }
+
+    # Get-AzLog reads Microsoft.Insights. Against a subscription where that provider isn't registered,
+    # Az would register it as a side effect of the read - so don't query at all in that case.
+    if (Get-BlockedProvider -Providers "Microsoft.Insights") { return $out }
 
     for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
         $events = @()
@@ -1302,6 +1314,244 @@ function Read-Choice {
     }
 }
 
+#region Resource provider gating -------------------------------------------------------------------
+# Az cmdlets - and Invoke-AzRestMethod - silently REGISTER a resource provider on the subscription
+# whenever ARM answers 409 MissingSubscriptionRegistration ("...not registered to use namespace..."). That
+# is Az.Accounts' RPRegistrationDelegatingHandler: AzureRMCmdlet.BeginProcessing attaches it to every Az
+# cmdlet and it has no off switch. It fires for reads (Get-AzResource, Get-AzLog, ...) as well as creates.
+# Registration is a subscription-level change that deleting the test resource group does not undo, so it
+# must never happen implicitly. Instead the provider check reads every provider's state first, asks
+# before registering anything, and any deploy OR read that would touch a provider that is still not
+# registered is skipped and reported instead of attempted.
+
+# What each provider is used for, so the prompt and skip messages can name the affected tests.
+# $null = no test uses it (NME needs it after install).
+$script:ProviderTests = @{
+    "Microsoft.KeyVault"              = "Key Vault tests (vault, key, secret, certificate, role assignments)"
+    "Microsoft.Automation"            = "Automation Account tests (and the role-assignment test that depends on them)"
+    "Microsoft.Compute"               = $null
+    "Microsoft.DesktopVirtualization" = $null
+    "Microsoft.Insights"              = "Application Insights and Data Collection Endpoint/Rule tests"
+    "Microsoft.Network"               = "private endpoint, Private DNS and VNet tests (only if you chose private endpoints)"
+    "Microsoft.OperationalInsights"   = "Log Analytics workspace test (and Application Insights and the Data Collection Rule, which depend on it)"
+    "Microsoft.RecoveryServices"      = $null
+    "Microsoft.Storage"               = "Storage account tests (account, lock, blob container)"
+    "Microsoft.Sql"                   = "SQL tests (server, database, firewall rule, Entra admin and token, data path)"
+    "Microsoft.Web"                   = "App Service Plan, Web App and VNet-integration tests"
+}
+
+function Get-BlockedProvider {
+    # The subset of $Providers this run must not touch. Returns an array - empty (falsy) when all are usable.
+    # A provider whose registration is still running in the background is waited for first, so the answer
+    # is always final.
+    param([Parameter(Mandatory = $true)][string[]] $Providers)
+    Resolve-ProviderRegistration -Providers $Providers
+    return @($Providers | Where-Object { $script:BlockedProviders.ContainsKey($_) })
+}
+
+function Add-ProviderSkipResult {
+    # If any of $Providers is blocked, records ONE Warn row for the test (so it is reported as not
+    # tested rather than silently missing) and returns $true - the caller then skips the test. $Also
+    # names dependent tests that go with it. Returns $false, and records nothing, when it is safe to run.
+    param(
+        [Parameter(Mandatory = $true)][string] $Category,
+        [Parameter(Mandatory = $true)][string] $Check,
+        [Parameter(Mandatory = $true)][string[]] $Providers,
+        [string] $Also
+    )
+    $blocked = @(Get-BlockedProvider -Providers $Providers)
+    if ($blocked.Count -eq 0) { return $false }
+    foreach ($ns in $blocked) { $script:ProviderTestsSkipped[$ns] = $true }
+    $reasons = ($blocked | ForEach-Object { "$_ $($script:BlockedProviders[$_])" }) -join " and "
+    $detail = "Not tested - $reasons on this subscription. Register the provider and re-run to test this."
+    if ($Also) { $detail += " Also skips $Also." }
+    Add-Result -Category $Category -Check $Check -Result "Warn" -Detail $detail
+    return $true
+}
+
+function Start-GatedThreadJob {
+    # Start-ThreadJob for a test that needs resource provider(s): when one is blocked, records the skip
+    # (see Add-ProviderSkipResult) and starts nothing - so `$jobs += Start-GatedThreadJob ...` simply adds
+    # nothing to the list. Everything else is passed straight through to Start-ThreadJob.
+    param(
+        [Parameter(Mandatory = $true)][string] $Name,
+        [Parameter(Mandatory = $true)][string[]] $Providers,
+        [Parameter(Mandatory = $true)][string] $Check,
+        [string] $Also,
+        [Parameter(Mandatory = $true)][scriptblock] $ScriptBlock,
+        [object[]] $ArgumentList,
+        [scriptblock] $InitializationScript
+    )
+    if (Add-ProviderSkipResult -Category "Deployability" -Check $Check -Providers $Providers -Also $Also) { return }
+    $jobArgs = @{ Name = $Name; ScriptBlock = $ScriptBlock }
+    if ($PSBoundParameters.ContainsKey("ArgumentList")) { $jobArgs.ArgumentList = $ArgumentList }
+    if ($InitializationScript) { $jobArgs.InitializationScript = $InitializationScript }
+    Start-ThreadJob @jobArgs
+}
+
+function Get-ResourceProviderState {
+    # Reads each namespace's registration state concurrently (one ThreadJob per provider). This is a plain
+    # GET on /providers/{namespace}, which ARM answers for unregistered providers too, so it can never
+    # trigger auto-registration. Returns @{ namespace = @{ Rp; Ok; State; Error } }.
+    param([Parameter(Mandatory = $true)][string[]] $Namespaces)
+    $rpJobs = @()
+    foreach ($rp in $Namespaces) {
+        $rpJobs += Start-ThreadJob -Name "Rp-$rp" -ThrottleLimit 16 -ScriptBlock {
+            param($rp)
+            try {
+                $state = (Get-AzResourceProvider -ProviderNamespace $rp -ErrorAction Stop | Select-Object -First 1).RegistrationState
+                @{ Rp = $rp; Ok = $true; State = $state }
+            }
+            catch {
+                @{ Rp = $rp; Ok = $false; Error = $_.Exception.Message }
+            }
+        } -ArgumentList $rp
+    }
+    $rpJobResults = Wait-JobsWithDots -Jobs $rpJobs -Activity "Checking resource providers"
+    $rpJobs | Remove-Job -Force -ErrorAction SilentlyContinue
+    $states = @{}
+    foreach ($rp in $Namespaces) {
+        $rr = $rpJobResults | Where-Object { $_.Rp -eq $rp } | Select-Object -First 1
+        $states[$rp] = if ($rr) { $rr } else { @{ Rp = $rp; Ok = $false; Error = "No result returned from the registration-state query job." } }
+    }
+    return $states
+}
+
+function Start-ResourceProviderRegistration {
+    # Starts registering the given providers - one ThreadJob each, all concurrently - and returns
+    # IMMEDIATELY. Registration happens on Azure's side (it commonly takes from tens of seconds to a couple
+    # of minutes), so the run carries on with its remaining prompts meanwhile instead of idling. Each job
+    # registers, then polls until 'Registered' or the timeout; Resolve-ProviderRegistration collects the
+    # outcome later. Only ever called after the user said yes. $ReadStates (Get-ResourceProviderState's
+    # result) is kept for the report row.
+    param(
+        [Parameter(Mandatory = $true)][string[]] $Namespaces,
+        [Parameter(Mandatory = $true)][hashtable] $ReadStates,
+        [int] $TimeoutSeconds = 300,
+        [int] $PollSeconds = 3
+    )
+    foreach ($rp in $Namespaces) {
+        $job = Start-ThreadJob -Name "RpRegister-$rp" -ThrottleLimit 16 -ScriptBlock {
+            param($rp, $timeout, $poll)
+            try {
+                Register-AzResourceProvider -ProviderNamespace $rp -ErrorAction Stop | Out-Null
+                $deadline = [DateTime]::UtcNow.AddSeconds($timeout)
+                while ($true) {
+                    $state = (Get-AzResourceProvider -ProviderNamespace $rp -ErrorAction Stop | Select-Object -First 1).RegistrationState
+                    if ($state -eq "Registered" -or [DateTime]::UtcNow -ge $deadline) { break }
+                    Start-Sleep -Seconds $poll
+                }
+                if ($state -eq "Registered") { @{ Rp = $rp; Ok = $true; State = $state } }
+                else { @{ Rp = $rp; Ok = $false; State = $state; Error = "still '$state' after $timeout seconds (registration may finish on its own later)" } }
+            }
+            catch {
+                @{ Rp = $rp; Ok = $false; State = $null; Error = $_.Exception.Message }
+            }
+        } -ArgumentList $rp, $TimeoutSeconds, $PollSeconds
+        $script:PendingProviderRegistrations[$rp] = @{ Job = $job; Before = $ReadStates[$rp] }
+    }
+}
+
+function Add-ProviderStateResult {
+    # Records the "Resource providers" row for one provider and, when the provider is unusable, adds it to
+    # $script:BlockedProviders. $Registration is the outcome of a registration this script attempted for it
+    # (or $null); $Declined means the user was asked and said no.
+    param(
+        [Parameter(Mandatory = $true)][string] $Namespace,
+        [Parameter(Mandatory = $true)] $ReadState,
+        $Registration,
+        [switch] $Declined
+    )
+    $tests = $script:ProviderTests[$Namespace]
+    # Rows are written before the user's later choices (e.g. private endpoints), so say what WILL be skipped.
+    $skipNote = if ($tests) { " Tests that use it will be skipped: $tests." } else { "" }
+    if (-not $ReadState.Ok) {
+        Add-Result -Category "ResourceProviders" -Check $Namespace -Result "Warn" -Detail "Could not read registration state: $($ReadState.Error) - treated as not registered, because this script won't touch a provider it can't confirm is registered.$skipNote" -Message $ReadState.Error
+        $script:BlockedProviders[$Namespace] = "could not be confirmed as registered"
+    }
+    elseif ($ReadState.State -eq "Registered") {
+        Add-Result -Category "ResourceProviders" -Check $Namespace -Result "Pass" -Detail "Registered."
+    }
+    elseif ($Registration -and $Registration.Ok) {
+        Add-Result -Category "ResourceProviders" -Check $Namespace -Result "Info" -Detail "Was not registered ($($ReadState.State)). Registered by this script at your request - a subscription-level change that cleanup does not revert."
+        $script:ProvidersRegisteredByScript += $Namespace
+    }
+    else {
+        $why = if ($Registration) { " Registration did not complete: $($Registration.Error)." } elseif ($Declined) { " You declined to register it." } else { "" }
+        Add-Result -Category "ResourceProviders" -Check $Namespace -Result "Warn" -Detail "Not registered ($($ReadState.State)) - register it on the subscription before installing.$why$skipNote"
+        $script:BlockedProviders[$Namespace] = "is not registered"
+    }
+}
+
+function Resolve-ProviderRegistration {
+    # Collects background registrations started by Start-ResourceProviderRegistration - just $Providers, or
+    # all of them when none are given - waiting for any still in flight, then records each one's row and
+    # blocks any that did not reach 'Registered'. Called wherever a provider's final state is needed (every
+    # gate, via Get-BlockedProvider; a sweep before the deploy tests; the report). A no-op when nothing
+    # is pending, so it is cheap to call often.
+    param([string[]] $Providers)
+    $candidates = if ($Providers) { $Providers } else { @($script:PendingProviderRegistrations.Keys | Sort-Object) }
+    $targets = @($candidates | Where-Object { $script:PendingProviderRegistrations.ContainsKey($_) })
+    if ($targets.Count -eq 0) { return }
+    $jobs = @($targets | ForEach-Object { $script:PendingProviderRegistrations[$_].Job })
+    $results = Wait-JobsWithDots -Jobs $jobs -Activity "Waiting for resource provider registration"
+    $jobs | Remove-Job -Force -ErrorAction SilentlyContinue
+    foreach ($ns in $targets) {
+        $entry = $script:PendingProviderRegistrations[$ns]
+        $script:PendingProviderRegistrations.Remove($ns)
+        $rr = $results | Where-Object { $_.Rp -eq $ns } | Select-Object -First 1
+        if (-not $rr) { $rr = @{ Rp = $ns; Ok = $false; State = $null; Error = "No result returned from the registration job." } }
+        Add-ProviderStateResult -Namespace $ns -ReadState $entry.Before -Registration $rr
+    }
+}
+
+function Invoke-ResourceProviderCheck {
+    # The provider check: read every provider's state, report the unregistered ones, ask whether to register
+    # them, and - only on a yes - START registering them in the background. Providers that are already
+    # settled get their result row now; the ones being registered get theirs when Resolve-ProviderRegistration
+    # collects them. Whatever ends up unusable lands in $script:BlockedProviders so the tests that need it
+    # are skipped.
+    param(
+        [Parameter(Mandatory = $true)][string[]] $Namespaces,
+        [int] $RegisterTimeoutSeconds = 300,
+        [int] $RegisterPollSeconds = 3
+    )
+    Write-Host -ForegroundColor "Cyan" "Running resource provider check..."
+    $script:BlockedProviders = @{}
+    $states = Get-ResourceProviderState -Namespaces $Namespaces
+
+    # Unreadable state is never offered for registration (nothing says it needs it) - it is simply
+    # treated as unusable. Everything readable-but-not-Registered (incl. a registration already in
+    # progress) is what the prompt covers.
+    $unregistered = @($Namespaces | Where-Object { $states[$_].Ok -and $states[$_].State -ne "Registered" })
+    $declined = $false
+    if ($unregistered.Count -gt 0) {
+        Write-Host ""
+        Write-Host -ForegroundColor "Yellow" "These resource providers are NOT registered on this subscription:"
+        Write-Host ""
+        foreach ($ns in $unregistered) {
+            $tests = $script:ProviderTests[$ns]
+            $uses = if ($tests) { "needed by: $tests" } else { "needed by NME after install (no test uses it)" }
+            Write-Host -ForegroundColor "Yellow" ("  {0,-34} [{1}]  {2}" -f $ns, $states[$ns].State, $uses)
+        }
+        Write-HelpText -Text "Registering a resource provider is a CHANGE to your subscription - it is not limited to the test resource group, and this script will not undo it (cleanup only removes the test resources). Nerdio Manager needs these providers, so they must be registered before an install anyway.`r`n`r`nIf you answer No, this script registers nothing: it skips every test that uses an unregistered provider and reports it as not tested. The rest of the run still completes."
+        if (Read-YesNo -Prompt "Register the $($unregistered.Count) unregistered provider(s) on this subscription now? [y/N]" -Default "n") {
+            Start-ResourceProviderRegistration -Namespaces $unregistered -ReadStates $states -TimeoutSeconds $RegisterTimeoutSeconds -PollSeconds $RegisterPollSeconds
+            Write-Host -ForegroundColor "Cyan" "Registering $($unregistered.Count) provider(s) in the background. The run continues meanwhile, and only waits if a test needs a provider before it is ready."
+        }
+        else {
+            $declined = $true
+            Write-Host -ForegroundColor "Cyan" "Nothing will be registered. Tests that use an unregistered provider will be skipped."
+        }
+    }
+
+    foreach ($ns in $Namespaces) {
+        if ($script:PendingProviderRegistrations.ContainsKey($ns)) { continue }   # row is recorded when the registration is collected
+        Add-ProviderStateResult -Namespace $ns -ReadState $states[$ns] -Declined:$declined
+    }
+}
+#endregion
+
 function Test-PrivateDnsZones {
     param(
         [Parameter(Mandatory = $true)] $Vnet,
@@ -1348,8 +1598,21 @@ function Test-PrivateDnsZones {
             try { Set-AzContext -Subscription $PrivateDnsZoneSubId -ErrorAction Stop | Out-Null; $dnsZoneCtxSwitched = $true }
             catch { Add-Result -Category "PrivateDns" -Check "Private DNS zones subscription" -Result "Warn" -Detail "Could not access subscription '$PrivateDnsZoneSubId' - zone results below may be inaccurate. Grant this account Reader on it." -Message $_.Exception.Message }
         }
+        # The zone lookups are ARM reads on Microsoft.Network. If that provider isn't registered in the
+        # zones' subscription, Az would register it THERE - a different subscription from the one under
+        # test - as a side effect of the read. This script never does that, so check first and skip.
+        $dnsZoneLookupBlocked = $false
+        if ($dnsZoneCtxSwitched) {
+            $dnsNetState = $null
+            try { $dnsNetState = (Get-AzResourceProvider -ProviderNamespace "Microsoft.Network" -ErrorAction Stop | Select-Object -First 1).RegistrationState } catch {}
+            if ($dnsNetState -ne "Registered") {
+                $dnsZoneLookupBlocked = $true
+                Add-Result -Category "PrivateDns" -Check "Private DNS zones" -Result "Warn" -Detail "Not verified - Microsoft.Network is $(if ($dnsNetState) { "not registered ($dnsNetState)" } else { 'not confirmed as registered' }) in the zones' subscription, and this script never registers providers in another subscription. Confirm the required zones exist and are linked to the VNet before installing."
+            }
+        }
         try {
-        if ($CreateNewVnet) {
+        if ($dnsZoneLookupBlocked) { }   # reported above
+        elseif ($CreateNewVnet) {
             # New-VNet + Existing zones: the real zones already exist in a subscription/RG the
             # customer manages. Report which required zones are MISSING from that RG. Linkage
             # can't be checked here (this VNet is throwaway) - that's handled at install.
@@ -1493,19 +1756,21 @@ function Test-PrivateEndpoints {
     }
     else {
         $peServicePlan = @()
-        $sqlResId = (Get-AzResource -ResourceGroupName $ResourceGroupName -Name $sqlName -ResourceType "Microsoft.Sql/servers" -ErrorAction SilentlyContinue).ResourceId
+        # Each lookup below is an ARM read in the target's provider namespace - skipped for a provider
+        # that isn't registered, since the read itself would make Az register it.
+        $sqlResId = if (Get-BlockedProvider -Providers "Microsoft.Sql") { $null } else { (Get-AzResource -ResourceGroupName $ResourceGroupName -Name $sqlName -ResourceType "Microsoft.Sql/servers" -ErrorAction SilentlyContinue).ResourceId }
         if ($sqlResId) { $peServicePlan += @{ Service = "SQL Server"; PeName = "$peName-sql"; TargetId = $sqlResId; GroupId = "sqlServer"; Port = 1433 } }
         else { Add-Result -Category "PrivateEndpoint" -Check "Private endpoint: SQL Server" -Result "Info" -Detail "Skipped - SQL Server was not created." }
 
-        $kvResId = (Get-AzResource -ResourceGroupName $ResourceGroupName -Name $kvName -ResourceType "Microsoft.KeyVault/vaults" -ErrorAction SilentlyContinue).ResourceId
+        $kvResId = if (Get-BlockedProvider -Providers "Microsoft.KeyVault") { $null } else { (Get-AzResource -ResourceGroupName $ResourceGroupName -Name $kvName -ResourceType "Microsoft.KeyVault/vaults" -ErrorAction SilentlyContinue).ResourceId }
         if ($kvResId) { $peServicePlan += @{ Service = "Key Vault"; PeName = "$peName-kv"; TargetId = $kvResId; GroupId = "vault"; Port = 443 } }
         else { Add-Result -Category "PrivateEndpoint" -Check "Private endpoint: Key Vault" -Result "Info" -Detail "Skipped - Key Vault was not created." }
 
-        $stResId = (Get-AzResource -ResourceGroupName $ResourceGroupName -Name $stName -ResourceType "Microsoft.Storage/storageAccounts" -ErrorAction SilentlyContinue).ResourceId
+        $stResId = if (Get-BlockedProvider -Providers "Microsoft.Storage") { $null } else { (Get-AzResource -ResourceGroupName $ResourceGroupName -Name $stName -ResourceType "Microsoft.Storage/storageAccounts" -ErrorAction SilentlyContinue).ResourceId }
         if ($stResId) { $peServicePlan += @{ Service = "Storage"; PeName = "$peName-blob"; TargetId = $stResId; GroupId = "blob"; Port = 443 } }
         else { Add-Result -Category "PrivateEndpoint" -Check "Private endpoint: Storage" -Result "Info" -Detail "Skipped - Storage account was not created." }
 
-        $aaResId = (Get-AzResource -ResourceGroupName $ResourceGroupName -Name $aaUpdaterName -ResourceType "Microsoft.Automation/automationAccounts" -ErrorAction SilentlyContinue).ResourceId
+        $aaResId = if (Get-BlockedProvider -Providers "Microsoft.Automation") { $null } else { (Get-AzResource -ResourceGroupName $ResourceGroupName -Name $aaUpdaterName -ResourceType "Microsoft.Automation/automationAccounts" -ErrorAction SilentlyContinue).ResourceId }
         if ($aaResId) { $peServicePlan += @{ Service = "Automation"; PeName = "$peName-auto"; TargetId = $aaResId; GroupId = "Webhook"; Port = 443 } }
         else { Add-Result -Category "PrivateEndpoint" -Check "Private endpoint: Automation" -Result "Info" -Detail "Skipped - Automation Account was not created." }
 
@@ -1870,7 +2135,8 @@ Write-Host "This script checks whether this Azure environment can host a Nerdio 
 Write-Host "It will:"
 Write-Host ""
 Write-Host "  1. Check your Entra directory roles and Azure subscription role (read-only)."
-Write-Host "  2. Check required resource providers are registered (read-only)."
+Write-Host "  2. Check required resource providers are registered (read-only). If any are missing it asks before registering"
+Write-Host "     them; if you decline, nothing is registered and the tests that need them are skipped."
 Write-Host "  3. Show you the exact resource names (and tags) it will use and let you customize them."
 Write-Host "  4. Create a temporary resource group (or use an existing empty one you provide) and attempt to deploy"
 Write-Host "     throwaway copies of the resources Nerdio Manager needs (Log Analytics, Storage, SQL server/database/firewall rule,"
@@ -1881,8 +2147,9 @@ Write-Host "  6. DELETE everything it created, then provide a report you can sen
 Write-Host ""
 Write-Host -ForegroundColor "Cyan" "This script is publicly available for inspection at:`r`nhttps://raw.githubusercontent.com/Get-Nerdio/NME-SE/refs/heads/main/preflight/Test-NmeDeploymentReadiness.ps1"
 Write-Host ""
-Write-Host -ForegroundColor "Yellow" "This script will NOT modify anything outside the test resource group, other than (if you opt in)"
-Write-Host -ForegroundColor "Yellow" "creating and then removing private endpoints in the existing subnet you specify."
+Write-Host -ForegroundColor "Yellow" "This script will NOT modify anything outside the test resource group, other than (only if you opt in):"
+Write-Host -ForegroundColor "Yellow" "  - creating and then removing private endpoints in the existing subnet you specify, and"
+Write-Host -ForegroundColor "Yellow" "  - registering any missing resource providers on the subscription (this is not undone afterwards)."
 Write-Host ""
 Write-Host "Typical runtime: 2-10 minutes."
 Write-Host ""
@@ -2183,6 +2450,20 @@ try {
     }
     #endregion Operator environment pre-checks
 
+    #region Resource provider check ---------------------------------------------------------------
+    # Runs before anything is created, and before any lookup an unregistered provider would turn into an
+    # implicit registration (the existing-VNet lookup below, for one) - see "Resource provider gating" in
+    # the helpers. It asks before registering anything; whatever stays unregistered is skipped and reported.
+    # Providers the installer template deploys, plus the ones NME needs to operate post-install
+    # (Compute = session-host VMs, DesktopVirtualization = AVD host pools, RecoveryServices = backup).
+    $ResourceProviders = @("Microsoft.KeyVault", "Microsoft.Automation", "Microsoft.Compute",
+        "Microsoft.DesktopVirtualization", "Microsoft.Insights",
+        "Microsoft.Network", "Microsoft.OperationalInsights", "Microsoft.RecoveryServices",
+        "Microsoft.Storage", "Microsoft.Sql", "Microsoft.Web")
+    Invoke-ResourceProviderCheck -Namespaces $ResourceProviders
+    Write-Host ""
+    #endregion
+
     # Resource group: existing (must be empty - NME installs only into a new or empty RG), or a
     # temporary one this script creates (after the naming/tag confirmation below).
     $PendingRgCreate = $false
@@ -2295,6 +2576,13 @@ try {
         "Yes - deploy with private endpoints (no public internet exposure)",
         "No - use public endpoints (default)"
     ) -Default 2 -Help "Private endpoints give NME's PaaS dependencies (SQL Database, Key Vault, Storage, and the App Service) private IPs on your VNet instead of public endpoints. `r`n`r`nPros: no public exposure of the NME data plane; meets network-isolation requirements. Note that public endpoints are still protected by Azure authentication and authorization requirements. `r`n`r`nCons: increases complexity and can extend the Nerdio Proof of Value timeline. `r`n`r`nNOTE: Private endpoints can be enabled after proving value and before going to production."
+    # Private networking needs Microsoft.Network, and even the existing-VNet lookup below is an ARM read in
+    # that namespace (Az would register the provider to answer it) - so while it isn't registered, ask
+    # nothing further and test nothing here.
+    if ($privateChoice -eq 1 -and (Add-ProviderSkipResult -Category "PrivateEndpoint" -Check "Private endpoints, DNS, and VNet integration" -Providers "Microsoft.Network")) {
+        $privateChoice = 0
+        $ConfigSummary["Private endpoint scenario"] = "Yes - NOT tested (Microsoft.Network is not registered, or not confirmed registered, on this subscription)"
+    }
     if ($privateChoice -eq 1) {
         $TestPrivate = $true
         $TestVnetIntegration = $true
@@ -2452,6 +2740,11 @@ try {
                 $ConfigSummary["Private DNS zones plan"] = "Custom/on-prem DNS - must resolve: $zoneList"
             }
         }
+    }
+
+    # The VNet-integration test creates an App Service Plan and Web App, which need Microsoft.Web.
+    if ($TestVnetIntegration -and (Add-ProviderSkipResult -Category "Connectivity" -Check "App Service VNet integration and outbound connectivity" -Providers "Microsoft.Web")) {
+        $TestVnetIntegration = $false
     }
 
     Write-Host ""
@@ -2756,44 +3049,8 @@ try {
         }
     }
 
-    # Resource providers.
-    # Providers the installer template deploys, plus the ones NME needs to operate post-install
-    # (Compute = session-host VMs, DesktopVirtualization = AVD host pools, RecoveryServices = backup).
-    # Print the section header as its own persistent line - the spinner below erases itself when the
-    # jobs finish, so without this the console would show no delineation from the checks above.
-    Write-Host -ForegroundColor "Cyan" "Running resource provider check..."
-    $ResourceProviders = @("Microsoft.KeyVault", "Microsoft.Automation", "Microsoft.Compute",
-        "Microsoft.DesktopVirtualization", "Microsoft.Insights",
-        "Microsoft.Network", "Microsoft.OperationalInsights", "Microsoft.RecoveryServices",
-        "Microsoft.Storage", "Microsoft.Sql", "Microsoft.Web")
-    # Fan the provider registration-state reads out concurrently (one ThreadJob per provider), then
-    # process results on the main thread in the original order so console/report ordering stays stable.
-    $rpJobs = @()
-    foreach ($rp in $ResourceProviders) {
-        $rpJobs += Start-ThreadJob -Name "Rp-$rp" -ScriptBlock {
-            param($rp)
-            try {
-                $state = (Get-AzResourceProvider -ProviderNamespace $rp -ErrorAction Stop | Select-Object -First 1).RegistrationState
-                @{ Rp = $rp; Ok = $true; State = $state }
-            }
-            catch {
-                @{ Rp = $rp; Ok = $false; Error = $_.Exception.Message }
-            }
-        } -ArgumentList $rp
-    }
-    $rpJobResults = Wait-JobsWithDots -Jobs $rpJobs -Activity "Checking resource providers"
-    $rpJobs | Remove-Job -Force -ErrorAction SilentlyContinue
-    foreach ($rp in $ResourceProviders) {
-        $rr = $rpJobResults | Where-Object { $_.Rp -eq $rp } | Select-Object -First 1
-        if ($rr -and $rr.Ok) {
-            if ($rr.State -eq "Registered") { Add-Result -Category "ResourceProviders" -Check $rp -Result "Pass" -Detail "Registered." }
-            else { Add-Result -Category "ResourceProviders" -Check $rp -Result "Warn" -Detail "Not registered ($($rr.State)) - register it on the subscription before installing." }
-        }
-        else {
-            $rpErr = if ($rr) { $rr.Error } else { "No result returned from the registration-state query job." }
-            Add-Result -Category "ResourceProviders" -Check $rp -Result "Warn" -Detail "Could not read registration state: $rpErr" -Message $rpErr
-        }
-    }
+    # (The resource provider check now runs earlier, right after the operator pre-checks, so nothing is
+    # created or looked up before the user has decided whether to register missing providers.)
 
     # NOTE: a read-only Azure Resource Graph scan for Deny-effect policy assignments used to run here.
     # It was removed - in practice it surfaced noise (Deny assignments that never targeted NME resource
@@ -2807,6 +3064,11 @@ try {
     # jobs finish, so without this the console would show no delineation from the checks above.
     Write-Host -ForegroundColor "Cyan" "Testing resource deployability. This will take several minutes..."
 
+    # Provider registrations the user approved were started back at the provider check and have been running
+    # while they answered the prompts above - collect them now, since each test below needs its provider's
+    # final state. Usually they have already finished; this only waits for stragglers.
+    Resolve-ProviderRegistration
+
     # -PrivateEndpointOnly forces the resources that support a create-time public-access flag (Storage,
     # SQL, Key Vault) to deploy with public network access disabled from the start, for environments
     # that reject public-endpoint creation outright.
@@ -2815,7 +3077,10 @@ try {
     # Each job returns @{ Target; Ok; Error }. Az context is shared into the thread via -UseNewRunspace:$false default of ThreadJob.
     $jobs = @()
 
-    $jobs += Start-ThreadJob -Name "LogAnalytics" -ScriptBlock {
+    # Each job below is started through Start-GatedThreadJob: if the provider it needs isn't registered
+    # (and the user declined to register it) it records a "not tested" row and starts nothing, rather than
+    # letting Az register the provider as a side effect of the create.
+    $jobs += Start-GatedThreadJob -Name "LogAnalytics" -Providers "Microsoft.OperationalInsights" -Check "Log Analytics workspace" -Also "Application Insights and the Data Collection Rule" -ScriptBlock {
         param($rg, $name, $loc, $tags)
         try { New-AzOperationalInsightsWorkspace -ResourceGroupName $rg -Name $name -Location $loc -Sku "PerGB2018" -RetentionInDays 30 -Tag $tags -ErrorAction Stop | Out-Null; @{ Target = "Log Analytics workspace"; Ok = $true; Name = $name; Kind = "law" } }
         catch {
@@ -2824,7 +3089,7 @@ try {
         }
     } -ArgumentList $ResourceGroupName, $lawName, $Location, $Tags -InitializationScript $script:ErrorHelperInitScript
 
-    $jobs += Start-ThreadJob -Name "Storage" -ScriptBlock {
+    $jobs += Start-GatedThreadJob -Name "Storage" -Providers "Microsoft.Storage" -Check "Storage account ($StorageSku)" -Also "its lock, blob container and private endpoint" -ScriptBlock {
         param($rg, $name, $loc, $sku, $tags, $pna)
         try {
             New-AzStorageAccount -ResourceGroupName $rg -Name $name -Location $loc -SkuName $sku -Kind "StorageV2" -AccessTier "Hot" `
@@ -2837,7 +3102,7 @@ try {
         }
     } -ArgumentList $ResourceGroupName, $stName, $Location, $StorageSku, $Tags, $pna -InitializationScript $script:ErrorHelperInitScript
 
-    $jobs += Start-ThreadJob -Name "Sql" -ScriptBlock {
+    $jobs += Start-GatedThreadJob -Name "Sql" -Providers "Microsoft.Sql" -Check "SQL Server" -Also "the SQL database, firewall rule, Entra admin and token, data-path and private endpoint tests" -ScriptBlock {
         param($rg, $name, $loc, $cred, $tags, $pna)
         try {
             New-AzSqlServer -ResourceGroupName $rg -ServerName $name -Location $loc -ServerVersion "12.0" -MinimalTlsVersion "1.2" `
@@ -2850,7 +3115,7 @@ try {
         }
     } -ArgumentList $ResourceGroupName, $sqlName, $Location, $sqlCred, $Tags, $pna -InitializationScript $script:ErrorHelperInitScript
 
-    $jobs += Start-ThreadJob -Name "AppServicePlan" -ScriptBlock {
+    $jobs += Start-GatedThreadJob -Name "AppServicePlan" -Providers "Microsoft.Web" -Check "App Service Plan (B3, Windows)" -Also "the Web App and its Key Vault role assignments" -ScriptBlock {
         param($rg, $name, $loc, $tags)
         try {
             # B3 == Basic tier, Large worker, Windows (reserved = false). Match the installer's App Service Plan.
@@ -2866,7 +3131,7 @@ try {
     # Created via ARM PUT with the template's exact vault properties (nme-template-8.1.json): Azure
     # RBAC authorization (no access policies), soft delete with 90-day retention, NO purge protection,
     # and public network access / default ACL action following the private-endpoint choice.
-    $jobs += Start-ThreadJob -Name "KeyVault" -ScriptBlock {
+    $jobs += Start-GatedThreadJob -Name "KeyVault" -Providers "Microsoft.KeyVault" -Check "Key Vault" -Also "the Key Vault key, secret, role-assignment, certificate and private endpoint tests" -ScriptBlock {
         param($rg, $name, $loc, $tags, $pna, $rmUrl, $subId, $tenantId)
         try {
             $body = @{
@@ -2897,7 +3162,7 @@ try {
 
     # NME deploys two Automation Accounts (an updater account with a system-assigned identity, and a
     # scripted-actions account with no identity) - test both, matching the installer template.
-    $jobs += Start-ThreadJob -Name "AutomationUpdater" -ScriptBlock {
+    $jobs += Start-GatedThreadJob -Name "AutomationUpdater" -Providers "Microsoft.Automation" -Check "Automation Account (updater)" -Also "the Contributor role-assignment test and the Automation private endpoint" -ScriptBlock {
         param($rg, $name, $loc, $tags)
         try {
             New-AzAutomationAccount -ResourceGroupName $rg -Name $name -Location $loc -Plan "Basic" -AssignSystemIdentity -Tag $tags -ErrorAction Stop | Out-Null
@@ -2909,7 +3174,7 @@ try {
         }
     } -ArgumentList $ResourceGroupName, $aaUpdaterName, $Location, $Tags -InitializationScript $script:ErrorHelperInitScript
 
-    $jobs += Start-ThreadJob -Name "AutomationScriptedActions" -ScriptBlock {
+    $jobs += Start-GatedThreadJob -Name "AutomationScriptedActions" -Providers "Microsoft.Automation" -Check "Automation Account (scripted actions)" -ScriptBlock {
         param($rg, $name, $loc, $tags)
         try {
             New-AzAutomationAccount -ResourceGroupName $rg -Name $name -Location $loc -Plan "Basic" -Tag $tags -ErrorAction Stop | Out-Null
@@ -2921,8 +3186,12 @@ try {
         }
     } -ArgumentList $ResourceGroupName, $aaScriptedActionsName, $Location, $Tags -InitializationScript $script:ErrorHelperInitScript
 
-    $jobResults = Wait-JobsWithDots -Jobs $jobs -Activity "Testing resource deployability"
-    $jobs | Remove-Job -Force -ErrorAction SilentlyContinue
+    # Every job may have been skipped (providers not registered) - then there is nothing to wait for.
+    $jobResults = @()
+    if ($jobs.Count -gt 0) {
+        $jobResults = Wait-JobsWithDots -Jobs $jobs -Activity "Testing resource deployability"
+        $jobs | Remove-Job -Force -ErrorAction SilentlyContinue
+    }
 
     foreach ($jr in $jobResults) {
         if ($jr.Ok) {
@@ -3324,7 +3593,8 @@ try {
 
     # Application Insights (workspace-based, linked to the Log Analytics workspace above).
     $lawOk = ($jobResults | Where-Object { $_.Kind -eq "law" -and $_.Ok })
-    if ($lawOk) {
+    if (Add-ProviderSkipResult -Category "Deployability" -Check "Application Insights (workspace-based)" -Providers "Microsoft.Insights") { }   # reported by the skip row
+    elseif ($lawOk) {
         $aiBody = @{
             location   = $Location
             kind       = "web"
@@ -3401,8 +3671,10 @@ try {
     # created with public network access enabled - a policy denying public DCEs would block install.
     $dceBody = @{ location = $Location; tags = $Tags; properties = @{ networkAcls = @{ publicNetworkAccess = "Enabled" } } } | ConvertTo-Json -Depth 6
     $dceId = "/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.Insights/dataCollectionEndpoints/$dceName"
-    $dceRes = Invoke-PreflightArmPut -RmUrl $AzEnv.ResourceManagerUrl -ResourceId $dceId -ApiVersion "2022-06-01" -Body $dceBody
-    if ($dceRes.Ok) {
+    $dcSkipped = Add-ProviderSkipResult -Category "Deployability" -Check "Data Collection Endpoint (public access enabled)" -Providers "Microsoft.Insights" -Also "the Data Collection Rule"
+    $dceRes = if ($dcSkipped) { @{ Ok = $false } } else { Invoke-PreflightArmPut -RmUrl $AzEnv.ResourceManagerUrl -ResourceId $dceId -ApiVersion "2022-06-01" -Body $dceBody }
+    if ($dcSkipped) { }   # reported by the skip row
+    elseif ($dceRes.Ok) {
         Add-Result -Category "Deployability" -Check "Data Collection Endpoint (public access enabled)" -Result "Pass" -Detail "Created successfully."
         Add-TrackedResource -Type "dce" -ResourceGroupName $ResourceGroupName -Name $dceName -Id $dceId
     }
@@ -3539,6 +3811,17 @@ catch {
 }
 finally {
     #region Reporting ----------------------------------------------------------------------------
+    # Provider items for the recap: what this script registered (a subscription change the report must
+    # state plainly) and what it had to skip (so an incomplete run is never mistaken for a complete one).
+    # A registration may still be running if the run ended early - collect it so the report is accurate.
+    try { Resolve-ProviderRegistration } catch {}
+    if (@($script:ProvidersRegisteredByScript).Count -gt 0) {
+        $ConfigSummary["Resource providers registered by this script"] = "$(@($script:ProvidersRegisteredByScript | Sort-Object) -join ', ') - at the user's request; a subscription-level change that cleanup does not revert"
+    }
+    if ($script:ProviderTestsSkipped.Count -gt 0) {
+        $NextSteps.Add("Some tests were skipped because resource providers are not registered: $(@($script:ProviderTestsSkipped.Keys | Sort-Object) -join ', '). Register them on the subscription (Register-AzResourceProvider -ProviderNamespace <name>), then re-run this script to test what was skipped.")
+    }
+
     $summaryMeta = [pscustomobject]@{
         TimestampUtc    = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss 'UTC'")
         SubscriptionId  = (Get-MaskedGuid $SubscriptionId)
