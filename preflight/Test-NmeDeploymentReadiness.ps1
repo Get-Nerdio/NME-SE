@@ -3267,8 +3267,7 @@ try {
 
     foreach ($jr in $jobResults) {
         if ($jr.Ok) {
-            $passDetail = if ($jr.Recovered) { "Created successfully (Azure took longer than the 100-second client request timeout; confirmed by checking for the resource afterwards)." } else { "Created successfully." }
-            Add-Result -Category "Deployability" -Check $jr.Target -Result "Pass" -Detail $passDetail
+            Add-Result -Category "Deployability" -Check $jr.Target -Result "Pass" -Detail "Created successfully."
             Add-TrackedResource -Type $jr.Kind -ResourceGroupName $ResourceGroupName -Name $jr.Name
             if ($jr.Kind -eq "kv") {
                 New-PreflightLock -ResourceId "/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.KeyVault/vaults/$($jr.Name)" -LockName "$($jr.Name)-lock" -Label "Key Vault"
