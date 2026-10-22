@@ -3944,8 +3944,9 @@ finally {
             # barrier only waits for that call to return, so the very next wave's delete of the
             # previously-locked resource (or a private endpoint against it) can still race the lag and
             # get back "ScopeLocked" even though the lock is already gone. Retry only that specific
-            # error, on only the resource types that sit behind a lock removed in the prior wave -
-            # every other error (policy blocks, permissions) still fails immediately.
+            # error, on only the resource types that sit behind a lock removed in the prior wave
+            # (including role assignments scoped to the locked Key Vault) - every other error (policy
+            # blocks, permissions) still fails immediately.
             $invokeWithLockRetry = {
                 param([scriptblock]$Action)
                 $maxAttempts = 8
@@ -3979,8 +3980,12 @@ finally {
                     "dcr" { Remove-AzResource -ResourceId $t.Id -Force -ErrorAction Stop | Out-Null }
                     "dce" { Remove-AzResource -ResourceId $t.Id -Force -ErrorAction Stop | Out-Null }
                     "roleassignment" {
-                        $del = Invoke-AzRestMethod -Method DELETE -Path "$($t.Name)?api-version=2022-04-01" -ErrorAction Stop
-                        if ($del.StatusCode -ge 300 -and $del.StatusCode -ne 404) { throw "HTTP $($del.StatusCode): $($del.Content)" }
+                        # Role assignments scoped to the Key Vault sit behind its lock too, so the same lag
+                        # applies (the ScopeLocked text is in the 409 body, which the throw carries).
+                        & $invokeWithLockRetry {
+                            $del = Invoke-AzRestMethod -Method DELETE -Path "$($t.Name)?api-version=2022-04-01" -ErrorAction Stop
+                            if ($del.StatusCode -ge 300 -and $del.StatusCode -ne 404) { throw "HTTP $($del.StatusCode): $($del.Content)" }
+                        }
                     }
                     default { }
                 }
