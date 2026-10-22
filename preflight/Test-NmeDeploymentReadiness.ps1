@@ -2489,9 +2489,12 @@ try {
     # E14 - database-audience token check: acquire a token for the SQL/database audience with the
     # install's exact call shape, so a tenant/audience mismatch that would break the installer's SQL
     # step is surfaced here rather than mid-install. Mirrors the Key Vault audience token model above.
-    # SQL resource-id doesn't have a clean $AzEnv property across clouds (unlike Key Vault's
-    # AzureKeyVaultServiceEndpointResourceId) - fall back to the commercial audience and note the cloud.
-    $SqlAudience = "https://database.windows.net/"
+    # The SQL token audience is the cloud's SQL DNS suffix as a URL (database.windows.net,
+    # database.usgovcloudapi.net, database.chinacloudapi.cn). $AzEnv has no resource-id property for it
+    # (unlike Key Vault's AzureKeyVaultServiceEndpointResourceId), so derive it from $SqlSuffix, which is
+    # already normalized (no leading dot) above. A hardcoded commercial audience makes Gov/China tokens
+    # fail with a resource-not-found error, a false negative on the SQL checks.
+    $SqlAudience = "https://$SqlSuffix/"
     try {
         try {
             Get-AzAccessToken -ResourceUrl $SqlAudience -TenantId $TenantId -AsSecureString -ErrorAction Stop | Out-Null
