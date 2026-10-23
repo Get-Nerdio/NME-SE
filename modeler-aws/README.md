@@ -10,7 +10,7 @@ This is the AWS version of the Azure tool in [`modeler/`](../modeler/).  Same ou
 
 ## Quick start
 
-1. Sign in to the console as a user or role that carries the policy under "What you need" (or ReadOnlyAccess) **and** the AWS managed policy `AWSCloudShellFullAccess`; the first is for the script, the second is for CloudShell itself.  Open **AWS CloudShell** (the terminal icon in the console toolbar).  Any region works; the tool scans every enabled region.
+1. Sign in to the console.  An administrator already has everything the run needs; anyone else needs the policy under "What you need" plus `AWSCloudShellFullAccess`.  Open **AWS CloudShell** (the terminal icon in the console toolbar).  Any region works; the tool scans every enabled region.
 2. Paste:
 
    ```bash
@@ -65,7 +65,9 @@ python3 nerdio_modeler_aws.py
 
 ## What you need
 
-**Least privilege.**  The Azure tool runs on **Reader**.  AWS has no built-in role that narrow, so the equivalent is the policy below: every action the script calls, nothing else, all of them reads.  Grant it to a dedicated IAM user or role for the run.  The AWS managed policy **ReadOnlyAccess** also works, but it reads every service in the account; it is the fallback, not the recommendation.
+**Least privilege.**  The Azure tool runs on **Reader**.  AWS has no built-in role that narrow, so the floor is the policy below: every action the script calls, nothing else, all of them reads.  It is a statement of what the run touches, not a setup step.  An administrator already holds all of it and runs the one-liner as is; nothing needs to be created.
+
+**Delegating the run.**  CloudShell runs as whoever opened the console, and no flag switches it to another identity in the same account (`--role-name` only reaches *other* accounts).  So when someone who is not an administrator will run it, give that person a console login carrying this policy plus `AWSCloudShellFullAccess`, and they sign in and paste the line.  Do not mint access keys for a restricted user and paste them into CloudShell; that trades one login for a long-lived credential.  A security team that wants proof the run used only this policy can instead create an IAM role carrying it, trusted by the administrator, and assume that role in CloudShell before running; the output then records the principal as a role.  The AWS managed policy **ReadOnlyAccess** also satisfies the floor, but it reads every service in the account; it is the fallback, not the recommendation.
 
 ```json
 {"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Resource": "*", "Action": [
