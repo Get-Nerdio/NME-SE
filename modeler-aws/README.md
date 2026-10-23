@@ -10,7 +10,7 @@ This is the AWS version of the Azure tool in [`modeler/`](../modeler/).  Same ou
 
 ## Quick start
 
-1. Open **AWS CloudShell** in the account (the terminal icon in the console toolbar).  Any region works; the tool scans every enabled region.
+1. Sign in to the console as a user or role that carries the policy under "What you need" (or ReadOnlyAccess) **and** the AWS managed policy `AWSCloudShellFullAccess`; the first is for the script, the second is for CloudShell itself.  Open **AWS CloudShell** (the terminal icon in the console toolbar).  Any region works; the tool scans every enabled region.
 2. Paste:
 
    ```bash
@@ -88,6 +88,7 @@ python3 nerdio_modeler_aws.py
 | `pricing:GetProducts` | The per-WorkSpace estimate | Running with `--skip-prices` |
 | `s3:GetObject`, `s3:ListBucket` | The WorkSpaces Applications usage report bucket.  `ListBucket` is what makes a missing day a quiet 404 instead of a logged 403 | Running with `--skip-usage-report` |
 | `organizations:ListAccounts`, `sts:AssumeRole` | Multi-account runs | Not using `--all-accounts` or `--account` |
+| AWS managed policy `AWSCloudShellFullAccess` (attach alongside; not part of the JSON) | Opening CloudShell at all.  The script never calls CloudShell, but the person running it there needs this or the console blocks the shell before the one-liner runs | Running from a laptop with the AWS CLI |
 
 **Verified live (2026-10-23, v0.1.2).**  An IAM user carrying only this policy ran `--check --skip-costs --ec2-tag` against an empty account, and every read it attempted passed: STS, EC2 `DescribeRegions` and `DescribeInstances`, WorkSpaces `DescribeWorkspaceDirectories`, `DescribeWorkspaces` and `DescribeWorkspacesPools`, AppStream `DescribeFleets`, Pricing `GetProducts`.  Not yet exercised with that user, because an empty account never reaches them: CloudWatch (no WorkSpaces to meter), S3 (no usage-report bucket), Cost Explorer (the root billing switch was off), Organizations and `AssumeRole`.  Those lines come from the API definitions, not from a live run.
 
