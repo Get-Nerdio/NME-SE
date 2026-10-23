@@ -8,7 +8,8 @@ Every call is a read. Nothing in the account is changed.
 
 Covers:
   * Amazon WorkSpaces Personal      (one desktop per user; AlwaysOn or AutoStop)
-  * Amazon WorkSpaces Pools         (non-persistent pooled desktops)
+  * Amazon WorkSpaces Pools         (non-persistent pooled desktops; end of support Dec 31, 2027, no new
+                                     customers after Jul 31, 2026: accounts without it read 'not offered')
   * Amazon WorkSpaces Applications  (formerly AppStream 2.0; single- and multi-session fleets)
   * EC2-hosted VDI (Citrix, Omnissa, RDSH) by tag or name pattern, inventory and running hours only
 
@@ -42,7 +43,7 @@ import time
 import uuid
 import zipfile
 
-SCRIPT_VERSION = 'v0.1.1'
+SCRIPT_VERSION = 'v0.1.2'
 TOOL_NAME = 'nerdio_modeler_aws.py'
 VERSION_URL = 'https://raw.githubusercontent.com/dclawrence003/NME/main/modeler-aws/VERSION'
 
@@ -353,18 +354,37 @@ def error_code(exc):
     try: return exc.response['Error']['Code']
     except Exception: return exc.__class__.__name__
 
+def error_message(exc):
+    try: return str(exc.response['Error'].get('Message') or '')
+    except Exception: return str(exc)
+
 def is_access_denied(exc):
     return error_code(exc) in ('AccessDenied', 'AccessDeniedException', 'UnauthorizedOperation', 'UnrecognizedClientException',
-                               'AuthFailure', 'OptInRequired', 'InvalidClientTokenId', 'ExpiredToken', 'ExpiredTokenException')
+                               'AuthFailure', 'InvalidClientTokenId', 'ExpiredToken', 'ExpiredTokenException')
 
-ACCESS = {}   # (service, region) -> 'ok' | 'denied' | 'unavailable' | 'error'; printed at the end so an empty account still shows what was reachable
+# Refusals that are about the account, not the policy. No IAM grant changes these, so they are reported as
+# 'not offered' and never counted against the principal:
+#   OptInRequired / SubscriptionRequiredException   the account has not enabled the service or region
+#   PendingVerification                             a new account AWS has not finished verifying
+#   WorkSpaces Pools end of support                 AccessDeniedException whose message says the service takes no new
+#                                                   customers (since Jul 31, 2026; support ends Dec 31, 2027)
+def not_offered_reason(exc):
+    code = error_code(exc); msg = error_message(exc)
+    if code in ('OptInRequired', 'SubscriptionRequiredException', 'PendingVerification'): return code
+    if 'no longer available to new customers' in msg or 'end-of-support' in msg: return 'not offered to new customers'
+    return None
+
+ACCESS = {}   # (service, region) -> 'ok' | 'denied' | 'not offered' | 'unavailable' | 'error'; printed at the end so an empty account still shows what was reachable
 _REGION_RX = re.compile(r'^[a-z]{2}-[a-z]+-\d$')
 def _record_access(label, status):
     words = label.split()
     service = 'Cost Explorer' if words[0] == 'Cost' else words[0]
     region = next((w for w in words if _REGION_RX.match(w)), 'global')
     prev = ACCESS.get((service, region))
-    if prev in (None, 'ok') or status != 'ok': ACCESS[(service, region)] = status if prev != 'denied' else 'denied'
+    if prev == 'denied': return                                   # a denial is the headline for that service and region
+    if status == 'not offered' and prev == 'ok': return           # one API not offered does not make the service unreadable
+    if prev == 'not offered' and status == 'ok': ACCESS[(service, region)] = 'ok'; return
+    if prev in (None, 'ok') or status != 'ok': ACCESS[(service, region)] = status
 
 def safe(label, fn, default=None, quiet=False, quiet_codes=()):
     """Runs one read. Access denied and unavailable endpoints are reported, never fatal."""
@@ -379,9 +399,13 @@ def safe(label, fn, default=None, quiet=False, quiet_codes=()):
     except be.ClientError as e:
         code = error_code(e)
         if code in quiet_codes: return default
-        if is_access_denied(e):
+        reason = not_offered_reason(e)
+        if reason:
+            _record_access(label, 'not offered')
+            LOG.info('%s: not offered on this account (%s: %s). Not a permissions problem; skipped.' % (label, reason, error_message(e)[:160]))
+        elif is_access_denied(e):
             _record_access(label, 'denied')
-            LOG.warn('%s: access denied (%s). Grant the read-only policy in the README and run again; everything else continues.' % (label, code))
+            LOG.warn('%s: access denied (%s: %s). Grant the read-only policy in the README and run again; everything else continues.' % (label, code, error_message(e)[:120]))
         else:
             _record_access(label, 'error')
             LOG.warn('%s: %s: %s' % (label, code, str(e)[:200]))
@@ -406,7 +430,7 @@ def print_access_check():
         by[service][status].append(region)
     for service in sorted(by):
         parts = []
-        for status in ('ok', 'denied', 'unavailable', 'error'):
+        for status in ('ok', 'denied', 'not offered', 'unavailable', 'error'):
             regs = by[service].get(status)
             if regs: parts.append('%s: %s' % (status, ', '.join(regs) if len(regs) <= 6 else '%d regions' % len(regs)))
         LOG.raw('    %-14s %s' % (service, '; '.join(parts)))
@@ -1123,6 +1147,7 @@ def main(argv=None, client_factory=None):
     args = parse_args(argv if argv is not None else sys.argv[1:])
     t0 = time.time()
     LOG.lines.clear()
+    ACCESS.clear()   # per run, like the log; the test harness runs main() several times in one process
     LOG.info('%s %s' % (TOOL_NAME, SCRIPT_VERSION))
     try:
         import boto3 as _b3, botocore as _bc

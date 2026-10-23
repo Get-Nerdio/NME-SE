@@ -129,6 +129,8 @@ def main():
     check('--check on an empty region probes the price list and prints the access check', 'probing the price list for eu-west-1' in log3 and 'SERVICE ACCESS CHECK' in log3 and 'Pricing' in log3, log3[-600:])
     raw3 = json.load(open(glob.glob(os.path.join(out3, '*-rawdata.json'))[0]))
     check('rawdata records the service access results', raw3.get('serviceAccess', {}).get('WorkSpaces eu-west-1') == 'ok', raw3.get('serviceAccess'))
+    check('WorkSpaces Pools end of support reads as not offered, not denied',
+          'DescribeWorkspacesPools eu-west-1: not offered on this account' in log3 and 'Denied somewhere' not in log3, log3[-600:])
     for d in (out, out2, out3): shutil.rmtree(d, ignore_errors=True)
 
     print('\n%d failure(s)' % len(FAILS))

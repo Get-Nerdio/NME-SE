@@ -224,6 +224,7 @@ def make_demo_factory(seed=7):
         return out
 
     def ws_pools(region, p):
+        if region == 'eu-west-1': raise denied('workspaces', 'DescribeWorkspacesPools', 'Amazon WorkSpaces Pools is no longer available to new customers as of 7/30/2026. Refer to https://docs.aws.amazon.com/workspaces/latest/adminguide/wsp-pools-end-of-support.html')   # the real end-of-support refusal
         if region != 'us-east-1': return dict(WorkspacesPools=[])
         return dict(WorkspacesPools=[dict(est['pool'])])
 

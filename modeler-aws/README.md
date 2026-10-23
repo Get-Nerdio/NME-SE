@@ -2,7 +2,7 @@
 
 Reads a customer's AWS virtual desktop estate and writes a Nerdio Modeler import file with the AVD equivalent proposed for each group.  One command in AWS CloudShell.  Read-only.  Nothing in the account is changed.
 
-This is the AWS version of the Azure tool in [`modeler/`](../modeler/).  Same outputs, same privacy rules, different plumbing.  AWS spreads VDI across several products, so this tool reads each one: WorkSpaces Personal, WorkSpaces Pools, WorkSpaces Applications (the product formerly called AppStream 2.0), and EC2 hosts you point it at.
+This is the AWS version of the Azure tool in [`modeler/`](../modeler/).  Same outputs, same privacy rules, different plumbing.  AWS spreads VDI across several products, so this tool reads each one: WorkSpaces Personal, WorkSpaces Pools (ending; see "What you need"), WorkSpaces Applications (the product formerly called AppStream 2.0), and EC2 hosts you point it at.
 
 **Status: v0.1.1, first test candidate.**  Every call it makes is checked offline against the AWS API definitions.  It has not run against a live AWS account yet.  See "First run" below.
 
@@ -65,19 +65,33 @@ python3 nerdio_modeler_aws.py
 
 ## What you need
 
-A signed-in principal with the AWS managed policy **ReadOnlyAccess**, or this policy:
+**Least privilege.**  The Azure tool runs on **Reader**.  AWS has no built-in role that narrow, so the equivalent is the policy below: every action the script calls, nothing else, all of them reads.  Grant it to a dedicated IAM user or role for the run.  The AWS managed policy **ReadOnlyAccess** also works, but it reads every service in the account; it is the fallback, not the recommendation.
 
 ```json
 {"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Resource": "*", "Action": [
   "sts:GetCallerIdentity", "ec2:DescribeRegions", "ec2:DescribeInstances",
-  "workspaces:Describe*", "appstream:Describe*", "appstream:List*",
+  "workspaces:Describe*", "appstream:Describe*",
   "cloudwatch:GetMetricData", "cloudwatch:ListMetrics",
   "ce:GetCostAndUsage", "pricing:GetProducts",
   "s3:GetObject", "s3:ListBucket",
   "organizations:ListAccounts", "sts:AssumeRole"]}]}
 ```
 
-The S3 lines are for the WorkSpaces Applications usage report bucket.  The Organizations and AssumeRole lines are only needed with `--all-accounts` or `--account`.
+| Line | Used for | Drop it when |
+|---|---|---|
+| `sts:GetCallerIdentity`, `ec2:DescribeRegions` | Who is signed in; which regions to scan | Never |
+| `workspaces:Describe*` | Directories, WorkSpaces, Pools, bundles, connection status | Never |
+| `appstream:Describe*` | Fleets, stacks, usage report subscriptions | Never |
+| `cloudwatch:GetMetricData`, `cloudwatch:ListMetrics` | Every usage number | Never; without them every group is `no usage data` |
+| `ec2:DescribeInstances` | EC2-hosted VDI | Not using `--ec2-tag` or `--ec2-name-regex` |
+| `ce:GetCostAndUsage` | The bill | Running with `--skip-costs` |
+| `pricing:GetProducts` | The per-WorkSpace estimate | Running with `--skip-prices` |
+| `s3:GetObject`, `s3:ListBucket` | The WorkSpaces Applications usage report bucket.  `ListBucket` is what makes a missing day a quiet 404 instead of a logged 403 | Running with `--skip-usage-report` |
+| `organizations:ListAccounts`, `sts:AssumeRole` | Multi-account runs | Not using `--all-accounts` or `--account` |
+
+**IAM users and Cost Explorer.**  AWS blocks every IAM user and role from billing data, Cost Explorer included, until the account's root user turns on *IAM user and role access to billing information* (Billing console > Account).  `ce:GetCostAndUsage` in the policy is not enough on its own.  Without that switch the run reports `Cost Explorer unavailable` and carries on; `--skip-costs` skips the calls entirely.
+
+**WorkSpaces Pools is ending.**  AWS stopped taking new Pools customers on July 31, 2026 and ends support on December 31, 2027.  In an account that did not have Pools before then, `DescribeWorkspacesPools` returns `AccessDeniedException` with a message saying so.  The script recognizes that message, prints the call as `not offered`, and does not count it against the policy.  Existing Pools customers keep working until the end-of-support date and are still read in full.
 
 Cost Explorer has to be enabled on the account.  It usually is.  First-time enablement takes up to 24 hours.  In a member account of an Organization the payer may have turned off linked-account access; the run says so and carries on without costs.  Each Cost Explorer call costs $0.01.  A run makes six to eight of them.
 
@@ -96,7 +110,7 @@ Not done: behavior only a live account can show.  Whether a given WorkSpace gene
 What to do with an empty or near-empty account:
 
 1. Run `... | python3 - --check`.
-2. Look at the `SERVICE ACCESS CHECK` block at the end.  One line per service: ok, denied, or unavailable, by region.  That tells you the script reached the right APIs with the right permissions, even with nothing to inventory.
+2. Look at the `SERVICE ACCESS CHECK` block at the end.  One line per service: ok, denied, not offered, or unavailable, by region.  `denied` is the policy; `not offered` is AWS not offering that service to the account (Pools in a new account, a region not opted in, an account still being verified) and no grant changes it.  That tells you the script reached the right APIs with the right permissions, even with nothing to inventory.
 3. Open the zip.  The JSON has zero deployments (nothing to import yet), the review CSV is header only, and `rawdata.json` has `serviceAccess`, the regions checked, and the cost summary.
 4. If you can, create two WorkSpaces (one AlwaysOn, one AutoStop), connect once from a client, wait an hour, run again.  That exercises the per-WorkSpace metrics, the usage math and the price estimate.
 
@@ -128,7 +142,7 @@ On a customer account, run `--skip-costs --regions <theirs>` first.  That is inv
 
 1. **Identity and scope.**  `sts:GetCallerIdentity`, then the enabled regions.  With `--all-accounts`, every active account in the Organization through the named role.
 2. **WorkSpaces Personal.**  Directories, every WorkSpace (bundle, compute type, running mode, AutoStop timeout, volumes, OS), bundles, last known user connection.  Usage per WorkSpace from CloudWatch: `UserConnected` for presence, `Available` for running hours, `UserVolumeDiskUsage` for how full the user volume is (the FSLogix sizing input).  WorkSpaces group by directory and compute type.  A group's concurrency per slot is the count of its WorkSpaces with a user connected.
-3. **WorkSpaces Pools.**  Capacity settings, plus `ActiveUserSessionCapacity` (concurrent sessions) and `ActualUserSessionCapacity` (running capacity) from CloudWatch.  The dimension name is discovered with `ListMetrics`, not assumed.
+3. **WorkSpaces Pools.**  Capacity settings, plus `ActiveUserSessionCapacity` (concurrent sessions) and `ActualUserSessionCapacity` (running capacity) from CloudWatch.  The dimension name is discovered with `ListMetrics`, not assumed.  Accounts without Pools (no new customers since July 31, 2026) read `not offered` and skip this step.
 4. **WorkSpaces Applications.**  Fleets with instance type, fleet type, platform, stream view and max sessions per instance; stacks; usage report subscriptions.  Concurrency from `ActiveUserSessionCapacity` on multi-session fleets and `InUseCapacity` on single-session fleets, capacity from `ActualCapacity`.  When usage reports are on, the daily session CSVs in the lookback are read from S3 for distinct users and user-hours per fleet.
 5. **EC2 (opt-in).**  Instances matching your tag or name pattern, with running hours from CloudWatch `CPUUtilization` sample counts.  AWS has no session data for broker-based VDI, so these rows carry inventory and hours only.  Users and density come from the broker.
 6. **Costs.**  Cost Explorer as described above.
@@ -165,7 +179,8 @@ On a customer account, run `--skip-costs --regions <theirs>` first.  That is inv
 
 | Symptom | Meaning |
 |---|---|
-| `access denied` on a service in one region | The principal cannot read that service there.  Everything else continues.  Grant ReadOnlyAccess and run again |
+| `access denied` on a service in one region | The principal cannot read that service there.  The line quotes AWS's message.  Everything else continues.  Grant the policy in "What you need" and run again |
+| `not offered on this account` | AWS does not offer that service to this account: WorkSpaces Pools in an account that never had it, a region not opted in, or an account still being verified.  Not a permissions problem; nothing to grant.  The run continues |
 | `TELEMETRY NOT FOUND` | No CloudWatch data came back for any group.  Check `cloudwatch:GetMetricData` on the principal, and that the WorkSpaces existed inside the lookback |
 | `Cost Explorer unavailable` | Not enabled on the account, or linked-account access is off at the payer.  Run from the payer account, or accept the run without costs |
 | Fleets show `MAU` blank | Usage reports are not enabled for WorkSpaces Applications.  Turn them on in the console, wait a day, run again |
