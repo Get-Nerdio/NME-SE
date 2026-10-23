@@ -4,7 +4,7 @@ Reads a customer's AWS virtual desktop estate and writes a Nerdio Modeler import
 
 This is the AWS version of the Azure tool in [`modeler/`](../modeler/).  Same outputs, same privacy rules, different plumbing.  AWS spreads VDI across several products, so this tool reads each one: WorkSpaces Personal, WorkSpaces Pools (ending; see "What you need"), WorkSpaces Applications (the product formerly called AppStream 2.0), and EC2 hosts you point it at.
 
-**Status: v0.1.1, first test candidate.**  Every call it makes is checked offline against the AWS API definitions.  It has not run against a live AWS account yet.  See "First run" below.
+**Status: v0.1.2.**  Every call it makes is checked offline against the AWS API definitions, and the policy under "What you need" has been run live, as a user carrying only that policy, against one empty account.  It has not yet run against an account with WorkSpaces in it.  See "First run" below.
 
 ---
 
@@ -89,6 +89,8 @@ python3 nerdio_modeler_aws.py
 | `s3:GetObject`, `s3:ListBucket` | The WorkSpaces Applications usage report bucket.  `ListBucket` is what makes a missing day a quiet 404 instead of a logged 403 | Running with `--skip-usage-report` |
 | `organizations:ListAccounts`, `sts:AssumeRole` | Multi-account runs | Not using `--all-accounts` or `--account` |
 
+**Verified live (2026-10-23, v0.1.2).**  An IAM user carrying only this policy ran `--check --skip-costs --ec2-tag` against an empty account, and every read it attempted passed: STS, EC2 `DescribeRegions` and `DescribeInstances`, WorkSpaces `DescribeWorkspaceDirectories`, `DescribeWorkspaces` and `DescribeWorkspacesPools`, AppStream `DescribeFleets`, Pricing `GetProducts`.  Not yet exercised with that user, because an empty account never reaches them: CloudWatch (no WorkSpaces to meter), S3 (no usage-report bucket), Cost Explorer (the root billing switch was off), Organizations and `AssumeRole`.  Those lines come from the API definitions, not from a live run.
+
 **IAM users and Cost Explorer.**  AWS blocks every IAM user and role from billing data, Cost Explorer included, until the account's root user turns on *IAM user and role access to billing information* (Billing console > Account).  `ce:GetCostAndUsage` in the policy is not enough on its own.  Without that switch the run reports `Cost Explorer unavailable` and carries on; `--skip-costs` skips the calls entirely.
 
 **WorkSpaces Pools is ending.**  AWS stopped taking new Pools customers on July 31, 2026 and ends support on December 31, 2027.  In an account that did not have Pools before then, `DescribeWorkspacesPools` returns `AccessDeniedException` with a message saying so.  The script recognizes that message, prints the call as `not offered`, and does not count it against the policy.  Existing Pools customers keep working until the end-of-support date and are still read in full.
@@ -101,11 +103,13 @@ Nothing to install in CloudShell.  Python 3 and boto3 are already there.
 
 ## First run
 
-There is no AWS account behind this release yet.  Here is what is covered and what is not.
+One empty AWS account is behind this release so far.  Here is what is covered and what is not.
 
 Done: an offline stand-in for AWS (`nerdio_modeler_aws_demo.py`) validates every request against the real botocore service definitions and checks every synthetic response against the real output shape.  A wrong parameter name or a field that does not exist in the API fails there.  `python3 tests/test_offline.py` runs the whole pipeline against it, 60-odd checks.
 
-Not done: behavior only a live account can show.  Whether a given WorkSpace generation emits a metric, how Cost Explorer spells its usage types, how the price list spells its attributes.  All three degrade to a blank with a flag rather than a crash.
+Done live, on an empty account (2026-10-23): sign-in, region discovery, every WorkSpaces and AppStream inventory read, the EC2 tag filter, the price list (821 rows for us-east-1), and the least-privilege policy as the only grant.
+
+Not done: behavior only a populated account can show.  Whether a given WorkSpace generation emits a metric, how Cost Explorer spells its usage types, whether the usage-report CSV columns are spelled as the reader expects.  All three degrade to a blank with a flag rather than a crash.
 
 What to do with an empty or near-empty account:
 
