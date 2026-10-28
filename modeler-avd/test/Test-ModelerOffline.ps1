@@ -292,8 +292,14 @@ Write-Host "`n--- SECOND RUN: Log Analytics token never issued ---"
 # v0.20.2: third run with no Az.Accounts at all (Get-AzContext undefined) - must stop
 # cleanly with the install instructions, never a raw CommandNotFound.
 Remove-Item Function:Get-AzContext -ErrorAction SilentlyContinue
+# A dev box with Az.Accounts installed would otherwise expose the REAL Get-AzContext here
+# (and the real token path), so the run carries on instead of stopping: unload it and
+# block autoloading for this run, then restore.
+Remove-Module Az.Accounts -Force -ErrorAction SilentlyContinue
+$prevAutoload = $PSModuleAutoLoadingPreference; $PSModuleAutoLoadingPreference = 'None'
 Write-Host "`n--- THIRD RUN: Az.Accounts not installed ---"
 & "$PSScriptRoot/../Get-NerdioModelerJson.ps1" -SkipDownload -OutFile /tmp/test-model-nomod.json -ModelName 'TEST-NOMOD'
+$PSModuleAutoLoadingPreference = $prevAutoload
 $log3 = if (Test-Path /tmp/test-model-nomod-console.log) { Get-Content /tmp/test-model-nomod-console.log -Raw } else { '' }
 Remove-Item Env:MODELER_FAST_RETRY -ErrorAction SilentlyContinue
 
@@ -400,7 +406,7 @@ $checks = [ordered]@{
     # ---- v0.21
     'family: one deployment, peak 50'       = ($null -ne $famDep -and @($famDep).Count -eq 1 -and $famDep.name -eq 'PoolB (slots merged: PoolB-slot-one + PoolB-Slot-Two)' -and $famDep.users.total -eq 50 -and $famDep.workload.vmSize -eq 'Standard_D8s_v5' -and $famDep.workload.disk.size -eq 512 -and @($m.deployments | Where-Object { $_.name -like 'PoolB-*' }).Count -eq 0)
     'family: review keeps both rows'        = ($rowB1.MergedInto -eq 'PoolB' -and $rowB2.MergedInto -eq 'PoolB' -and $rowPoolA.MergedInto -eq '' -and $rowB1.PeakUsers -eq '30' -and $rowB2.PeakUsers -eq '20' -and $rowB1.Hosts -eq '4' -and $rowB2.Hosts -eq '6' -and $rowPoolA.Hosts -eq '3' -and $rowEmpty.Hosts -eq '0')
-    'family: table + rawdata'               = ($log -match 'BLUE/GREEN SLOT FAMILIES \(one deployment each' -and $log -match 'Blue/green slot families merged: 1 family \(2 slot pools\)' -and @($rawJson.slotFamilies).Count -eq 1 -and $rawJson.slotFamilies[0].family -eq 'PoolB' -and $rawJson.slotFamilies[0].hosts -eq 10 -and $rawJson.slotFamilies[0].peakConcurrentUsers -eq 50 -and $rawJson.slotFamilies[0].mau -eq 4 -and $rawJson.slotFamilies[0].merged -eq $true -and $rawJson.slotFamilies[0].actualMo -eq 680 -and $rawJson.slotFamilies[0].actualDisk -eq 180 -and $rawJson.slotFamilies[0].peakAtUtc -eq '2026-08-05T13:15:00Z')
+    'family: table + rawdata'               = ($log -match 'BLUE/GREEN SLOT FAMILIES \(one deployment each' -and $log -match 'Blue/green slot families merged: 1 family \(2 slot pools\)' -and @($rawJson.slotFamilies).Count -eq 1 -and $rawJson.slotFamilies[0].family -eq 'PoolB' -and $rawJson.slotFamilies[0].hosts -eq 10 -and $rawJson.slotFamilies[0].peakConcurrentUsers -eq 50 -and $rawJson.slotFamilies[0].mau -eq 4 -and $rawJson.slotFamilies[0].merged -eq $true -and $rawJson.slotFamilies[0].actualMo -eq 680 -and $rawJson.slotFamilies[0].actualDisk -eq 180 -and (Get-Content /tmp/zipcheck/test-model-rawdata.json -Raw) -match '"peakAtUtc":\s*"2026-08-05T13:15:00Z"')   # raw text: ConvertFrom-Json turns ISO strings into local-time DateTimes
     'family: over-provisioned flag'         = ($rawJson.slotFamilies[0].flags -match 'over-provisioned: 10 hosts registered for a peak of 50 users \(25 per host\); 3 would carry it with 10% headroom' -and $rowB1.Flags -match 'over-provisioned: 4 hosts registered for a peak of 30 users \(25 per host\); 2 would carry it' -and $rowPoolA.Flags -notmatch 'over-provisioned')
     'family: description says merged'       = ($m.description -match '1 blue/green slot family merged into one deployment each')
     'no-merge run: slots stay separate'     = (@($mNoMerge.deployments).Count -eq 5 -and @($mNoMerge.deployments | Where-Object { $_.name -eq 'PoolB-slot-one' }).Count -eq 1 -and @($mNoMerge.deployments | Where-Object { $_.name -like '*slots merged*' }).Count -eq 0 -and (@($csvNoMerge | Where-Object { $_.MergedInto })).Count -eq 0 -and $logNoMerge -match 'kept as separate deployments \(-NoSlotMerge\)')
