@@ -56,11 +56,11 @@
 
 .EXAMPLE
     # Quick run (Cloud Shell, defaults):
-    iex (irm 'https://raw.githubusercontent.com/dclawrence003/NME/main/modeler/Get-NerdioModelerJson.ps1')
+    iex (irm 'https://raw.githubusercontent.com/Get-Nerdio/NME-SE/main/modeler-avd/Get-NerdioModelerJson.ps1')
 
 .EXAMPLE
     # Inspect-then-run form (security-conscious), with options:
-    irm 'https://raw.githubusercontent.com/dclawrence003/NME/main/modeler/Get-NerdioModelerJson.ps1' -OutFile ./modeler.ps1
+    irm 'https://raw.githubusercontent.com/Get-Nerdio/NME-SE/main/modeler-avd/Get-NerdioModelerJson.ps1' -OutFile ./modeler.ps1
     # read it, then:
     ./modeler.ps1 -TimeZone 'America/Chicago' -ModelName 'Contoso - Actuals'
 
@@ -239,10 +239,10 @@
     forever, and an old copy looks normal until compared against a fresh
     one. Now: the version prints as the FIRST line of every run (before
     sign-in), and the script fetches the published version marker
-    (modeler/VERSION on main, cache-busting query, 5s timeout, silent on
+    (modeler-avd/VERSION on main, cache-busting query, 5s timeout, silent on
     any failure) and prints a loud three-line warning with the exact
     re-fetch command when the running copy is old. RELEASE RULE: bump
-    modeler/VERSION and $ScriptVersion together.
+    modeler-avd/VERSION and $ScriptVersion together.
     v0.17 (2026-08-07). EXPLICIT SUBSCRIPTION SCOPE ON EVERY QUERY - from two
     same-day runs against the same demo estate: Cloud Shell returned 120 pools,
     local PowerShell returned 18, with ZERO overlap - disjoint subscriptions,
@@ -456,7 +456,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = 'v0.21' # RELEASE RULE: bump modeler/VERSION in the same commit
+$ScriptVersion = 'v0.21' # RELEASE RULE: bump modeler-avd/VERSION in the same commit
 # Windows PowerShell 5.1 compatibility: force TLS 1.2 (old .NET Framework
 # defaults can be lower and ARM/Log Analytics require 1.2), and no PS7-only
 # syntax anywhere in this file (?? / ?. / -AsPlainText / utf8NoBOM).
@@ -612,12 +612,12 @@ Write-Info "Get-NerdioModelerJson $ScriptVersion"
 # failure (offline, proxy, repo moved) stays silent - freshness advice must
 # never break a run. The random query defeats CDN/proxy caching.
 try {
-    $verUrl = "https://raw.githubusercontent.com/dclawrence003/NME/main/modeler/VERSION?nocache=$(Get-Random)"
+    $verUrl = "https://raw.githubusercontent.com/Get-Nerdio/NME-SE/main/modeler-avd/VERSION?nocache=$(Get-Random)"
     $latestVer = ("$(Invoke-RestMethod -Uri $verUrl -TimeoutSec 5)").Trim()
     if ($latestVer -match '^v[\d.]+$' -and $latestVer -ne $ScriptVersion) {
         Write-Warn2 "THIS COPY IS STALE: it is $ScriptVersion, but the published version is $latestVer."
         Write-Warn2 "Fixes shipped since $ScriptVersion are missing from this run. Delete any saved modeler.ps1, then re-paste:"
-        Write-Warn2 "    iex (irm 'https://raw.githubusercontent.com/dclawrence003/NME/main/modeler/Get-NerdioModelerJson.ps1')"
+        Write-Warn2 "    iex (irm 'https://raw.githubusercontent.com/Get-Nerdio/NME-SE/main/modeler-avd/Get-NerdioModelerJson.ps1')"
     }
 } catch { }
 

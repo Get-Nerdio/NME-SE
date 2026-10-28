@@ -65,7 +65,7 @@
     plan came out as PowerManage. Plan-level property kept too (harmless).
     If this PUT now fails, that's Azure refusing dynamic on a classic pool -
     the error prints verbatim and that result is informative by itself.
-    v1.0 (2026-08-04). Companion test fixture for dclawrence003/NME autoscale.
+    v1.0 (2026-08-04). Companion test fixture for Get-Nerdio/NME-SE autoscale.
     api-version 2024-11-01-preview everywhere (scalingMethod requires it; the
     2025-10-10 stable surface does not expose it).
 #>
@@ -341,5 +341,5 @@ Write-Info "    schedules-disagree note$(if (-not $SkipVmTag) { ", and the tagge
 if ($poolSkip) { Write-Info "  - $($poolSkip.name): SKIP block (assigned but not enabled)." }
 if ($poolDyn)  { Write-Info "  - $($poolDyn.name): sheet flagged 'dynamic plan - manual review'." }
 else { Write-Info "  - $DynPlanName : listed as unassigned + flagged dynamic (needs translator v0.1.1+)." }
-Write-Info "Run it:  iex (irm 'https://raw.githubusercontent.com/dclawrence003/NME/main/autoscale/Get-NerdioAutoscaleSheet.ps1')"
+Write-Info "Run it:  iex (irm 'https://raw.githubusercontent.com/Get-Nerdio/NME-SE/main/autoscale/Get-NerdioAutoscaleSheet.ps1')"
 Write-Info "Clean up when finished:  ./Create-TestScalingPlans.ps1 -Remove"

@@ -40,11 +40,11 @@
     Skip the Cloud Shell auto-download (files still written to the session).
 
 .EXAMPLE
-    iex (irm 'https://raw.githubusercontent.com/dclawrence003/NME/main/autoscale/Get-NerdioAutoscaleSheet.ps1')
+    iex (irm 'https://raw.githubusercontent.com/Get-Nerdio/NME-SE/main/autoscale/Get-NerdioAutoscaleSheet.ps1')
 
 .EXAMPLE
     # Download first to pass parameters (or to read the code before running it):
-    irm 'https://raw.githubusercontent.com/dclawrence003/NME/main/autoscale/Get-NerdioAutoscaleSheet.ps1' -OutFile ./autoscale.ps1
+    irm 'https://raw.githubusercontent.com/Get-Nerdio/NME-SE/main/autoscale/Get-NerdioAutoscaleSheet.ps1' -OutFile ./autoscale.ps1
     ./autoscale.ps1 -SubscriptionId 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'
 
 .NOTES
@@ -69,7 +69,7 @@
     plans are detected reliably.
     v0.1.1 (2026-08-04). Pooled plans with no host pool references are now
     listed and flagged (previously they were invisible in the output).
-    v0.1 (2026-08-04). First release. Sibling of modeler/Get-NerdioModelerJson.ps1
+    v0.1 (2026-08-04). First release. Sibling of modeler-avd/Get-NerdioModelerJson.ps1
     (same skeleton: Resource Graph over REST, Cloud Shell auto-download).
 
     TRANSLATION RULES (the short version - the README has the full reasoning):

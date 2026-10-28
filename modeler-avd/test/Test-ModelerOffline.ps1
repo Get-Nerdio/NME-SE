@@ -235,7 +235,7 @@ function Get-AzAccessToken {
 }
 function Invoke-RestMethod {
     param($Method, $Uri, $Headers, $ContentType, $Body, $TimeoutSec)
-    if ("$Uri" -match 'modeler/VERSION') { return 'v0.21' }   # stale-copy self-check: report current
+    if ("$Uri" -match 'modeler-avd/VERSION') { return 'v0.21' }   # stale-copy self-check: report current
     if ("$Uri" -match 'prices\.azure\.com') {
         # v0.21: public retail prices by meter id. D8s v5 retail 0.2533/h (billed 0.2026 -> 20% under);
         # E20 LRS Disk retail 38.40/month (billed 30.60 -> 20.3% under); the files meter has no entry.

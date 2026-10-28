@@ -14,7 +14,7 @@ Moving from native scaling plans to NME auto-scale shouldn't change how your env
 2. Paste:
 
    ```powershell
-   iex (irm 'https://raw.githubusercontent.com/dclawrence003/NME/main/autoscale/Get-NerdioAutoscaleSheet.ps1')
+   iex (irm 'https://raw.githubusercontent.com/Get-Nerdio/NME-SE/main/autoscale/Get-NerdioAutoscaleSheet.ps1')
    ```
 
 3. A review table prints (one row per pool and schedule), and one zip downloads automatically: `nme-autoscale-profiles-<timestamp>.zip`. It holds the HTML, the review CSV, the raw plan and pool data, and the run's console log. If someone asked you to run this, that zip is the only thing to send back.
@@ -23,7 +23,7 @@ Moving from native scaling plans to NME auto-scale shouldn't change how your env
 Prefer to read the code before running it? You should:
 
 ```powershell
-irm 'https://raw.githubusercontent.com/dclawrence003/NME/main/autoscale/Get-NerdioAutoscaleSheet.ps1' -OutFile ./autoscale.ps1
+irm 'https://raw.githubusercontent.com/Get-Nerdio/NME-SE/main/autoscale/Get-NerdioAutoscaleSheet.ps1' -OutFile ./autoscale.ps1
 # open it, read it, then:
 ./autoscale.ps1
 ```
@@ -98,7 +98,7 @@ Some tenants block Cloud Shell. `fallback/nerdio-scalingplan-translator.kql` run
 
 ---
 
-*Read-only by design: every call is a read. Version and change notes are in the script header. Sibling tool: [`modeler/`](../modeler/) builds a Nerdio Modeler import from the same environment's actual usage.*
+*Read-only by design: every call is a read. Version and change notes are in the script header. Sibling tool: [`modeler-avd/`](../modeler-avd/) builds a Nerdio Modeler import from the same environment's actual usage.*
 
 ---
 

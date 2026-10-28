@@ -15,7 +15,7 @@ Covers:
 
 Run it in AWS CloudShell (boto3 is preinstalled) or anywhere the AWS CLI is signed in:
 
-    curl -sSL https://raw.githubusercontent.com/dclawrence003/NME/main/modeler-aws/nerdio_modeler_aws.py | python3 -
+    curl -sSL https://raw.githubusercontent.com/Get-Nerdio/NME-SE/main/modeler-aws/nerdio_modeler_aws.py | python3 -
 
 Parameters go after the dash:  ... | python3 - --check --regions us-east-1
 
@@ -45,7 +45,7 @@ import zipfile
 
 SCRIPT_VERSION = 'v0.1.2'
 TOOL_NAME = 'nerdio_modeler_aws.py'
-VERSION_URL = 'https://raw.githubusercontent.com/dclawrence003/NME/main/modeler-aws/VERSION'
+VERSION_URL = 'https://raw.githubusercontent.com/Get-Nerdio/NME-SE/main/modeler-aws/VERSION'
 
 # ============================================================================ console
 class Console:

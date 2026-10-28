@@ -14,7 +14,7 @@ A cost model is only as credible as the data behind it. This tool feeds the Mode
 2. Paste:
 
    ```powershell
-   iex (irm 'https://raw.githubusercontent.com/dclawrence003/NME/main/modeler/Get-NerdioModelerJson.ps1')
+   iex (irm 'https://raw.githubusercontent.com/Get-Nerdio/NME-SE/main/modeler-avd/Get-NerdioModelerJson.ps1')
    ```
 
 3. Read the review table it prints. One row per pool; anything defaulted is spelled out in `Flags`. The run never stops to ask anything. The first lines name the signed-in account, the tenant, and every subscription in scope. If a pool you expected is missing, look there first. A run covers one tenant, and the script warns you when your account can reach others.
@@ -30,7 +30,7 @@ From there, paste the exact same command. Nothing changes between Cloud Shell an
 Prefer to read the code before running it? You should:
 
 ```powershell
-irm 'https://raw.githubusercontent.com/dclawrence003/NME/main/modeler/Get-NerdioModelerJson.ps1' -OutFile ./modeler.ps1
+irm 'https://raw.githubusercontent.com/Get-Nerdio/NME-SE/main/modeler-avd/Get-NerdioModelerJson.ps1' -OutFile ./modeler.ps1
 # open it, read it, then:
 ./modeler.ps1
 ```

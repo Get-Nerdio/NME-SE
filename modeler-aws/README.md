@@ -2,7 +2,7 @@
 
 Reads a customer's AWS virtual desktop estate and writes a Nerdio Modeler import file with the AVD equivalent proposed for each group.  One command in AWS CloudShell.  Read-only.  Nothing in the account is changed.
 
-This is the AWS version of the Azure tool in [`modeler/`](../modeler/).  Same outputs, same privacy rules, different plumbing.  AWS spreads VDI across several products, so this tool reads each one: WorkSpaces Personal, WorkSpaces Pools (ending; see "What you need"), WorkSpaces Applications (the product formerly called AppStream 2.0), and EC2 hosts you point it at.
+This is the AWS version of the Azure tool in [`modeler-avd/`](../modeler-avd/).  Same outputs, same privacy rules, different plumbing.  AWS spreads VDI across several products, so this tool reads each one: WorkSpaces Personal, WorkSpaces Pools (ending; see "What you need"), WorkSpaces Applications (the product formerly called AppStream 2.0), and EC2 hosts you point it at.
 
 **Status: v0.1.2.**  Every call it makes is checked offline against the AWS API definitions, and the policy under "What you need" has been run live, as a user carrying only that policy, against one empty account.  It has not yet run against an account with WorkSpaces in it.  See "First run" below.
 
@@ -14,7 +14,7 @@ This is the AWS version of the Azure tool in [`modeler/`](../modeler/).  Same ou
 2. Paste:
 
    ```bash
-   curl -sSL https://raw.githubusercontent.com/dclawrence003/NME/main/modeler-aws/nerdio_modeler_aws.py | python3 -
+   curl -sSL https://raw.githubusercontent.com/Get-Nerdio/NME-SE/main/modeler-aws/nerdio_modeler_aws.py | python3 -
    ```
 
 3. Read the review table.  One row per group.  Anything defaulted is spelled out in `Flags`.  The run never stops to ask anything.  The first lines show the account, the principal type, and the regions it will scan.  If something you expected is missing, look there first.
@@ -24,13 +24,13 @@ This is the AWS version of the Azure tool in [`modeler/`](../modeler/).  Same ou
 Parameters go after the dash:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/dclawrence003/NME/main/modeler-aws/nerdio_modeler_aws.py | python3 - --check --regions us-east-1
+curl -sSL https://raw.githubusercontent.com/Get-Nerdio/NME-SE/main/modeler-aws/nerdio_modeler_aws.py | python3 - --check --regions us-east-1
 ```
 
 Want to read the code first?  Save it, then run it:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/dclawrence003/NME/main/modeler-aws/nerdio_modeler_aws.py -o nerdio_modeler_aws.py
+curl -sSL https://raw.githubusercontent.com/Get-Nerdio/NME-SE/main/modeler-aws/nerdio_modeler_aws.py -o nerdio_modeler_aws.py
 python3 nerdio_modeler_aws.py
 ```
 
