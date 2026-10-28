@@ -1,0 +1,188 @@
+# Nerdio Modeler Import Builder
+
+Turns your actual AVD environment into an import file for the Nerdio Modeler. Every host pool, tenant-wide, plus a per-pool review of what was found and, where permitted, what those pools actually cost last month.
+
+One command in Azure Cloud Shell, or in local PowerShell (7 or the built-in Windows PowerShell 5.1) after `Connect-AzAccount`. Read-only. Nothing in your environment is changed.
+
+A cost model is only as credible as the data behind it. This tool feeds the Modeler reality instead of estimates: real SKUs, real disks, real session limits, observed concurrency and working hours. Every host pool, not a sample. The savings it shows are savings you can expect to keep.
+
+---
+
+## Quick start
+
+1. Open **Azure Cloud Shell** in the tenant that hosts your AVD environment (portal, `>_` icon), **PowerShell** mode.
+2. Paste:
+
+   ```powershell
+   iex (irm 'https://raw.githubusercontent.com/dclawrence003/NME/main/modeler/Get-NerdioModelerJson.ps1')
+   ```
+
+3. Read the review table it prints. One row per pool; anything defaulted is spelled out in `Flags`. The run never stops to ask anything. The first lines name the signed-in account, the tenant, and every subscription in scope. If a pool you expected is missing, look there first. A run covers one tenant, and the script warns you when your account can reach others.
+4. One zip downloads automatically: `modeler-import-<timestamp>.zip`. It holds the import JSON, the review CSV, the storage ledger CSV, the raw observation data, and the full console log. If someone asked you to run this, that zip is the only thing to send back.
+
+   Cloud Shell shows the download as a link at the bottom of the shell window, and it stays up for a few seconds. Missed it? The zip is still in your Cloud Shell home folder (the `/home/<name>` in your prompt). Run `download modeler-import-<timestamp>.zip` to pop the link again, or use the toolbar's **Manage files > Download** and enter the zip name. If Cloud Shell was set up without a storage account, the home folder is wiped when the session closes; re-run the command and click the link when it appears.
+5. Nerdio Modeler > Import > pick the JSON from the zip. Done.
+
+**Running from a local machine instead:** the **Az.Accounts** module is all it takes. `Install-Module Az.Accounts -Scope CurrentUser` once (no admin rights needed; answer Y to the NuGet and PSGallery prompts), then `Connect-AzAccount`. Add `-TenantId <id>` if you have several tenants, and sign in as the account that has Reader on the environment you're scanning. The run header names the account, tenant, and subscriptions it can see, so a wrong sign-in is visible on line 2. Not signed in? The script stops immediately and tells you exactly what to run. It never half-runs.
+
+From there, paste the exact same command. Nothing changes between Cloud Shell and local. Works in PowerShell 7 (recommended) and Windows PowerShell 5.1. No other Az modules are used; inventory, telemetry, storage, and cost are all reached over REST. The only difference: instead of a browser auto-download, the zip lands in your Downloads folder, full path printed at the end. In Cloud Shell there is nothing to install or sign into. The shell is already authenticated as the portal user.
+
+Prefer to read the code before running it? You should:
+
+```powershell
+irm 'https://raw.githubusercontent.com/dclawrence003/NME/main/modeler/Get-NerdioModelerJson.ps1' -OutFile ./modeler.ps1
+# open it, read it, then:
+./modeler.ps1
+```
+
+### Parameters (all optional)
+
+| Parameter | Default | What it does |
+|---|---|---|
+| `-ModelName` | `AVD Environment - Actuals` | Model name shown in the Modeler |
+| `-LookbackDays` | `30` | Days of usage history analyzed |
+| `-TimeZone` | `America/New_York` | Your environment's local time zone (IANA) for work-hours math. `America/Chicago`, `Europe/London`, etc. |
+| `-SubscriptionId` | all visible | Narrow to specific subscription ID(s). Default is every enabled subscription the sign-in can see, listed at run start |
+| `-OutFile` | timestamped | Output JSON name |
+| `-SkipCosts` | off | Skip the actual-spend pull |
+| `-SkipDownload` | off | Skip the Cloud Shell auto-downloads |
+| `-NoSlotMerge` | off | Keep blue/green slot pools (`name-slot-one` / `name-slot-two`, `name-blue` / `name-green`) as separate deployments instead of one merged deployment per family |
+
+Parameters require the two-step (download, then run) form. `iex (irm ...)` runs with defaults.
+
+---
+
+## What you need
+
+- **Reader** on the subscription(s) holding the AVD host pools and session hosts.
+- Reader on the Log Analytics workspace(s) receiving AVD diagnostics.
+- AVD diagnostic settings feeding `WVDConnections` somewhere, if you want usage numbers. Pools with session hosts but no telemetry still land in the JSON: flagged, 1 user, defaulted hours, named `... (no usage data)`. Pools with neither hosts nor activity are excluded from the JSON and flagged `EMPTY` in the review table.
+
+Nothing needs to be installed. Cloud Shell ships every module the script uses, and Resource Graph is reached over REST.
+
+---
+
+## What it produces
+
+**The import JSON.** Schema-4 Nerdio Modeler format, one deployment per host pool that has real compute or activity behind it. Empty shells (a pool object with no session hosts and no activity in the lookback) stay out of the JSON, because a defaulted 1-user deployment would only skew the model. They are flagged `EMPTY` in the review table and counted in the console. Blue/green slot pools merge into one deployment per family (next paragraph). When the cost pull could measure it, the JSON also carries the Azure agreement discount (see the cost section), so the Modeler does not ask for it.
+
+**Blue/green slot families.** Some environments run every production pool as a pair, `name-slot-one` and `name-slot-two` (or `name-blue` and `name-green`), and swap them on each image release. The two slots serve the same people in turn, so one deployment per slot counts every user twice; a 47-pool tenant modeled 2,373 users that way for a true peak of 1,065. The script groups slot pools by family, adds their 15-minute samples per slot, and measures the family the way it measures one pool: peak, work days, window, and overtime from the combined series. Hosts add up, the per-host peak is the highest slot's, MAU is the distinct-user union across the slots, and the VM spec comes from the slot holding the most hosts. Empty slots (the idle slot already scaled to zero) never take part. The JSON carries one deployment per family, named `family (slots merged: a + b)`; the review CSV keeps one row per pool with a `MergedInto` column; a slot-family table prints after the review table; rawdata.json has the family numbers. `-NoSlotMerge` keeps the per-pool deployments.
+
+**The review table and CSV.** Per pool: resource group, type, desktop experience (`Exp`: 1 multi-session, 2 personal, 3 single-user pooled, 4 RemoteApp), SKU, session hosts registered (`Hosts`), session limit, density used, observed per-host peak, peak concurrent users, MAU, observed work window and days, overtime fields, the family it merged into (`MergedInto`), actual last-month cost (`ActualMo`, when retrievable) split into `ActualVm` and `ActualDisk` with how it was attributed (`ActualBasis`), and a `Flags` column that names every default or adjustment applied. MAU is the count of distinct users seen in the lookback. It is informational only and never enters the JSON; it answers "the model says 24 users, we have 5,000" and feeds licensing conversations. Two flags read the fleet against the usage: `over-provisioned` when a pool or family holds at least twice the hosts its measured peak needs with 10% headroom, and `OS disks are N% of this pool's bill` when disks are 40% or more of the spend (the hosts sit stopped most of the month while their disks keep billing, so the levers are the stopped-disk tier switch and fewer idle hosts). If a value was touched, the flag says so. Nothing is changed silently.
+
+**Tenant-wide counts.** One line near the end: peak concurrent users across the whole tenant and when it happened in your time zone, the distinct users who connected in the lookback, and the session hosts registered. Per-pool MAU adds to more than that distinct count whenever a person used two pools, which every blue/green rotation guarantees. rawdata.json carries the same numbers (`tenant`). This is the licensing number.
+
+**No person is named anywhere in the output.** Distinct users are counted from opaque tokens: each workspace returns a hash of the sign-in salted with a value minted for the run, the tokens stay in memory, and only counts are written. The share-to-pool evidence uses the same tokens. The signed-in account is shown by domain only, and the console transcript has its Username, RunAs User, Machine, and Host Application lines redacted and profile paths masked before it goes in the zip. The zip can travel.
+
+**Import pre-flight.** Before the JSON is written, every deployment is checked against the Modeler's own import rules (read from the Modeler app: users at least 1, density at least 0.1 users per vCPU, a known disk tier, consistent overtime fields, a valid work window). Anything outside them is corrected and printed. A file this script writes imports.
+
+**The storage ledger** (`...-storage-ledger.csv`). Every discovered Azure Files share and NetApp capacity pool, classified (profiles, app attach, not AVD, unknown) with evidence, confidence, serving pools, sizes, billing model, and actual cost where visible. Storage never enters the import JSON. See the FSLogix section below.
+
+**The raw observation data.** `...-rawdata.json` holds the inventory, VM and disk specs, workspaces, usage aggregates, storage findings, the empty-pool list, cost rows, and run parameters. `...-usage-buckets.csv` holds per-pool concurrency in 15-minute slots. This is everything the model was computed from, so if the model needs tuning after review, it can be re-derived from the zip without asking anyone to run it again.
+
+**Console summary.** Pool counts, workspaces found, usage coverage, the resource groups where session-host VMs live (that list is the Cost Management filter for manual comparisons), and cost totals: spend attributed to session hosts and disks (by resource id, and by host naming where hosts were rebuilt), storage account spend, and VM or disk spend that matched no pool, named by resource group.
+
+**When usage could not be collected, the run says so.** If the usage query never ran (the shell would not issue a Log Analytics token, or every workspace blocked the runner at the network layer), the console prints `TELEMETRY NOT COLLECTED` with the re-run instruction, every affected pool's `Flags` says `usage NOT collected this run`, and the model's description carries `USAGE NOT COLLECTED`. A defaulted pool never passes for a measured one. `WORKSPACE CHECK: FAIL` is reserved for the case where the query ran and found no data.
+
+---
+
+## How it reads the environment
+
+1. **Scope.** The run enumerates every enabled subscription the sign-in can see, prints the list, and pins it onto every Resource Graph query. `-SubscriptionId` narrows it. Nothing is left to whatever the current context happens to default to. Two windows signed into different scopes once produced 120-pool and 18-pool answers for the same environment with no way to tell from the logs. Now you can tell.
+2. **Inventory.** Every host pool across those subscriptions via Azure Resource Graph: type, session limit, app group preference, resource group, region. Per-subscription pool counts print.
+3. **Session hosts to VMs.** Each pool's registered hosts resolve to their VMs: size, OS disk (size and SKU), image type, ephemeral flag. The pool is represented by its most common VM size, a true majority; two D2as hosts outvote one D8as even when they run different images. Image and disk come from the most common combo among hosts of that size. Ties break deterministically, so PowerShell 5.1, 7, and Cloud Shell pick the identical spec from identical hosts.
+4. **Workspace discovery.** Reads every host pool's diagnostic settings and finds all Log Analytics workspaces receiving AVD telemetry. No hunting for the right workspace, and environments that split pools across workspaces are handled automatically.
+5. **Usage.** One Log Analytics token for the run, retried with pauses if the shell is slow to issue it, then 30 days of `WVDConnections` per workspace, bucketed into 15-minute concurrency slots of distinct users. From that: peak concurrent users, observed work days (days whose user-hours reach 25% of the busiest day's), the observed work window (hours at 20% of peak or better, measured on work days), weekly in-window vs. off-window user-hours, per-pool MAU, and peak users on any single host. Day and hour averages include the quiet slots and are normalized by each weekday's actual calendar count in the lookback. A 30-day window holds five of some weekdays and four of others; uniform-week math penalized the four-count days about 20%, enough to cost a real call center its Saturday shift. Concurrency counts connected sessions. NME's console counts sessions including disconnected and reads higher; sizing is unaffected because peak and per-host density share the same basis. Pools where session counts run 15% or more above connected peaks (from `WVDAgentHealthStatus`, when present) are flagged.
+6. **Assembly.** The modeling rules below, a flag for every default, and empty shells set aside: counted, flagged, never in the JSON.
+7. **Profile storage.** Azure Files shares and SMB NetApp volumes that could hold FSLogix profiles, with provisioned and used capacity. When file-access diagnostics flow to Log Analytics, also which host pools use each share.
+8. **Actual spend.** Last calendar month's cost for the session-host VMs and OS disks via the Cost Management Query API: one query per subscription, filtered to the resource groups that matter. Attributed by resource id first, then by host naming where last month's hosts no longer exist (rebuilt fleets); anything matching no pool is named, not absorbed. If Azure throttles, the script waits as long as Azure asks and tries again; anything still refused gets a second pass after a cooldown. A second query per subscription, grouped by meter with usage quantity, measures the effective unit prices against the public retail list to give the Azure agreement discount. See the cost section for the details.
+9. **Transient failures.** A dropped connection (the error reads `HttpRequestException` or `connection was closed`) is retried three times with short pauses before the run gives up on that call. Sign-in and HTTP status errors are never retried that way.
+
+---
+
+## The modeling rules (what lands in the JSON, and why)
+
+The goal is a model of how your pools actually run, so the Nerdio number is credible and the savings come from real levers: hours and true concurrency, not optimistic assumptions.
+
+- **Users = observed peak concurrent**, not assigned users. Floored at 1 (the Modeler minimum) on pools that have hosts but showed no usage.
+- **Work days and hours = observed**, not the scaling plan's schedule. Windows never cross midnight (Modeler max is 23:45); only full-day windows get trimmed.
+- **Weekend and off-hours load** folds into the Modeler's overtime fields (percent of users times additional hours, applied across 7 days), reconciled so weekly compute hours match what was observed.
+- **Density (users per vCPU) = observed peak users on a single host**, capped at the configured session limit. How your hosts are actually packed is what the model should price. Falls back to session limit divided by vCPUs when there is no telemetry; last resort is 1.0. Both fallbacks are flagged. The review table shows `PerHostPeak` next to `Limit`, and the gap between them is density headroom. Personal and single-user pooled pools (session limit 1) carry 1.0, which is what the Modeler applies to them regardless. Nothing goes below 0.1, the Modeler's import minimum; a session limit of 1 on a 16-vCPU host would otherwise compute to 0.06 and the whole file would refuse to import.
+- **SKUs are reported exactly as found**, never substituted. The model uses the Custom workload type, which accepts any AVD SKU.
+- **Disks are reported as found.** Size snaps up to the Modeler's offered tiers (128/256/512/1024/2048/4096 GB) only when the actual size isn't offered. Stopped-disk type is always Standard HDD, because disk switching is the Nerdio feature being modeled.
+- **Empty pools never enter the JSON.** A pool object with no session hosts and no activity in the lookback is noise, and a fake 1-user deployment skews the totals. Empty pools are flagged `EMPTY` in the review table, listed in rawdata.json, and counted in the console.
+- **Storage never enters the JSON either.** Every pool exports with fsLogix off, and everything storage lands in the ledger. See the next section.
+- Not derivable from Azure, so left for manual touch-up after import: RDP egress GB (10) and custom-image build-VM hours.
+
+---
+
+## FSLogix profile storage: the ledger
+
+FSLogix configuration lives in Group Policy or Intune. Nothing in Azure says "this pool uses FSLogix," and this tool will not reach inside session hosts to look. What Azure does show, with the same Reader access, is the storage the profiles could live on: Azure Files shares and SMB NetApp volumes. The tool discovers all of it and applies one rule: **storage never enters the Modeler JSON.** The import carries host pools only, an Azure compute model. Everything storage lands in the storage ledger CSV, always in the zip. The run never stops to ask anything.
+
+Each ledger row is one billing unit: SKU and billing model (premium and provisioned-v2 bill on provisioned GB, v1 standard bills on used), provisioned and used capacity, an automatic classification (name match means profiles, msix means app attach, pvcn/mq/sftp patterns mean not AVD, everything else is unknown), pool evidence with a confidence level when file-share diagnostics exist, and actual last-month cost where cost visibility allows. Pool evidence comes from `StorageFileLogs` caller IPs correlated with session-host IPs, and the tool checks each storage account's own diagnostics workspace, not just the AVD ones. NetApp is quantified at the capacity pool, the thing Azure actually bills, with member volumes listed and shared pools flagged.
+
+Sizes are resilient. Share stats retry once, then fall back to Azure Monitor's `FileCapacity` metric; huge shares can time the stats call out, and the metric is precomputed. A census line ends the stage: accounts scanned, skipped (named), stores sized and unsized. Gaps are visible, never silent. If profile storage should appear in a Modeler scenario, add it by hand using the ledger's numbers. The ledger is the storage conversation.
+
+---
+
+## The cost comparison (`ActualMo`)
+
+The script queries the Cost Management Query API for last calendar month, filtered to Virtual Machines and Storage, grouped by resource. Cost is then attributed to each pool's VMs and OS disks. Amortized cost is tried first, so environments with Reservations or Savings Plans get honest numbers. Pay-as-you-go offers that reject amortized queries fall back to actual cost.
+
+**How spend is attributed to a pool.** First by resource id: last month's rows for the pool's current VMs and their OS disks. That alone is not enough, because some environments rebuild every session host on each release, and last month's VMs then no longer exist. A 47-pool run once attributed $7.3k of $76.3k that way, with nine production pools reading zero while their spend sat in "other". So, second, a billed VM (or its OS disk) that is no longer a current host is attributed to a pool when its name follows that pool's host naming: the same stem once trailing numbers and hex suffixes are stripped, so `avd-ec1-7-3-94` from August and `avd-ec1-8-1-108` from today both read as `avd-ec`. The pool is flagged `hosts rebuilt since the billing month` and `ActualBasis` says `by id + host naming`. When several pools in the same resource group share a stem, that row splits by current host count, flagged as an estimate. Anything that matches no pool's naming stays out of every pool's total and is listed by resource group with its top items, in the console and in rawdata.json (`costUnattributed`). That is deliberate: image builders, jump boxes, and orphaned disks live in AVD resource groups too, and a demo tenant carried an $807 image VM next to its hosts. Storage accounts never enter a pool's total. rawdata.json carries a `costAttribution` block with the parts per pool.
+
+**How it avoids losing data to throttling.** Cost Management rate-limits per tenant, and it bites: a six-scope customer run once lost one resource group's actuals to HTTP 429, which meant an estimate in a CIO-facing model. Three things now keep that from happening, in the order they matter:
+
+1. **Fewer calls.** One query per subscription, filtered to the resource groups holding session hosts and profile storage, instead of one query per resource group. Six scopes used to mean up to 36 calls in a burst. Now it is one. If a subscription-level query is refused (Reader granted only on specific resource groups, an offer quirk) or comes back empty, that subscription falls back to the per-resource-group path on its own.
+2. **Azure's own wait time.** A 429 carries a `Retry-After` header that says how long to wait. Every Azure call the script makes (Cost Management, Resource Graph, ARM, Log Analytics) reads it and waits exactly that long, up to six attempts inside a five-minute budget per call. Cost calls are paced 1.5 seconds apart on top. Every wait prints, so a slow step never looks hung.
+3. **A second pass.** Anything still throttled after its budget is set aside. The run finishes everything else, cools down 90 seconds so the rate window resets, and tries those scopes once more before giving up.
+
+The end of the run prints a one-line throttle summary (how many 429s, seconds waited, what recovered), and rawdata.json records the same history. A scope that fails both passes is reported as throttled, with the counts, and that message means something else is hammering the tenant's Cost Management API at that moment. Re-run in an hour.
+
+**The Azure agreement discount.** The Modeler asks for one number, the discount off retail, and guessing it moves the whole model. The script measures it: a second Cost Management query per subscription, grouped by meter with cost and usage quantity, gives the effective unit price the environment actually paid last month for each compute, disk and storage meter, and the public retail price list (prices.azure.com, no sign-in) gives list for the same meter id. The gap prints per class (compute meters, OS disk meters, other storage meters) and blended by spend, as `AZURE AGREEMENT DISCOUNT TO ENTER IN THE MODELER: N%`. The blended number is written into the JSON as the enterprise discount; adjust it in the Modeler if compute and disks differ a lot. Meters whose units do not reconcile or that have no retail entry are left out and named. rawdata.json carries every meter (`discount`). If either side is unavailable the line says so and the model is unchanged.
+
+**Permissions:** the same Reader access the script already needs. Any of Owner, Contributor, Reader, or Cost Management Reader at RG or subscription scope works. Subscription-scope Reader takes the fast path; resource-group-only Reader takes the per-resource-group path automatically.
+
+**When it skips (by design):** cost API failures that are not throttling are almost never RBAC. They are billing-side policy: CSP subscriptions without customer cost visibility, EA enrollments where the admin disabled "view charges," or offer types with no cost API support at all (sponsored, internal, MSDN; typical in demo and lab tenants). Each failing scope is skipped with one warning line quoting Azure's actual error. The model, review table, JSON, and downloads are never affected. `-SkipCosts` turns the pull off entirely.
+
+Reading the numbers: `ActualMo` already includes whatever your current scaling setup saves you. The comparison is Nerdio-run vs. how the environment is managed today. That's the honest comparison, and the one that shows where Nerdio's value actually comes from.
+
+---
+
+## No Cloud Shell?
+
+Two fallbacks, in order:
+
+1. **Local PowerShell.** Same command, same output. See "Running from a local machine" in the Quick start. This also covers workspaces that reject queries from public networks; run from inside the customer network and the query usually passes.
+2. **Portal-paste KQL**, in the `fallback/` folder, for tenants where both shells are off the table:
+   - `modeler-make-json.kql`: run it in the Log Analytics workspace that receives AVD diagnostics (find it: any host pool > Diagnostic settings). One result row holds check columns (`WorkspaceCheck`, pool counts, `FlaggedPools`) plus the complete import JSON in the `ModelerImportJson` cell. Export to CSV, then one command unwraps it. Instructions are in the file header, Windows and Mac.
+   - `modeler-detail-grid.kql`: optional per-pool magnifier when a flag needs investigating.
+
+   Caveats vs. the script: you find the workspace yourself, extra workspaces are a commented one-line edit, and there is no storage ledger, cost pull, agreement discount, slot-pair merge, or tenant-wide user count.
+
+---
+
+## Troubleshooting
+
+| Symptom | Meaning |
+|---|---|
+| `TELEMETRY NOT COLLECTED` | The usage query never ran. In Cloud Shell this is the portal's token relay timing out ("Timeout waiting for token from portal"); the script asks six times with pauses before giving up. The data is almost certainly there. Run the command again: local PowerShell after `Connect-AzAccount` is the sure path, and a fresh Cloud Shell session usually works too. Inventory, storage, and cost in the output are complete |
+| `WORKSPACE CHECK: FAIL`, or all pools show "no telemetry" | The query ran and found no `WVDConnections` data. Diagnostics were never enabled, or they flow to a workspace the account can't read |
+| Import fails with "One or more review steps are not completed" | One deployment breaks a Modeler import rule, usually users per vCPU below 0.1 from a session limit of 1 on a big host. Current versions pre-flight every deployment and correct this before writing the file; if the file came from an older version, raise that pool's `maxUsersPerVCpu` to 0.1 or more (1.0 for a one-user-per-host pool) and import again |
+| `Found 0 diagnostic workspace(s)` | No host pool has diagnostic settings; usage will be defaulted for every pool |
+| Cost lines skipped with an error message | Billing-side policy or unsupported offer (see the cost section); everything else completed |
+| A pool shows defaults with `VM spec defaulted` | The pool has no registered session hosts to sample |
+| Pools flagged `EMPTY` in the review CSV but missing from the JSON | By design. The pool exists in Azure but has no session hosts and no activity in the lookback. A defaulted deployment would skew the model, so it's reported instead of exported |
+| Peak = 1 pools show odd windows | With one observed user, any active hour counts as "working." Noise on near-idle pools, meaningless at real load |
+| A workspace prints `BLOCKED BY ITS NETWORK SETTINGS` | The workspace only accepts queries from approved networks (Network Security Perimeter, public query access off, or private link). Not a permissions problem. Run the same command from inside the customer network (local PowerShell on a VPN or corporate machine), or allow the runner's IP in the workspace's networking settings |
+| Fewer pools than expected | Check the run's opening lines: signed-in account, tenant, and the subscription list. The usual cause is the wrong tenant; `Connect-AzAccount -TenantId <id>` and run again. A run covers one tenant, and the script names any others your account can reach |
+| Storage ledger rows have an empty `ServesPools` | File-share diagnostics aren't flowing to Log Analytics, so share-to-pool mapping has no evidence. Sizes and costs are still correct; ask the AVD admin which pools use the share |
+| `The term 'Get-AzContext' is not recognized`, or the script says Az.Accounts is not installed | Local run on a machine without the Az.Accounts module. One-time setup, no admin rights: `Install-Module Az.Accounts -Scope CurrentUser` (answer Y to the NuGet and PSGallery prompts), then `Connect-AzAccount`, then run the command again |
+| `THIS COPY IS STALE` warning, or an old version number on the first line | The machine is running old code, usually a saved `modeler.ps1` or a replayed command pinned to an old commit. Delete saved copies and re-paste the Quick start command. The raw URL also caches for about 5 minutes right after an update |
+| A production pool shows a lower peak than you expected, and a sibling pool named `-slot-two` or `-green` exists | The environment rotates blue/green slots and the users split across them mid-month. Look at the slot-family table after the review table: the family row carries the merged peak, hosts, and MAU, and the JSON models the family as one deployment. `-NoSlotMerge` keeps them separate if you need that view |
+| `Agreement discount not measured` | The meter-level cost query was refused (same billing-side causes as the cost pull) or prices.azure.com could not be reached from this shell. Enter the discount by hand in the Modeler; nothing else is affected |
+| A call hit a transport error and the run paused | A dropped connection or proxy hiccup. The script retries three times with short pauses; if the error persists after that, check the network and run again |
+| Auto-download didn't fire, or the link disappeared before you clicked it | The zip is in your Cloud Shell home folder. Run `download <zip name>` to pop the link again, or use Cloud Shell's Manage files > Download and enter the printed filename. Searching your browser for the filename won't find it; the browser just turns the name into a web address |
+
+---

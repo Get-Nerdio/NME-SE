@@ -1,0 +1,2439 @@
+<#
+.SYNOPSIS
+    Builds a Nerdio Modeler import JSON from an AVD environment's ACTUAL usage and
+    configuration. Run in Azure Cloud Shell (PowerShell). Read-only. One command.
+
+.DESCRIPTION
+    What it does, in order:
+      1. Inventories ALL host pools tenant-wide via Azure Resource Graph.
+      2. Reads each pool's diagnostic settings and discovers EVERY Log Analytics
+         workspace receiving AVD telemetry - no workspace hunting, multi-workspace
+         handled automatically.
+      3. Pulls session concurrency (WVDConnections) from each workspace:
+         users.total = observed PEAK CONCURRENT; work days/hours = observed;
+         off-hours + weekend load folded into the Modeler's overtime fields
+         (additional-hours applies across all 7 days).
+      4. Enriches VM size/disk/image per pool from Resource Graph.
+      5. Discovers FSLogix-candidate storage (Azure Files shares + ANF capacity
+         pools) and records ALL of it in a storage ledger CSV - classification,
+         sizes, SKU/billing model, log-derived pool evidence, actual cost.
+         STORAGE NEVER ENTERS THE MODELER JSON: the model carries host pools
+         only, and the ledger is the storage deliverable. No prompts.
+      6. Prints a per-pool review table + flags, writes the schema-4 import JSON
+         and the storage ledger, and packages one zip (Cloud Shell auto-download;
+         local runs write it to the current folder).
+      7. Pulls last month's ACTUAL spend for those VMs + disks + storage (Cost
+         Management Query API, per resource group) and prints it beside the
+         model inputs - skipped cleanly wherever cost visibility isn't granted.
+
+    Pools without telemetry still land in the JSON, named "(no usage data)".
+    Nothing is modified anywhere - every call is a read.
+
+.PARAMETER ModelName
+    Model name shown inside the Nerdio Modeler. Default "AVD Environment - Actuals".
+.PARAMETER LookbackDays
+    Days of usage history to analyze. Default 30.
+.PARAMETER TimeZone
+    IANA time zone for work-hours math (the environment's local zone), e.g.
+    America/New_York, America/Chicago, Europe/London. Default America/New_York.
+.PARAMETER SubscriptionId
+    Optional subscription ID(s) to narrow the scan. Default: every enabled
+    subscription this sign-in can see - enumerated and printed at the start of
+    the run, and pinned onto every discovery query. One run covers ONE tenant;
+    the run says so when the account can reach others.
+.PARAMETER OutFile
+    Output file name. Default modeler-import-<timestamp>.json.
+.PARAMETER SkipDownload
+    Skip the Cloud Shell auto-download (file still written to the session).
+.PARAMETER SkipCosts
+    Skip the Cost Management actual-spend pull entirely.
+.PARAMETER NoSlotMerge
+    Keep blue/green slot pools (name-slot-one / name-slot-two, name-blue /
+    name-green) as separate deployments. By default the slots of a family are
+    merged into ONE deployment measured from their combined usage, because the
+    two slots serve the same people in turn and a per-slot model double counts
+    them. The review CSV always keeps one row per pool.
+
+.EXAMPLE
+    # Quick run (Cloud Shell, defaults):
+    iex (irm 'https://raw.githubusercontent.com/dclawrence003/NME/main/modeler/Get-NerdioModelerJson.ps1')
+
+.EXAMPLE
+    # Inspect-then-run form (security-conscious), with options:
+    irm 'https://raw.githubusercontent.com/dclawrence003/NME/main/modeler/Get-NerdioModelerJson.ps1' -OutFile ./modeler.ps1
+    # read it, then:
+    ./modeler.ps1 -TimeZone 'America/Chicago' -ModelName 'Contoso - Actuals'
+
+.NOTES
+    v0.21 (2026-09-16). WHAT THE FIRST 47-POOL CUSTOMER REPORT NEEDED AND THE
+    TOOL COULD NOT GIVE IT. Seven changes, each from a gap found while turning
+    that run into a cost model by hand:
+    (1) BLUE/GREEN SLOT FAMILIES MERGE INTO ONE DEPLOYMENT. The customer runs
+    every production family as name-slot-one and name-slot-two and swaps them
+    on each image release; both slots serve the same people in turn. The
+    per-pool model carried 2,373 users for a tenant whose true peak was 1,065.
+    Slot pools (slot-one/two/three/four, 1-4, blue/green suffixes) are now
+    grouped by family; the 15-minute samples of the slots are added per slot
+    and the peak, window, days and overtime are re-derived with the same rules
+    the KQL applies to one pool (Get-UsageFromSeries). Hosts add up, per-host
+    peak is the highest slot's, MAU is the distinct-user union across the
+    slots, VM spec comes from the slot with the most hosts. Empty slots never
+    take part. The JSON carries one deployment per family; the review CSV
+    keeps one row per pool with a MergedInto column; a SLOT FAMILIES table
+    prints after the review; rawdata.json gets slotFamilies. -NoSlotMerge
+    keeps the old per-pool deployments.
+    (2) TENANT-WIDE COUNTS. Per-pool MAU adds to more users than exist (a
+    person in two pools counts twice) and pools peak at different moments.
+    The run now reports the tenant-wide peak concurrency (sum of the pools'
+    samples per slot, each pool from the workspace its aggregates came from),
+    when it happened in the customer's zone, and the tenant-wide distinct user
+    count, in the console and in rawdata.json (tenant). MAU per pool and per
+    family use the same basis.
+    (3) NO PERSON IS NAMED ANYWHERE IN THE OUTPUT. Distinct users are counted
+    from opaque tokens: each workspace returns hash(salt + sign-in) where the
+    salt is a GUID minted for the run; tokens live in memory only. The
+    share-to-pool username evidence uses the same tokens (both sides hash in
+    Log Analytics), so no username is ever pulled out. The signed-in account
+    prints and is recorded by domain only. The transcript's Username, RunAs
+    User, Machine and Host Application lines are redacted and profile paths
+    are masked before the log goes in the zip.
+    (4) HOSTS COLUMN AND OVER-PROVISIONING FLAG. The review table shows the
+    session hosts registered per pool, and flags a pool (or family) holding at
+    least twice the hosts its measured peak needs with 10% headroom - the
+    customer had 1,564 hosts across seven families for a demand 730 would
+    serve.
+    (5) ACTUALS SPLIT INTO VM AND DISK (ActualVm, ActualDisk columns and
+    costAttribution in rawdata.json) and a flag when OS disks are 40% or more
+    of a pool's bill: hosts are stopped most of the month while their disks
+    keep billing, so the levers are the stopped-disk tier switch and fewer
+    idle hosts, not compute schedules. That customer's disks ($57.7k) cost
+    more than its compute ($53.0k).
+    (6) AZURE AGREEMENT DISCOUNT, MEASURED. A second Cost Management query,
+    grouped by meter with cost and usage quantity, gives the effective unit
+    price the customer pays; the public retail list (prices.azure.com) gives
+    list for the same meter id. The gap is printed per meter class (compute,
+    OS disks, other storage), blended by spend, and entered in the JSON as
+    enterpriseDiscount so the Modeler stops asking. Per-meter detail in
+    rawdata.json (discount). Skipped quietly when either side is unavailable.
+    (7) TRANSPORT ERRORS RETRIED. A dropped socket surfaced as a raw
+    HttpRequestException from Invoke-AzRestMethod on a local run and killed
+    it; the same command worked a minute later. Every Azure call now retries
+    a transport failure three times (3/8/15s) before giving up; auth and HTTP
+    status errors are never retried this way.
+    v0.20.2 (2026-09-16). MISSING Az.Accounts SAID PLAINLY. A customer's first
+    local run (elevated Windows PowerShell, module never installed) died on a
+    raw "The term 'Get-AzContext' is not recognized". The script now checks
+    for the module before anything else and prints the two commands that fix
+    it (Install-Module Az.Accounts -Scope CurrentUser, Connect-AzAccount),
+    then stops cleanly. README troubleshooting row added.
+    v0.20.1 (2026-09-16). COST ATTRIBUTION BY HOST NAMING, NOT BY RESOURCE
+    GROUP. v0.20's first cut swept every unmatched VM and disk in a shared
+    resource group into its pools by host count. Replayed against a demo
+    tenant, that handed an $807 image-builder VM, test boxes, and orphaned
+    disks to host pools as "rebuilt hosts". Now a billed VM (or its OS disk)
+    that is not a current host is attributed only when its name follows a
+    pool's host naming (same stem once trailing numbers and hex suffixes
+    are stripped), split by host count only when several pools in the group
+    share that stem. Everything else stays out of pool totals and is listed
+    by resource group with its top items, in the console and in
+    rawdata.json (costUnattributed). Replayed against the 47-pool run:
+    76,281 attributed (vs 7,294 in v0.19), and the unrelated VMs in the
+    storage groups are named instead of absorbed.
+    v0.20 (2026-09-16). THREE DEFECTS FROM ONE 47-POOL / 1,199-HOST CLOUD
+    SHELL RUN, each of which produced a plausible-looking file that was wrong:
+    (1) TELEMETRY LOST TO A TOKEN TIMEOUT. Cloud Shell's token relay answered
+    "Timeout waiting for token from portal" for the Log Analytics audience.
+    The script asked ONCE per workspace, moved on, defaulted all 47 pools
+    to 1 user, and its banner claimed "no WVDConnections data found" when
+    the query never ran. Now ONE token serves the whole run (cached), each
+    request gets six attempts with growing pauses (5/10/20/30/45s), a second
+    full budget at the next call site in case the relay recovered, and if
+    Azure still won't issue one the run says TELEMETRY NOT COLLECTED in the
+    banner, in every affected pool's Flags, and in the model description,
+    with the re-run instruction. A defaulted pool can no longer pass for a
+    measured one.
+    (2) UNIMPORTABLE FILE. A pool with a session limit of 1 on a 16-vCPU
+    host produced maxUsersPerVCpu 0.06; the Modeler's import validator
+    rejects anything under 0.1 and the whole file failed with "One or more
+    review steps are not completed". The validator's rules were read from
+    the public Modeler app (nmeadvisor.getnerdio.com) and are now replayed
+    as an IMPORT PRE-FLIGHT over every deployment before the JSON is
+    written: density floors at 0.1 (single-session experiences carry 1.0,
+    which is what the Modeler forces anyway), and every other rule (users,
+    region, egress, disk tier, overtime consistency, work days/duration,
+    custom image hours) is checked and auto-corrected with a printed note.
+    The same pass confirmed the experience enum: 1 multi-session, 2
+    personal, 3 single-user pooled, 4 RemoteApp, 5 Windows 365.
+    (3) ACTUALS MISSED REBUILT HOSTS. Cost was attributed by exact resource
+    id against CURRENT session hosts. This customer rebuilds every host on
+    each release (August's generation was gone by mid-September), so nine
+    production pools showed ActualMo 0 while $69k of their VM and disk
+    spend sat in the "other" bucket ($7.3k attributed of $76.3k real).
+    Rebuilt hosts are now recognized and attributed (see v0.20.1 for the
+    final rule). The review CSV gains an ActualBasis column and
+    rawdata.json a costAttribution block so the split is auditable.
+    v0.19 (2026-09-09). NO DATA LOST TO THROTTLING. A 6-scope customer run
+    lost one resource group's actuals to Cost Management HTTP 429s, which
+    meant an estimated number in a CIO-facing model. Three changes, in the
+    order they matter:
+    (1) FEWER CALLS. Cost is now pulled with ONE query per subscription,
+    filtered to the resource groups that hold session hosts and profile
+    storage, instead of one query per resource group. The 6-scope run made
+    up to 36 calls in a burst (Amortized then Actual, three tries each);
+    it now makes one. If a subscription-level query is refused (Reader
+    granted per resource group, offer quirks), that subscription falls back
+    to the per-resource-group path on its own.
+    (2) HONOR RETRY-AFTER. Every Azure REST call (Cost Management, Resource
+    Graph, ARM, Log Analytics) now reads the header a 429 carries - Retry-
+    After in seconds or as a date, x-ms-user-quota-resets-after on Resource
+    Graph - and waits exactly that long before asking again, up to six
+    attempts inside a five-minute budget per call. Fixed 20s/60s waits
+    guessed at the window; this uses Azure's own answer. Cost calls are also
+    paced 1.5s apart. Every wait is printed, so a slow step never looks hung.
+    (3) SECOND PASS. Anything still throttled after its budget is set aside,
+    the run finishes everything else, cools down 90s so the rate window
+    resets, and tries those scopes once more before giving up. A scope that
+    fails both passes is reported as throttled, with the attempt count and
+    seconds waited, and rawdata.json records the whole throttle history.
+    MODELER_FAST_RETRY=1 skips the waits (dev harness only).
+    v0.18 (2026-08-17). EMPTY HOST POOLS STAY OUT OF THE JSON - SE field
+    feedback: a 114-pool tenant carried 38 pool objects with no session
+    hosts and no activity, and each exported as a fake 1-user 9:00+9h
+    deployment (a third of the model was noise that skewed the numbers).
+    A pool is EMPTY when no session host resolves to a VM, AND no
+    connection appeared in the lookback, AND no session was ever counted.
+    Empty pools: excluded from the Modeler JSON, kept in the review table
+    with Flags=EMPTY and dashed columns, listed in rawdata.json
+    (emptyPools), counted in the console and on the Model-written line.
+    Pools WITH session hosts but no users still export flagged - that is
+    real idle compute worth modeling.
+    v0.17.3 (2026-08-12). FIELD HARDENING FROM THE FIRST ENTERPRISE-SCALE
+    RUN (144 pools / 65 subscriptions / 562 storage accounts):
+    (1) Log Analytics 403s caused by workspace NETWORK settings (Network
+    Security Perimeter / public query access off / private link) are named
+    as such - the warning says it is a location problem, not permissions,
+    and gives the fix (run from inside the customer network, or allow the
+    runner's IP on the workspace). Previously they printed as a generic
+    query failure, and the evidence stage mislabeled them as "file-share
+    diagnostics not enabled".
+    (2) Cost Management 429s get three attempts (20s + 60s waits - one 20s
+    retry was not enough at 18-scope scale) and a throttle-specific skip
+    message; the offer-type "common causes" list no longer prints for pure
+    throttling, where it was misleading.
+    v0.17.2 (2026-08-07). DETERMINISTIC REPRESENTATIVE VM SPEC - found by
+    diffing a Windows PowerShell 5.1 run against a Cloud Shell run of the SAME
+    tenant minutes apart: 119 of 120 pools matched on every field; one pool
+    (4 hosts: D2as x2, D4as, D8as) modeled as D2as from Cloud Shell but D8as
+    from 5.1. Root cause: the representative spec grouped on
+    vmSize+ephemeral+imageId in one key, so two D2as hosts running different
+    images split into separate count-1 groups - a 4-way tie - and tie order
+    under Sort-Object is stable in PowerShell 7 but NOT in 5.1. Now the size
+    is chosen first (true mode over vmSize alone), then the image/ephemeral
+    combo among hosts of that size, with every sort ordered Count desc then
+    name asc - the same input picks the same spec in every shell, every run.
+    v0.17.1 (2026-08-07). STALE-COPY SELF-DETECTION - a laptop ran v0.15
+    three times in one day (System32 output, warning floods, 18-pool scans)
+    while Cloud Shell, minutes apart, pulled current code from the same
+    repo. CDN lag was ruled out (the fixes were hours old); a saved
+    modeler.ps1 or a replayed SHA-pinned command keeps old code alive
+    forever, and an old copy looks normal until compared against a fresh
+    one. Now: the version prints as the FIRST line of every run (before
+    sign-in), and the script fetches the published version marker
+    (modeler/VERSION on main, cache-busting query, 5s timeout, silent on
+    any failure) and prints a loud three-line warning with the exact
+    re-fetch command when the running copy is old. RELEASE RULE: bump
+    modeler/VERSION and $ScriptVersion together.
+    v0.17 (2026-08-07). EXPLICIT SUBSCRIPTION SCOPE ON EVERY QUERY - from two
+    same-day runs against the same demo estate: Cloud Shell returned 120 pools,
+    local PowerShell returned 18, with ZERO overlap - disjoint subscriptions,
+    disjoint workspaces. Each window was signed into a different scope, and an
+    unscoped Resource Graph query silently answers for whatever the current
+    sign-in happens to reach. Neither console log recorded who was signed in,
+    so the gap was invisible. Now every run: (1) prints the signed-in account
+    and tenant, (2) enumerates the enabled subscriptions that sign-in can see
+    and prints them, (3) pins that explicit list onto every Resource Graph
+    query (chunked at ARG's 1000-subscription request cap), (4) prints
+    per-subscription pool counts after discovery, (5) warns when the account
+    can reach OTHER tenants (a run covers one tenant - pools there need
+    Connect-AzAccount -TenantId <id> and a second run), and (6) records
+    account/tenant/scope in rawdata.json. Also: Az breaking-change warning
+    suppression - older Az.Accounts (4.x) printed an "Upcoming breaking
+    changes in Get-AzAccessToken" block around every Log Analytics query and
+    flooded the 5.1 transcript.
+    v0.16 (2026-08-07). CREDENTIAL CIRCUIT BREAKER - from a live Cloud Shell
+    run where the shell's token service started returning garbage mid-run
+    ("ManagedIdentityCredential ... invalid: ExpiresOn"). The user was signed
+    in; the token provider glitched, and every later Azure call failed
+    instantly and identically: 72 storage accounts mislabeled "slow or
+    unreadable", ANF and the cost pull dead, ~150 identical error dumps in
+    the transcript. Now: credential-shaped failures are classified apart
+    from slow/unreadable; the first one triggers a pause + one cheap probe;
+    if the token is still broken, ONE plain banner explains the glitch and
+    the fix (restart Cloud Shell / Connect-AzAccount, run again), and every
+    remaining Azure call is skipped fast under an accurate label. The census
+    reports token-blocked accounts separately. Telemetry (stage 4) completes
+    before storage, so pools/windows/MAU survive even a mid-run token death.
+    v0.15.1 (2026-08-07). Local runs save to DOWNLOADS. The first Windows
+    PowerShell 5.1 run (successful end to end - 5.1 support live-proven)
+    wrote its zip to C:\Windows\System32, because that's where an elevated
+    console starts and the script wrote to the current directory. Default
+    output now lands in the user's Downloads folder on local runs, full path
+    printed at the end. Explicit -OutFile and Cloud Shell are unchanged.
+    v0.15 (2026-08-07). TWO RULINGS FROM THE FIRST LIVE v0.14 RUN:
+    (1) STORAGE IS LEDGER-ONLY, ALWAYS. The v0.14 interactive triage asked the
+    runner to classify stores and type pool names mid-run - unworkable at scale
+    (100 stores = 100 prompts) and runners should never do data entry. Removed
+    entirely: no prompts, no -NoPrompts switch, no storage deployments in the
+    JSON under any circumstances. The Modeler JSON carries host pools only,
+    fsLogix off everywhere. Everything discovered goes to the storage ledger
+    CSV with automatic classification (name/msix/junk patterns), log-derived
+    pool evidence when StorageFileLogs exist, sizes, SKU/billing model, and
+    actual cost. The run flows straight through with zero stops.
+    (2) WINDOWS POWERSHELL 5.1 SUPPORTED. Removed every PS7-only construct:
+    ?? null-coalescing (Coalesce helper), ConvertFrom-SecureString -AsPlainText
+    (BSTR marshal), -Encoding utf8NoBOM (UTF8Encoding($false) writer), and
+    added TLS 1.2 enforcement plus an IANA->Windows time-zone map (.NET
+    Framework doesn't know IANA ids). Export-Csv everywhere uses
+    -NoTypeInformation so 5.1 doesn't prepend #TYPE lines. PowerShell 7 still
+    recommended; 5.1 is the built-in fallback.
+    v0.14 (2026-08-07). STORAGE OVERHAUL - nothing unconfirmed enters the model:
+    (1) POLICY: a discovered store lands in the Modeler JSON only when it is
+    confirmed as FSLogix profile storage AND mapped to at least one host pool
+    (by log evidence accepted at the prompt, or typed by the person running).
+    Everything discovered - confirmed or not, app attach, non-AVD, unknown -
+    is quantified in a new storage ledger CSV that always ships in the zip.
+    App attach never enters the JSON (no Modeler concept for it).
+    (2) INLINE TRIAGE: one line per store with a smart default (name-matched ->
+    PROFILES, msix -> APP ATTACH, pvcn-/mq/sftp patterns -> NOT AVD, else
+    UNKNOWN). Enter accepts; pool assignment is search-driven - type name or
+    resource-group fragments, the script resolves and echoes matches; * = all.
+    Drops are bulk-confirmed at the end, never silent. -NoPrompts (or any
+    non-interactive session) skips the pass: ledger only, JSON gets no storage.
+    (3) EVIDENCE: mapping now correlates StorageFileLogs caller IPs with
+    WVDConnections session-host IPs (works across split workspaces - joins
+    happen in PowerShell), with username overlap demoted to fallback evidence;
+    each storage account's own diagnostic-settings workspace is discovered and
+    queried, not just the AVD workspaces. All serving pools are kept (the old
+    6-pool cap was display-only in intent, stored in practice - fixed).
+    (4) CLASSIFICATION BY SKU, not account kind: FileStorage no longer implies
+    premium (provisioned-v2 StandardV2/PremiumV2 SKUs share the kind). Billing
+    basis follows the SKU: provisioned models bill provisioned GB, v1 standard
+    bills used. v2 IOPS/throughput recorded in the ledger.
+    (5) SIZE RESILIENCE: share stats retry once, then fall back to the Azure
+    Monitor FileCapacity metric (already computed platform-side - answers fast
+    where on-demand stats on huge shares hit the 100s timeout). ANF used GB
+    from the VolumeLogicalSize metric. ANF is quantified at its BILLING
+    boundary - the capacity pool, priced once, member volumes listed, shared
+    pools flagged. A census line ends the stage: accounts scanned/skipped,
+    shares sized/unsized - gaps are named, never silent.
+    v0.13 (2026-08-07). LOCAL POWERSHELL IS NOW FIRST-CLASS - from a prospect's
+    local-PS run that lost every usage number:
+    (1) Telemetry queries no longer use Invoke-AzOperationalInsightsQuery (the
+    Az.OperationalInsights module ships in Cloud Shell but rarely on laptops -
+    all 4 workspaces failed with 'not recognized' and every pool defaulted).
+    Queries now go straight to the Log Analytics REST API with a token from
+    Get-AzAccessToken - both live in Az.Accounts, which anyone who can run
+    Connect-AzAccount already has. Handles the Az.Accounts 5.x SecureString
+    token change. Commercial cloud endpoint; sovereign clouds would need edits.
+    (2) Storage discovery survives slow accounts: one 100-second stats timeout
+    (a 100TB share) used to abort every remaining account AND all ANF checking,
+    then print 'continuing without FSLogix modeling' above a table of modeled
+    shares. Now: per-account catch + per-stats catch, ANF isolated, and the log
+    names exactly which accounts were skipped.
+    (3) Missing/expired sign-in gets a plain message (run Connect-AzAccount,
+    add -TenantId if needed) instead of a wall of red TerminatingErrors.
+    v0.12 (2026-08-06). Validated against a live customer's Nerdio Mothership
+    telemetry (independent hourly per-pool concurrency); three changes came out:
+    (1) DAY RULE NORMALIZATION - a 30-day lookback holds 5 of some weekdays and
+    4 of others; normalizing by uniform weeks penalized the 4-occurrence days
+    ~20%, which cost a real call center its Saturday shift. Day and hour rules
+    now normalize by each weekday's actual calendar occurrence count.
+    (2) MAU column in the review table (distinct users per pool over the
+    lookback) - INFORMATIONAL ONLY, never in the JSON. users.total stays peak
+    concurrent: this is an Azure compute exercise, and hosts are sized per-pool
+    from concurrency. MAU answers "the model says 24 users, we have 5,000" and
+    feeds licensing conversations.
+    (3) COUNTING BASIS, made explicit: concurrency counts CONNECTED sessions
+    (WVDConnections spans). NME's console counts sessions incl. disconnected
+    and reads higher (~10-25% at the validation customer). Sizing is safe
+    either way - peak and per-host density share the same basis, so it cancels;
+    observed density was measured on hosts that also carried the disconnected
+    load. When WVDAgentHealthStatus is available and session peaks run >=15%
+    above connected peaks, the pool is flagged so nobody is surprised.
+    Also: rawdata meta version now comes from the same constant as this header.
+    v0.11.1 (2026-08-06). Live-run polish: raw-export success message had a bad
+    escape (files were written; only the message threw - now clean); usage/flag
+    counters exclude storage rows; MSIX/app-attach shares are labeled
+    'AppAttach - <share>' instead of FSLogix (still modeled - the storage cost
+    is real - but never confused with user profiles).
+    v0.11 (2026-08-06). Raw decision data rides in the zip: <name>-rawdata.json
+    (inventory, VM/disk specs, workspaces, usage aggregates, storage findings,
+    cost rows + skips, run parameters) and <name>-usage-buckets.csv (per-pool
+    15-minute concurrency, UTC). Purpose: model adjustments re-derive offline
+    from one customer run - no repeat asks. Boundaries in the file's meta.notes.
+    v0.10.1 (2026-08-06). Two live-run fixes from Don's demo tenant log:
+    (1) FSLogix storage discovery query used 'kind' as a projected column name -
+    ARG's parser rejects it as reserved; renamed accountKind. (2) The Cost
+    Management API no longer supports timeframe 'TheLastMonth' (HTTP 400
+    everywhere - cost pull was silently dead on every tenant); now uses an
+    explicit Custom range for last calendar month (UTC).
+    v0.10 (2026-08-05). One-file handoff: the run's console output is captured
+    (transcript, ANSI-stripped) and packaged with the JSON + review CSV into
+    modeler-import-<ts>.zip - one download, one file to send back. Degrades
+    to individual downloads if transcription or zipping is unavailable.
+    v0.9.1 (2026-08-05). storageType emitted exactly from the storage itself -
+    dropdown enum decoded (1=Files Premium LRS, 2=Files Premium ZRS, 3/4/5=ANF
+    Standard/Premium/Ultra): LRS/ZRS from the account SKU, ANF tier from the
+    volume's service level. The Modeler has no standard-Files option, so
+    standard shares model as Premium LRS on USED GB (flagged, conservative).
+    v0.9 (2026-08-05). FSLogix profile storage, modeled from the cost surface:
+    discovers Azure Files shares (provisioned + used via share stats) and SMB
+    ANF volumes, maps shares to pools from StorageFileLogs usernames when the
+    tenant ships file diagnostics to Log Analytics, and adds ONE dummy
+    deployment per profile store (users=1, profileSizeGb=measured GB, B2s for
+    1h/week - compute noise ~zero). Storage is priced once per share, never
+    per pool, so users in multiple pools can't double-count profile GB.
+    Premium/ANF model PROVISIONED (today's bill); standard models USED.
+    storageType emitted as 1 pending the Modeler dropdown enum - verify tier.
+    All paths skip-graceful; no candidates = model unchanged.
+    v0.8.1 (2026-08-05). ActualMo column now always present in the review CSV
+    (Export-Csv takes columns from the first row; a costless first pool was
+    silently dropping the column for every pool). Empty ActualMo = cost pull
+    skipped for that pool's scope.
+    v0.8 (2026-08-05). Work window and work days now qualify by REGULAR load:
+    hourly averages include the silent slots, and days count by their share of
+    the busiest day's user-hours - so a handful of off-hours logins lands in
+    the overtime fields instead of stretching the work window to 24h. New
+    flags: genuine round-the-clock presence; usage too sparse for a window.
+    Field-driven fix from the first real-customer run.
+    v0.7 (2026-08-04). Language pass for customer-facing use; default ModelName
+    is now "AVD Environment - Actuals".
+    v0.6 (2026-08-04). Adds model-vs-actual: last month's ACTUAL spend for the
+    session-host VMs + disks via the Cost Management Query API, shown as an
+    ActualMo column in the review table.
+    COST PULL REQUIREMENTS + SKIP BEHAVIOR: succeeds with the same Reader access
+    the script already needs (any of Owner / Contributor / Reader / Cost Management
+    Reader at RG or subscription scope). When it fails, it is almost never RBAC.
+    It is billing-side policy: CSP subscriptions without customer cost visibility,
+    EA enrollments where the admin disabled "view charges", or sponsored/legacy
+    offers. Every such scope is SKIPPED with one warning line; the model, review
+    table, JSON, and download are never affected. -SkipCosts disables the pull.
+    Review table shows each pool's resource group, and the run ends with the list
+    of resource groups holding session-host VMs (the Cost Management filter list).
+    Requires: Azure Cloud Shell (PowerShell), or local PowerShell 7 or Windows
+    PowerShell 5.1 with the Az.Accounts module + Connect-AzAccount (no other
+    Az modules used). Needs Reader on the subscriptions and Log Analytics
+    Reader on the discovered workspaces.
+    v0.4 REPORTING RULES (per real Modeler UI bounds):
+    - SKUs reported EXACTLY as found, never mapped. workload.type = 5 (Custom),
+      which accepts any AVD SKU.
+    - Density (maxUsersPerVCpu) = OBSERVED peak concurrent users on a single host
+      (capped at the configured session limit), so the model reflects how they
+      actually pack hosts, not what they allow. Falls back to session limit /
+      vCPUs when there's no telemetry (flagged); last resort 1.0, flagged.
+      UI max 10. Both numbers appear in the review grid (PerHostPeak vs Limit);
+      the gap between them is density headroom Nerdio can reclaim.
+    - Disk type reported as found (Premium_LRS / StandardSSD_LRS / Standard_LRS all
+      valid). Disk size snapped UP to the Modeler's offered tiers
+      (128/256/512/1024/2048/4096 GB) only when the actual size isn't offered.
+      stoppedDiskType always Standard_LRS (disk switching is the Nerdio feature
+      being modeled).
+    - Work window cannot cross midnight (UI max 23:45): trimmed only at that
+      boundary. users.total floored to 1 on zero-utilization pools (name carries
+      "(no usage data)"). overtimeHours 0 when overtime disabled.
+    Every adjustment is visible in the Flags column.
+#>
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $false)] [string]   $ModelName      = "AVD Environment - Actuals",
+    [Parameter(Mandatory = $false)] [int]      $LookbackDays   = 30,
+    [Parameter(Mandatory = $false)] [string]   $TimeZone       = "America/New_York",
+    [Parameter(Mandatory = $false)] [string[]] $SubscriptionId = @(),
+    [Parameter(Mandatory = $false)] [string]   $OutFile        = "",
+    [Parameter(Mandatory = $false)] [switch]   $SkipDownload,
+    [Parameter(Mandatory = $false)] [switch]   $SkipCosts,
+    [Parameter(Mandatory = $false)] [switch]   $NoSlotMerge
+)
+
+$ErrorActionPreference = 'Stop'
+$ScriptVersion = 'v0.21' # RELEASE RULE: bump modeler/VERSION in the same commit
+# Windows PowerShell 5.1 compatibility: force TLS 1.2 (old .NET Framework
+# defaults can be lower and ARM/Log Analytics require 1.2), and no PS7-only
+# syntax anywhere in this file (?? / ?. / -AsPlainText / utf8NoBOM).
+try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
+# Older Az.Accounts (4.x) prints an "Upcoming breaking changes in the cmdlet
+# 'Get-AzAccessToken'" warning block on EVERY call - a live 5.1 run drowned its
+# transcript in them. This env var is the Az-supported off switch; it is
+# process-scoped and touches no user configuration.
+$env:SuppressAzurePowerShellBreakingChangeWarnings = 'true'
+function Coalesce { param($a, $b) if ($null -ne $a) { $a } else { $b } }
+function Get-HostNameStem {
+    # "avd-ec1-7-3-94" and "avd-ec1-8-1-108" -> "avd-ec"; "mspooled-268d" -> "mspooled";
+    # "vm7_OsDisk_1_<guid>" and "personal-03-osdisk" -> the VM's stem. Trailing
+    # numbers and short hex tokens (NME's random suffixes) are stripped until
+    # nothing changes. Empty when nothing is left.
+    param([string]$Name)
+    $n = "$Name".ToLowerInvariant()
+    $n = [regex]::Replace($n, '[-_](?:os)?disk.*$', '')
+    while ($true) {
+        $n2 = [regex]::Replace($n, '[-_]?(?:\d+|(?=[0-9a-f]{2,4}$)[0-9a-f]*\d[0-9a-f]*)$', '')
+        $n2 = $n2.TrimEnd('-', '_')
+        if ($n2 -eq $n) { break }
+        $n = $n2
+    }
+    return $n
+}
+function Write-Utf8NoBom {
+    param([string]$FilePath, [string]$Content)
+    $full = if ([IO.Path]::IsPathRooted($FilePath)) { $FilePath } else { Join-Path (Get-Location).Path $FilePath }
+    [IO.File]::WriteAllText($full, $Content, (New-Object System.Text.UTF8Encoding($false)))
+}
+# Cloud Shell detection first - the output location depends on it
+$script:IsCloudShell = (-not [string]::IsNullOrEmpty($env:ACC_CLOUD)) -or ($env:AZUREPS_HOST_ENVIRONMENT -like "cloud-shell*")
+if ([string]::IsNullOrEmpty($OutFile)) {
+    $OutFile = "modeler-import-$(Get-Date -Format 'yyyyMMdd-HHmm').json"
+    # Local runs default the whole output set into the user's Downloads folder -
+    # that's where people look, and an elevated console starts in
+    # C:\Windows\System32, where output effectively vanishes. An explicit
+    # -OutFile and Cloud Shell (which auto-downloads) are left untouched.
+    if (-not $script:IsCloudShell) {
+        $dl = Join-Path $HOME 'Downloads'
+        if (Test-Path -LiteralPath $dl) { $OutFile = Join-Path $dl $OutFile }
+    }
+}
+
+function Write-Info { param([string]$m) Write-Host "[i] $m" -ForegroundColor Gray }
+function Write-Ok   { param([string]$m) Write-Host "[+] $m" -ForegroundColor Green }
+function Write-Warn2{ param([string]$m) Write-Host "[!] $m" -ForegroundColor Yellow }
+
+# --- throttling: honor Azure's own Retry-After, never lose data to a 429 (v0.19) ---
+# Azure services that throttle (Cost Management most of all; Resource Graph and
+# Log Analytics on big estates) answer HTTP 429 WITH a header that says how long
+# to wait: Retry-After (seconds, or an HTTP date), or on Resource Graph
+# x-ms-user-quota-resets-after (hh:mm:ss). Waiting exactly that long and asking
+# again is the documented contract. The previous fixed 20s/60s waits guessed at
+# the window and lost a resource group's actuals on a 6-scope customer run.
+$script:Throttle = @{ Hits = 0; WaitedSeconds = 0; Services = @{}; Recovered = @() }
+$script:TransportRetries = 0
+function Get-RetryAfterSeconds {
+    # Accepts an Invoke-AzRestMethod response (.Headers), a plain hashtable of
+    # headers, or an ErrorRecord from Invoke-RestMethod (.Exception.Response.Headers).
+    # Returns whole seconds, or $null when no usable header is present.
+    param($Source)
+    $hdrs = $null
+    try {
+        if ($null -eq $Source) { return $null }
+        if ($Source -is [System.Management.Automation.ErrorRecord]) { $hdrs = $Source.Exception.Response.Headers }
+        elseif ($Source -is [System.Collections.IDictionary]) { $hdrs = $Source }
+        elseif ($Source.PSObject.Properties['Headers']) { $hdrs = $Source.Headers }
+    } catch { return $null }
+    if ($null -eq $hdrs) { return $null }
+    $pairs = @()
+    try {
+        if ($hdrs -is [System.Collections.IDictionary]) { foreach ($k in @($hdrs.Keys)) { $pairs += ,@("$k", @($hdrs[$k])) } }
+        elseif ($hdrs.PSObject.Properties['AllKeys']) { foreach ($k in @($hdrs.AllKeys)) { $pairs += ,@("$k", @($hdrs[$k])) } }   # WebHeaderCollection (5.1)
+        else { foreach ($h in $hdrs) { $pairs += ,@("$($h.Key)", @($h.Value)) } }                                             # HttpResponseHeaders (Az, PS7)
+    } catch { return $null }
+    $best = $null
+    foreach ($p in $pairs) {
+        if ($p[0] -notmatch '(?i)retry-after|resets-after') { continue }
+        foreach ($v in $p[1]) {
+            $s = "$v".Trim(); $secs = $null; $n = 0; $ts = [TimeSpan]::Zero; $dt = [DateTime]::MinValue
+            if ([int]::TryParse($s, [ref]$n)) { $secs = $n }
+            elseif ([TimeSpan]::TryParse($s, [ref]$ts)) { $secs = [int][Math]::Ceiling($ts.TotalSeconds) }
+            elseif ([DateTime]::TryParse($s, [ref]$dt)) { $secs = [int][Math]::Ceiling(($dt.ToUniversalTime() - [DateTime]::UtcNow).TotalSeconds) }
+            if ($null -ne $secs -and $secs -ge 0 -and ($null -eq $best -or $secs -gt $best)) { $best = $secs }
+        }
+    }
+    return $best
+}
+# v0.21: transient TRANSPORT failures (the socket dropped, a proxy hiccup, DNS
+# blinked) surface as an HttpRequestException thrown by Invoke-AzRestMethod or
+# Invoke-RestMethod, not as an HTTP status. A live local run died on one and
+# succeeded untouched a minute later. Three quick retries with short pauses,
+# then the original error. Auth and HTTP-status errors are never retried here.
+function Test-CredError { param([string]$Message) [bool]($Message -match '(?i)credentials have not been set up|Connect-AzAccount|ManagedIdentityCredential') }
+function Test-TransportError { param([string]$Message) [bool]($Message -match '(?i)HttpRequestException|error occurred while sending the request|connection was (forcibly )?closed|connection reset|unable to connect|could not connect|name resolution|No such host|timed out|timeout|SSL connection|SecureChannel|socket') }
+function Invoke-AzRestRetry {
+    # Invoke-AzRestMethod with the 429/503 contract handled: wait what Azure asks
+    # (capped at 120s; backoff 5/15/30/60/90s when no header), up to MaxAttempts
+    # inside BudgetSeconds. Returns the last response either way - callers keep
+    # their own status handling. Every wait is printed so a slow step never
+    # looks hung. MODELER_FAST_RETRY=1 skips the sleeps (harness only).
+    param([string]$Method = 'GET', [string]$Path, [string]$Uri, [string]$Payload, [string]$What = 'Azure',
+          [int]$MaxAttempts = 6, [int]$BudgetSeconds = 300)
+    $started = [DateTime]::UtcNow
+    $transportTries = 0
+    for ($attempt = 1; ; $attempt++) {
+        $call = @{ Method = $Method }
+        if ($Uri) { $call.Uri = $Uri } else { $call.Path = $Path }
+        if ($Payload) { $call.Payload = $Payload }
+        try { $resp = Invoke-AzRestMethod @call }
+        catch {
+            $msg = ("$($_.Exception.Message)" -split "`r?`n")[0].Trim()
+            if ((Test-TransportError $msg) -and -not (Test-CredError $msg) -and $transportTries -lt 3) {
+                $transportTries++
+                $wait = @(3, 8, 15)[$transportTries - 1]
+                $script:TransportRetries++
+                Write-Info "$What call hit a transport error ($msg) - waiting ${wait}s, then trying again ($transportTries of 3)."
+                if ($env:MODELER_FAST_RETRY -ne '1') { Start-Sleep -Seconds $wait }
+                $attempt--
+                continue
+            }
+            throw
+        }
+        if ($resp.StatusCode -ne 429 -and $resp.StatusCode -ne 503) { return $resp }
+        $script:Throttle.Hits++
+        $script:Throttle.Services[$What] = 1 + [int](Coalesce $script:Throttle.Services[$What] 0)
+        $elapsed = ([DateTime]::UtcNow - $started).TotalSeconds
+        if ($attempt -ge $MaxAttempts -or $elapsed -ge $BudgetSeconds) { return $resp }
+        $asked = Get-RetryAfterSeconds $resp
+        $wait = if ($null -ne $asked) { [Math]::Min([Math]::Max([int]$asked, 1), 120) } else { @(5, 15, 30, 60, 90)[[Math]::Min($attempt - 1, 4)] }
+        if ($null -ne $asked) { Write-Info "$What is throttling (HTTP $($resp.StatusCode)) and asked for a $($asked)s pause - honoring it, then trying again (attempt $attempt of $MaxAttempts)." }
+        else { Write-Info "$What is throttling (HTTP $($resp.StatusCode)) without saying how long - waiting $($wait)s, then trying again (attempt $attempt of $MaxAttempts)." }
+        $script:Throttle.WaitedSeconds += $wait
+        if ($env:MODELER_FAST_RETRY -ne '1') { Start-Sleep -Seconds $wait }
+    }
+}
+
+# --- console transcript: captured into the output zip so one run = one file back ---
+$script:TranscriptFile = ($OutFile -replace '\.json$', '') + '-console.log'
+$script:TranscriptOn = $false
+try { Start-Transcript -Path $script:TranscriptFile -Force | Out-Null; $script:TranscriptOn = $true }
+catch { Write-Warn2 "Console transcript unavailable ($($_.Exception.Message)) - the zip will omit the run log." }
+
+# The version is the FIRST line of every run - before sign-in, before anything.
+# Three local runs in one day executed a fossilized v0.15 while Cloud Shell,
+# minutes apart, pulled current code: a saved modeler.ps1 or a replayed
+# SHA-pinned command keeps old code alive forever, and an old copy looks fine
+# until its output is compared against a fresh one.
+Write-Info "Get-NerdioModelerJson $ScriptVersion"
+# Stale-copy self-check: compare against the published version marker. Any
+# failure (offline, proxy, repo moved) stays silent - freshness advice must
+# never break a run. The random query defeats CDN/proxy caching.
+try {
+    $verUrl = "https://raw.githubusercontent.com/dclawrence003/NME/main/modeler/VERSION?nocache=$(Get-Random)"
+    $latestVer = ("$(Invoke-RestMethod -Uri $verUrl -TimeoutSec 5)").Trim()
+    if ($latestVer -match '^v[\d.]+$' -and $latestVer -ne $ScriptVersion) {
+        Write-Warn2 "THIS COPY IS STALE: it is $ScriptVersion, but the published version is $latestVer."
+        Write-Warn2 "Fixes shipped since $ScriptVersion are missing from this run. Delete any saved modeler.ps1, then re-paste:"
+        Write-Warn2 "    iex (irm 'https://raw.githubusercontent.com/dclawrence003/NME/main/modeler/Get-NerdioModelerJson.ps1')"
+    }
+} catch { }
+
+# --- Cloud Shell auto-download (same pattern as Test-NmeDeploymentReadiness) ---
+function Invoke-CloudShellDownload {
+    param([string]$Path)
+    if (-not $script:IsCloudShell) { Write-Info "Not running in Cloud Shell - file saved at: $Path"; return }
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    try {
+        download $Path
+        Write-Ok "Browser download triggered for $Path"
+    } catch {
+        Write-Warn2 "Auto-download unavailable. Use the Cloud Shell 'Manage files -> Download' toolbar button and enter: $Path"
+    }
+}
+
+# --- Resource Graph via REST (no extra modules; pages through results) ---
+# EVERY query is pinned to an explicit subscription list. Two same-day runs of
+# the same estate returned 120 pools (Cloud Shell) vs 18 (local PowerShell)
+# with zero overlap: each window was signed into a different default scope, and
+# an unscoped ARG query silently answers for whatever that happens to be.
+# -SubscriptionId (if given) wins; otherwise the enabled subscriptions
+# enumerated at startup. ARG caps one request at 1000 subscriptions, so the
+# list is chunked and results merged. Empty list (enumeration failed) falls
+# back to unscoped rather than dying - the startup warning already said so.
+function Invoke-ArgQuery {
+    param([string]$Query)
+    $scope = @(if ($SubscriptionId.Count -gt 0) { $SubscriptionId } else { $script:ScopeSubIds })
+    $chunkList = New-Object System.Collections.ArrayList
+    if ($scope.Count -gt 0) {
+        for ($i = 0; $i -lt $scope.Count; $i += 1000) {
+            [void]$chunkList.Add(@($scope[$i..([Math]::Min($i + 999, $scope.Count - 1))]))
+        }
+    } else { [void]$chunkList.Add($null) }
+    $all = @()
+    foreach ($chunk in $chunkList) {
+        $skip = $null
+        do {
+            $body = @{ query = $Query; options = @{ resultFormat = 'objectArray' } }
+            if ($null -ne $chunk) { $body.subscriptions = @($chunk) }
+            if ($skip) { $body.options.'$skipToken' = $skip }
+            $resp = Invoke-AzRestRetry -Method POST -Path "/providers/Microsoft.ResourceGraph/resources?api-version=2022-10-01" -Payload ($body | ConvertTo-Json -Depth 6) -What 'Resource Graph'
+            if ($resp.StatusCode -ne 200) { throw "Resource Graph query failed (HTTP $($resp.StatusCode)): $($resp.Content)" }
+            $parsed = $resp.Content | ConvertFrom-Json
+            $all += @($parsed.data)
+            $skip = $parsed.'$skipToken'
+        } while ($skip)
+    }
+    return $all
+}
+
+# --- Cost Management Query API (skip-safe; see .NOTES v0.19) --------------------
+# One query per SUBSCRIPTION, filtered to the resource groups that matter, is the
+# normal path; the per-resource-group scope is the fallback when a subscription-
+# level query is refused. Both go through Invoke-AzRestRetry, so a 429 waits what
+# Azure asks instead of guessing. Calls are paced 1.5s apart on top of that.
+$script:LastCostCallUtc = $null
+function Get-ActualCostRows {
+    param([string]$Scope, [string]$CostType = 'ActualCost', [string[]]$ResourceGroupFilter = @())
+    # The API dropped support for timeframe 'TheLastMonth' (HTTP 400: "currently not
+    # supported") - use an explicit Custom range covering last calendar month (UTC).
+    $utcNow = [DateTime]::UtcNow
+    $firstOfThisMonth = [DateTime]::new($utcNow.Year, $utcNow.Month, 1, 0, 0, 0, [DateTimeKind]::Utc)
+    $lastMonthStart = $firstOfThisMonth.AddMonths(-1)
+    $lastMonthEnd = $firstOfThisMonth.AddDays(-1)
+    $svcFilter = @{ dimensions = @{ name = 'ServiceName'; operator = 'In'; values = @('Virtual Machines', 'Storage') } }
+    $filter = if ($ResourceGroupFilter.Count -gt 0) {
+        @{ and = @($svcFilter, @{ dimensions = @{ name = 'ResourceGroupName'; operator = 'In'; values = @($ResourceGroupFilter) } }) }
+    } else { $svcFilter }
+    $body = @{
+        type = $CostType
+        timeframe = 'Custom'
+        timePeriod = @{
+            from = $lastMonthStart.ToString('yyyy-MM-ddT00:00:00+00:00')
+            to   = $lastMonthEnd.ToString('yyyy-MM-ddT23:59:59+00:00')
+        }
+        dataset = @{
+            aggregation = @{ totalCost = @{ name = 'Cost'; function = 'Sum' } }
+            grouping = @(@{ type = 'Dimension'; name = 'ResourceId' })
+            filter = $filter
+        }
+    } | ConvertTo-Json -Depth 10
+    $rows = @(); $nextUri = $null; $first = $true
+    while ($first -or $nextUri) {
+        if ($script:LastCostCallUtc -and $env:MODELER_FAST_RETRY -ne '1') {
+            $gapMs = ([DateTime]::UtcNow - $script:LastCostCallUtc).TotalMilliseconds
+            if ($gapMs -lt 1500) { Start-Sleep -Milliseconds ([int](1500 - $gapMs)) }
+        }
+        $script:LastCostCallUtc = [DateTime]::UtcNow
+        $resp = if ($nextUri) { Invoke-AzRestRetry -Method POST -Uri $nextUri -Payload $body -What 'Cost Management' }
+                else { Invoke-AzRestRetry -Method POST -Path "$Scope/providers/Microsoft.CostManagement/query?api-version=2023-03-01" -Payload $body -What 'Cost Management' }
+        if ($resp.StatusCode -ne 200) {
+            $msg = ''
+            try { $msg = "$((($resp.Content | ConvertFrom-Json).error.message))" } catch { $msg = "$($resp.Content)" }
+            if ($msg.Length -gt 160) { $msg = $msg.Substring(0, 160) + '...' }
+            return @{ ok = $false; status = "HTTP $($resp.StatusCode) - $msg"; rows = @() }
+        }
+        $parsed = $resp.Content | ConvertFrom-Json
+        $cols = @($parsed.properties.columns.name)
+        $ci = [array]::IndexOf($cols, 'Cost'); $ri = [array]::IndexOf($cols, 'ResourceId'); $cu = [array]::IndexOf($cols, 'Currency')
+        foreach ($r in $parsed.properties.rows) {
+            $rows += [pscustomobject]@{
+                Cost = [double]$r[$ci]
+                ResourceId = ("$($r[$ri])").ToLower()
+                Currency = $(if ($cu -ge 0) { "$($r[$cu])" } else { '' })
+            }
+        }
+        $nextUri = $parsed.properties.nextLink
+        $first = $false
+    }
+    return @{ ok = $true; rows = $rows }
+}
+# One cost scope, both cost types. AmortizedCost spreads RI/Savings Plan purchases
+# across usage (the honest number for reserved customers); PAYG-type offers reject
+# it, so fall back to ActualCost. EXCEPT on 429: throttling is rate-based, not
+# cost-type-specific - asking for the other type just doubles the hammering.
+function Invoke-CostScope {
+    param($Item)
+    $filter = @(if ($Item.Kind -eq 'sub') { $Item.RGs } else { @() })
+    try { $res = Get-ActualCostRows -Scope $Item.Scope -CostType 'AmortizedCost' -ResourceGroupFilter $filter } catch { $res = @{ ok = $false; status = "error: $($_.Exception.Message)" } }
+    if (-not $res.ok -and "$($res.status)" -notmatch '^HTTP 429') {
+        try { $res = Get-ActualCostRows -Scope $Item.Scope -CostType 'ActualCost' -ResourceGroupFilter $filter } catch { $res = @{ ok = $false; status = "error: $($_.Exception.Message)" } }
+    }
+    return $res
+}
+
+# v0.21: EFFECTIVE RATES. The same Cost Management query, grouped by meter with
+# cost AND usage quantity, gives what the customer actually pays per unit. The
+# public retail price list (prices.azure.com, no sign-in) gives list. The gap is
+# the Azure agreement discount the Modeler asks for, measured instead of guessed.
+function Get-MeterRateRows {
+    param([string]$Scope, [string[]]$ResourceGroupFilter = @())
+    $utcNow = [DateTime]::UtcNow
+    $firstOfThisMonth = [DateTime]::new($utcNow.Year, $utcNow.Month, 1, 0, 0, 0, [DateTimeKind]::Utc)
+    $lastMonthStart = $firstOfThisMonth.AddMonths(-1); $lastMonthEnd = $firstOfThisMonth.AddDays(-1)
+    $svcFilter = @{ dimensions = @{ name = 'ServiceName'; operator = 'In'; values = @('Virtual Machines', 'Storage') } }
+    $filter = if ($ResourceGroupFilter.Count -gt 0) { @{ and = @($svcFilter, @{ dimensions = @{ name = 'ResourceGroupName'; operator = 'In'; values = @($ResourceGroupFilter) } }) } } else { $svcFilter }
+    $body = @{
+        type = 'ActualCost'; timeframe = 'Custom'
+        timePeriod = @{ from = $lastMonthStart.ToString('yyyy-MM-ddT00:00:00+00:00'); to = $lastMonthEnd.ToString('yyyy-MM-ddT23:59:59+00:00') }
+        dataset = @{
+            aggregation = @{ totalCost = @{ name = 'Cost'; function = 'Sum' }; totalQuantity = @{ name = 'UsageQuantity'; function = 'Sum' } }
+            grouping = @(@{ type = 'Dimension'; name = 'MeterId' }, @{ type = 'Dimension'; name = 'Meter' })
+            filter = $filter
+        }
+    } | ConvertTo-Json -Depth 10
+    $rows = @(); $nextUri = $null; $first = $true
+    while ($first -or $nextUri) {
+        if ($script:LastCostCallUtc -and $env:MODELER_FAST_RETRY -ne '1') {
+            $gapMs = ([DateTime]::UtcNow - $script:LastCostCallUtc).TotalMilliseconds
+            if ($gapMs -lt 1500) { Start-Sleep -Milliseconds ([int](1500 - $gapMs)) }
+        }
+        $script:LastCostCallUtc = [DateTime]::UtcNow
+        $resp = if ($nextUri) { Invoke-AzRestRetry -Method POST -Uri $nextUri -Payload $body -What 'Cost Management' }
+                else { Invoke-AzRestRetry -Method POST -Path "$Scope/providers/Microsoft.CostManagement/query?api-version=2023-03-01" -Payload $body -What 'Cost Management' }
+        if ($resp.StatusCode -ne 200) {
+            $msg = ''; try { $msg = "$((($resp.Content | ConvertFrom-Json).error.message))" } catch { $msg = "$($resp.Content)" }
+            if ($msg.Length -gt 160) { $msg = $msg.Substring(0, 160) + '...' }
+            return @{ ok = $false; status = "HTTP $($resp.StatusCode) - $msg"; rows = @() }
+        }
+        $parsed = $resp.Content | ConvertFrom-Json
+        $cols = @($parsed.properties.columns.name)
+        $ci = [array]::IndexOf($cols, 'Cost'); $qi = [array]::IndexOf($cols, 'UsageQuantity'); $mi = [array]::IndexOf($cols, 'MeterId'); $ni = [array]::IndexOf($cols, 'Meter'); $cu = [array]::IndexOf($cols, 'Currency')
+        if ($ci -lt 0 -or $qi -lt 0 -or $mi -lt 0) { return @{ ok = $false; status = "unexpected columns: $($cols -join ',')"; rows = @() } }
+        foreach ($r in $parsed.properties.rows) {
+            $rows += [pscustomobject]@{ Cost = [double]$r[$ci]; Quantity = [double]$r[$qi]; MeterId = "$($r[$mi])".ToLower(); Meter = $(if ($ni -ge 0) { "$($r[$ni])" } else { '' }); Currency = $(if ($cu -ge 0) { "$($r[$cu])" } else { '' }) }
+        }
+        $nextUri = $parsed.properties.nextLink; $first = $false
+    }
+    return @{ ok = $true; rows = $rows }
+}
+function Get-RetailUnitPrice {
+    # Public retail price for one meter (no sign-in). Returns @{ price; unit; service; product; sku; region } or $null.
+    param([string]$MeterId, [string]$Currency = 'USD')
+    try {
+        $uri = "https://prices.azure.com/api/retail/prices?currencyCode='$Currency'&`$filter=meterId eq '$MeterId' and type eq 'Consumption'"
+        $r = Invoke-RestMethod -Uri $uri -Method Get -TimeoutSec 20
+        $items = @($r.Items | Where-Object { "$($_.type)" -eq 'Consumption' })
+        if ($items.Count -eq 0) { return $null }
+        $now = [DateTime]::UtcNow
+        $live = @($items | Where-Object { -not $_.effectiveStartDate -or ([DateTime]$_.effectiveStartDate) -le $now } | Sort-Object { [DateTime]$_.effectiveStartDate } -Descending)
+        $it = if ($live.Count -gt 0) { $live[0] } else { $items[0] }
+        return @{ price = [double]$it.retailPrice; unit = "$($it.unitOfMeasure)"; service = "$($it.serviceName)"; product = "$($it.productName)"; sku = "$($it.skuName)"; region = "$($it.armRegionName)"; meterName = "$($it.meterName)" }
+    } catch { return $null }
+}
+
+# v0.20.2: a laptop without Az.Accounts used to die on a raw "Get-AzContext is
+# not recognized" (a customer's first local run, elevated console, no module).
+# Say what is missing and print the two commands that fix it.
+if (-not (Get-Command Get-AzContext -ErrorAction SilentlyContinue)) {
+    Write-Warn2 "The Az.Accounts PowerShell module is not installed on this machine, so the script cannot talk to Azure yet. One-time setup (no admin rights needed; answer Y to the NuGet and PSGallery prompts):"
+    Write-Host "      Install-Module Az.Accounts -Scope CurrentUser" -ForegroundColor Yellow
+    Write-Host "      Connect-AzAccount" -ForegroundColor Yellow
+    Write-Warn2 "Then run this command again. Add -TenantId <tenant-id> to Connect-AzAccount if your account reaches more than one tenant. Azure Cloud Shell has the module built in."
+    if ($script:TranscriptOn) { try { Stop-Transcript | Out-Null } catch { }; $script:TranscriptOn = $false }
+    return
+}
+if (-not (Get-AzContext)) {
+    Write-Warn2 "Not signed in to Azure. Run Connect-AzAccount first (add -TenantId <tenant-id> if you have several tenants), then run this command again. In Azure Cloud Shell sign-in is automatic."
+    if ($script:TranscriptOn) { try { Stop-Transcript | Out-Null } catch { }; $script:TranscriptOn = $false }
+    return
+}
+
+# --- identity + subscription scope: stated on every run ------------------------
+# Two same-day runs against "the same demo environment" produced 120 pools from
+# Cloud Shell and 18 from local PowerShell - zero overlap - because the two
+# windows were signed into different scopes, and neither console log recorded
+# who was signed in or what was reachable. The gap was invisible. Every run now
+# states its identity, lists the subscriptions it can see, and pins discovery
+# to that explicit list.
+$azCtx = Get-AzContext
+# v0.21: the sign-in is shown and recorded by DOMAIN only. The console log and
+# rawdata.json travel back to Nerdio and on to whoever reviews the model; the
+# tenant id and the subscription list are what a reviewer needs to tell two
+# runs apart, and a person's UPN is not. Nothing in the output names a person.
+$acctRaw = "$(Coalesce $azCtx.Account.Id '')"
+$script:AcctText = if ($acctRaw -match '@([^@]+)$') { "an account in $($Matches[1])" } elseif ($acctRaw) { 'a non-UPN identity (service principal or managed identity)' } else { 'unknown account' }
+$script:TenText  = Coalesce $azCtx.Tenant.Id  'unknown tenant'
+Write-Info "Signed in as $($script:AcctText) - tenant $($script:TenText)."
+$script:ScopeSubIds = @()
+$script:SubNameById = @{}
+try {
+    $subsRaw = @()
+    $nextPath = "/subscriptions?api-version=2020-01-01"
+    while ($nextPath) {
+        $resp = Invoke-AzRestRetry -Method GET -Path $nextPath
+        if ($resp.StatusCode -ne 200) { throw "HTTP $($resp.StatusCode): $($resp.Content)" }
+        $parsed = $resp.Content | ConvertFrom-Json
+        $subsRaw += @($parsed.value)
+        $nextPath = if ($parsed.nextLink) { ([uri]$parsed.nextLink).PathAndQuery } else { $null }
+    }
+    foreach ($s in $subsRaw) {
+        if ("$($s.state)" -ne 'Enabled') { continue }
+        $script:ScopeSubIds += "$($s.subscriptionId)"
+        $script:SubNameById["$($s.subscriptionId)".ToLower()] = "$($s.displayName)"
+    }
+} catch {
+    Write-Warn2 "Could not enumerate subscriptions ($($_.Exception.Message)) - discovery will run unscoped against this sign-in's defaults."
+}
+if ($SubscriptionId.Count -gt 0) {
+    $visIds = @{}
+    foreach ($id in $script:ScopeSubIds) { $visIds["$id".ToLower()] = $true }
+    foreach ($want in $SubscriptionId) {
+        if ($script:ScopeSubIds.Count -gt 0 -and -not $visIds["$want".ToLower()]) {
+            Write-Warn2 "-SubscriptionId $want is not visible to this sign-in - it will return nothing. Check the account or tenant above."
+        }
+    }
+    Write-Info "Scope: narrowed by -SubscriptionId to $($SubscriptionId.Count) subscription(s)."
+} elseif ($script:ScopeSubIds.Count -gt 0) {
+    Write-Ok "Scope: $($script:ScopeSubIds.Count) enabled subscription(s) visible to this sign-in:"
+    $shown = 0
+    foreach ($id in $script:ScopeSubIds) {
+        $shown++
+        if ($shown -le 25) { Write-Info "    $($script:SubNameById["$id".ToLower()])  ($id)" }
+    }
+    if ($script:ScopeSubIds.Count -gt 25) { Write-Info "    ...and $($script:ScopeSubIds.Count - 25) more (full list lands in rawdata.json)." }
+} else {
+    Write-Warn2 "No enabled subscriptions are visible to this sign-in - discovery will find nothing. Check the account or tenant above."
+}
+# One run covers ONE tenant. If this sign-in can reach others, say so out loud -
+# "the environment" may be bigger than what this run can see.
+try {
+    $tResp = Invoke-AzRestRetry -Method GET -Path "/tenants?api-version=2020-01-01"
+    if ($tResp.StatusCode -eq 200) {
+        $otherTenants = @((($tResp.Content | ConvertFrom-Json).value) | Where-Object { "$($_.tenantId)" -ne "$($script:TenText)" })
+        if ($otherTenants.Count -gt 0) {
+            Write-Warn2 "This account can also reach $($otherTenants.Count) other tenant(s). A run covers ONE tenant - host pools there are NOT in this output:"
+            foreach ($t in $otherTenants) {
+                $tName = Coalesce $t.displayName "$($t.tenantId)"
+                Write-Warn2 "    $tName ($($t.tenantId)) - to cover it: Connect-AzAccount -TenantId $($t.tenantId), then run this command again."
+            }
+        }
+    }
+} catch { }
+
+# --- Log Analytics query via REST (no Az.OperationalInsights dependency) ------
+# Invoke-AzOperationalInsightsQuery ships in Cloud Shell but rarely on laptops -
+# a prospect's local-PS run lost ALL telemetry to that missing module. This uses
+# Get-AzAccessToken + Invoke-RestMethod, both in Az.Accounts, which anyone who
+# can Connect-AzAccount already has. Commercial-cloud endpoint.
+# --- Log Analytics token: one per run, retried, never silently lost (v0.20) ------
+# Live failure (47-pool Cloud Shell run, 2026-09-16): Get-AzAccessToken for the
+# api.loganalytics.io audience threw "Timeout waiting for token from portal" -
+# Cloud Shell's portal token relay, not permissions. The script asked once per
+# workspace, gave up, and every pool went out defaulted to 1 user under a banner
+# that said "no WVDConnections data found". The query had never run. Now: one
+# token is fetched and cached for the run, each fetch gets six attempts with
+# growing pauses, a later call site gets one more full budget in case the relay
+# recovered, and after two dead budgets every remaining query fails fast under
+# the honest label (TELEMETRY NOT COLLECTED) instead of burning minutes.
+$script:LaToken = $null
+$script:LaTokenExpires = [DateTime]::MinValue
+$script:LaTokenDeadBudgets = 0
+$script:LaTokenLastError = ''
+function Get-LaAccessToken {
+    if ($script:LaToken -and $script:LaTokenExpires -gt (Get-Date).AddMinutes(5)) { return $script:LaToken }
+    if ($script:LaTokenDeadBudgets -ge 2) { throw "Log Analytics token unavailable in this shell session ($($script:LaTokenLastError))" }
+    $delays = @(5, 10, 20, 30, 45)
+    $max = 6
+    for ($attempt = 1; $attempt -le $max; $attempt++) {
+        try {
+            $tok = Get-AzAccessToken -ResourceUrl 'https://api.loganalytics.io' -WarningAction SilentlyContinue -ErrorAction Stop
+            # Az.Accounts 5.x returns a SecureString token; older versions a plain string.
+            # BSTR marshal, not ConvertFrom-SecureString -AsPlainText (that flag is PS7-only).
+            $text = if ($tok.Token -is [securestring]) {
+                $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($tok.Token)
+                try { [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) } finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
+            } else { "$($tok.Token)" }
+            if ([string]::IsNullOrWhiteSpace($text)) { throw 'the token service returned an empty token' }
+            $script:LaToken = $text
+            $script:LaTokenExpires = (Get-Date).AddMinutes(50)
+            try { if ($tok.ExpiresOn) { $script:LaTokenExpires = ([DateTimeOffset]$tok.ExpiresOn).LocalDateTime } } catch { }
+            if ($attempt -gt 1) { Write-Ok "Log Analytics token issued on attempt $attempt - continuing." }
+            return $text
+        } catch {
+            $msg = ("$($_.Exception.Message)" -split "`r?`n")[0].Trim()
+            if ($msg.Length -gt 140) { $msg = $msg.Substring(0, 140) + '...' }
+            $script:LaTokenLastError = $msg
+            if ($attempt -ge $max) {
+                $script:LaTokenDeadBudgets++
+                throw "Log Analytics token not issued after $max attempts: $msg"
+            }
+            $wait = $delays[[Math]::Min($attempt - 1, $delays.Count - 1)]
+            Write-Info "Azure did not issue a Log Analytics token ($msg) - waiting ${wait}s, then asking again (attempt $attempt of $max)."
+            if ($env:MODELER_FAST_RETRY -ne '1') { Start-Sleep -Seconds $wait }
+        }
+    }
+}
+function Test-LaTokenFailure { param([string]$Message) [bool]($Message -match '(?i)Log Analytics token (not issued|unavailable)') }
+
+function Invoke-LaQuery {
+    param([string]$WorkspaceCustomerId, [string]$Query)
+    $tokenText = Get-LaAccessToken
+    # v0.19: Log Analytics throttles too (HTTP 429 with Retry-After). Invoke-RestMethod
+    # throws on it, so catch, read the header off the exception, wait, ask again.
+    # v0.20: a 401 means the cached token aged out mid-run - refresh it once.
+    $resp = $null
+    $refreshed = $false
+    $transportTries = 0
+    for ($attempt = 1; $attempt -le 5; $attempt++) {
+        try {
+            $resp = Invoke-RestMethod -Method Post -Uri "https://api.loganalytics.io/v1/workspaces/$WorkspaceCustomerId/query" `
+                -Headers @{ Authorization = "Bearer $tokenText" } -ContentType 'application/json' `
+                -Body (@{ query = $Query } | ConvertTo-Json -Depth 4 -Compress)
+            break
+        } catch {
+            $code = 0; try { $code = [int]$_.Exception.Response.StatusCode } catch { $code = 0 }
+            if ($code -eq 0 -and (Test-TransportError "$($_.Exception.Message)") -and $transportTries -lt 3) {
+                $transportTries++
+                $wait = @(3, 8, 15)[$transportTries - 1]
+                $script:TransportRetries++
+                Write-Info "Log Analytics call hit a transport error ($((("$($_.Exception.Message)" -split "`r?`n")[0]).Trim())) - waiting ${wait}s, then trying again ($transportTries of 3)."
+                if ($env:MODELER_FAST_RETRY -ne '1') { Start-Sleep -Seconds $wait }
+                $attempt--
+                continue
+            }
+            if (($code -eq 401 -or "$($_.Exception.Message)" -match '\b401\b') -and -not $refreshed) {
+                $refreshed = $true; $script:LaToken = $null
+                $tokenText = Get-LaAccessToken
+                continue
+            }
+            $isThrottle = ($code -eq 429) -or ("$($_.Exception.Message)" -match '\b429\b')
+            if (-not $isThrottle -or $attempt -ge 5) { throw }
+            $asked = Get-RetryAfterSeconds $_
+            $wait = if ($null -ne $asked) { [Math]::Min([Math]::Max([int]$asked, 1), 120) } else { @(5, 15, 30, 60)[[Math]::Min($attempt - 1, 3)] }
+            $script:Throttle.Hits++
+            $script:Throttle.Services['Log Analytics'] = 1 + [int](Coalesce $script:Throttle.Services['Log Analytics'] 0)
+            $script:Throttle.WaitedSeconds += $wait
+            Write-Info "Log Analytics is throttling (HTTP 429)$(if ($null -ne $asked) { " and asked for a $($asked)s pause" }) - waiting $($wait)s, then trying again (attempt $attempt of 5)."
+            if ($env:MODELER_FAST_RETRY -ne '1') { Start-Sleep -Seconds $wait }
+        }
+    }
+    $table = @($resp.tables) | Select-Object -First 1
+    $rows = [System.Collections.Generic.List[object]]::new()
+    if ($table) {
+        $colNames = @($table.columns | ForEach-Object { "$($_.name)" })
+        foreach ($r in @($table.rows)) {
+            $o = [ordered]@{}
+            for ($i = 0; $i -lt $colNames.Count; $i++) { $o[$colNames[$i]] = $r[$i] }
+            $rows.Add([pscustomobject]$o)
+        }
+    }
+    [pscustomobject]@{ Results = $rows }
+}
+
+# Workspace network lockdowns (Network Security Perimeter / public query access
+# off / private link) reject the QUERY with a 403 even though RBAC is fine -
+# seen live: a customer's two production AVD workspaces refused Cloud Shell's
+# egress IP ("NspValidationFailedError ... allow access from public networks").
+# The fix is LOCATION, not permissions - so say that, not a generic failure.
+$script:NetBlockedWs = @{}
+$script:TokenFailedWs = @{}   # v0.20: workspaces whose usage query never ran (no Log Analytics token)
+function Test-LaNetworkBlocked {
+    param($ErrorRecord)
+    $txt = "$($ErrorRecord.Exception.Message) $($ErrorRecord.ErrorDetails.Message)"
+    return [bool]($txt -match '(?i)NspValidationFailed|Network Security Perimeter|public network|private link|access to workspace .+ is denied')
+}
+
+# ------------------------------------------------------------------------- 1. pools
+Write-Info "[1/8] Inventorying host pools via Resource Graph..."
+try {
+$pools = Invoke-ArgQuery -Query @"
+resources
+| where type =~ 'microsoft.desktopvirtualization/hostpools'
+| project id, name, resourceGroup, location, subscriptionId,
+          hostPoolType = tostring(properties.hostPoolType),
+          maxSessionLimit = toint(properties.maxSessionLimit),
+          preferredAppGroupType = tostring(properties.preferredAppGroupType),
+          startVMOnConnect = tobool(properties.startVMOnConnect)
+"@
+} catch {
+    if ("$($_.Exception.Message)" -match '(?i)Connect-AzAccount|credential|expired|authentication') {
+        Write-Warn2 "Azure sign-in is missing or expired. Run Connect-AzAccount (add -TenantId <tenant-id> if it mentions tenants), then run this command again."
+        if ($script:TranscriptOn) { try { Stop-Transcript | Out-Null } catch { }; $script:TranscriptOn = $false }
+        return
+    }
+    throw
+}
+if ($pools.Count -eq 0) { throw "No host pools visible in the scanned scope. Check the subscription list printed above, Reader access, the signed-in tenant (Connect-AzAccount -TenantId <id>), or -SubscriptionId." }
+$poolsBySub = @($pools | Group-Object subscriptionId)
+Write-Ok "Found $($pools.Count) host pool(s) across $($poolsBySub.Count) subscription(s):"
+foreach ($g in ($poolsBySub | Sort-Object Count -Descending)) {
+    $subLabel = Coalesce $script:SubNameById["$($g.Name)".ToLower()] "$($g.Name)"
+    Write-Info "    $subLabel : $($g.Count) pool(s)"
+}
+
+# ------------------------------------------------------------- 2. session host -> VM
+Write-Info "[2/8] Mapping session hosts to VMs..."
+$sessionHosts = Invoke-ArgQuery -Query @"
+desktopvirtualizationresources
+| where type =~ 'microsoft.desktopvirtualization/hostpools/sessionhosts'
+| project id, vmId = tolower(tostring(properties.resourceId))
+| where isnotempty(vmId)
+"@
+$poolVmIds = @{}   # poolIdLower -> [vmId,...]
+foreach ($sh in $sessionHosts) {
+    $idx = $sh.id.ToLower().IndexOf('/sessionhosts')
+    if ($idx -lt 1) { continue }
+    $poolKey = $sh.id.Substring(0, $idx).ToLower()
+    if (-not $poolVmIds.ContainsKey($poolKey)) { $poolVmIds[$poolKey] = [System.Collections.Generic.List[string]]::new() }
+    $poolVmIds[$poolKey].Add($sh.vmId)
+}
+$allVmIds = @($poolVmIds.Values | ForEach-Object { $_ } | Select-Object -Unique)
+$vmSpecs = @{}
+for ($i = 0; $i -lt $allVmIds.Count; $i += 100) {
+    $chunk = $allVmIds[$i..([Math]::Min($i + 99, $allVmIds.Count - 1))]
+    $inList = ($chunk | ForEach-Object { "'$_'" }) -join ','
+    $vms = Invoke-ArgQuery -Query @"
+resources
+| where type =~ 'microsoft.compute/virtualmachines'
+| where tolower(id) in~ ($inList)
+| project id = tolower(id),
+          vmSize = tostring(properties.hardwareProfile.vmSize),
+          ephemeral = isnotempty(properties.storageProfile.osDisk.diffDiskSettings),
+          imageId = tostring(properties.storageProfile.imageReference.id),
+          osDiskId = tolower(tostring(properties.storageProfile.osDisk.managedDisk.id))
+"@
+    foreach ($vm in $vms) { $vmSpecs[$vm.id] = $vm }
+}
+$allDiskIds = @($vmSpecs.Values | Where-Object { $_.osDiskId } | ForEach-Object { $_.osDiskId } | Select-Object -Unique)
+$diskSpecs = @{}
+for ($i = 0; $i -lt $allDiskIds.Count; $i += 100) {
+    $chunk = $allDiskIds[$i..([Math]::Min($i + 99, $allDiskIds.Count - 1))]
+    $inList = ($chunk | ForEach-Object { "'$_'" }) -join ','
+    $disks = Invoke-ArgQuery -Query @"
+resources
+| where type =~ 'microsoft.compute/disks'
+| where tolower(id) in~ ($inList)
+| project id = tolower(id), diskSizeGb = toint(properties.diskSizeGB), diskSku = tostring(sku.name)
+"@
+    foreach ($d in $disks) { $diskSpecs[$d.id] = $d }
+}
+Write-Ok "VM specs resolved for $($vmSpecs.Count) session host VM(s)."
+
+# ------------------------------------------- 3. discover diagnostic workspaces per pool
+Write-Info "[3/8] Discovering Log Analytics workspaces from host pool diagnostic settings..."
+$workspaceIds = @{}   # workspaceResourceId -> $true
+$poolWorkspaces = @{}  # poolIdLower -> [workspaceResourceId,...] (v0.20: so a pool can say WHICH workspace failed it)
+foreach ($p in $pools) {
+    try {
+        $resp = Invoke-AzRestRetry -Method GET -Path "$($p.id)/providers/Microsoft.Insights/diagnosticSettings?api-version=2021-05-01-preview"
+        if ($resp.StatusCode -eq 200) {
+            foreach ($ds in (($resp.Content | ConvertFrom-Json).value)) {
+                if ($ds.properties.workspaceId) {
+                    $wsLower = $ds.properties.workspaceId.ToLower()
+                    $workspaceIds[$wsLower] = $true
+                    $pk = $p.id.ToLower()
+                    if (-not $poolWorkspaces.ContainsKey($pk)) { $poolWorkspaces[$pk] = @() }
+                    if ($poolWorkspaces[$pk] -notcontains $wsLower) { $poolWorkspaces[$pk] += $wsLower }
+                }
+            }
+        }
+    } catch { }
+}
+if ($workspaceIds.Count -eq 0) {
+    Write-Warn2 "No host pool sends diagnostics to any Log Analytics workspace. Usage fields will be defaulted for every pool (WORKSPACE CHECK: FAIL)."
+} else {
+    Write-Ok "Found $($workspaceIds.Count) diagnostic workspace(s)."
+}
+
+# ------------------------------------------------------------- 4. usage per workspace
+Write-Info "[4/8] Querying $LookbackDays days of WVDConnections concurrency..."
+$kqlPrelude = @'
+let LookbackDays = __LOOKBACK__d;
+let LocalTimeZone = '__TZ__';
+let WorkHourFloorPct = 0.20;
+let WorkDayFloorPct = 0.25;
+let WeeksObserved = todouble(LookbackDays / 7d);
+let DowCal = dynamic([__DOWCAL__]);
+let ConnRaw = union isfuzzy=true (datatable(TimeGenerated:datetime, State:string, CorrelationId:string, UserName:string, SessionHostName:string, _ResourceId:string)[]), (WVDConnections | project TimeGenerated, State, CorrelationId, UserName, SessionHostName, _ResourceId);
+let Sessions = ConnRaw | where TimeGenerated > ago(LookbackDays) | where State == 'Connected' | project CorrelationId, UserName, SessionHostName, HostPoolId = tolower(_ResourceId), StartTime = TimeGenerated | join kind=leftouter (ConnRaw | where TimeGenerated > ago(LookbackDays) | where State == 'Completed' | project CorrelationId, EndTime = TimeGenerated) on CorrelationId | project-away CorrelationId1 | extend EndTime = coalesce(EndTime, min_of(StartTime + 12h, now())) | where EndTime > StartTime;
+let Buckets = Sessions | extend Slots = range(bin(StartTime, 15m), bin(EndTime, 15m), 15m) | mv-expand Slot = Slots to typeof(datetime) | summarize ConcurrentUsers = dcount(UserName) by HostPoolId, Slot;
+'@
+$telemetryKql = $kqlPrelude + @'
+let PeakPerHost = Sessions | extend Slots = range(bin(StartTime, 15m), bin(EndTime, 15m), 15m) | mv-expand Slot = Slots to typeof(datetime) | summarize HostConcurrent = dcount(UserName) by HostPoolId, SessionHostName, Slot | summarize HostPeak = max(HostConcurrent) by HostPoolId, SessionHostName | summarize PeakUsersPerHost = max(HostPeak) by HostPoolId;
+let Peaks = Buckets | summarize PeakConcurrentUsers = max(ConcurrentUsers) by HostPoolId;
+let PoolMau = Sessions | summarize Mau = dcount(UserName) by HostPoolId;
+let DayLoads = Buckets | extend DowN = toint(dayofweek(datetime_utc_to_local(Slot, LocalTimeZone)) / 1d) | summarize DayUH = sum(todouble(ConcurrentUsers)) * 0.25 by HostPoolId, DowN | extend DayUH = DayUH / todouble(max_of(toint(DowCal[DowN]), 1));
+let WorkDays = DayLoads | join kind=inner (DayLoads | summarize MaxDayUH = max(DayUH) by HostPoolId) on HostPoolId | where DayUH >= MaxDayUH * WorkDayFloorPct | extend ModelerDay = tolong(iff(DowN == 0, 7, DowN)) | summarize WorkDaysList = array_sort_asc(make_list(ModelerDay)) by HostPoolId;
+let WorkDaySlots = WorkDays | mv-expand M = WorkDaysList to typeof(long) | extend DowX = toint(iff(M == 7, tolong(0), M)) | summarize DaySlots = sum(todouble(max_of(toint(DowCal[DowX]), 1))) * 4.0 by HostPoolId;
+let WorkWindow = Buckets | extend LocalSlot = datetime_utc_to_local(Slot, LocalTimeZone) | extend LocalHour = hourofday(LocalSlot), DowN = toint(dayofweek(LocalSlot) / 1d) | extend ModelerDay = tolong(iff(DowN == 0, 7, DowN)) | join kind=inner WorkDays on HostPoolId | where set_has_element(WorkDaysList, ModelerDay) | summarize SumConcurrent = sum(todouble(ConcurrentUsers)) by HostPoolId, LocalHour | join kind=inner WorkDaySlots on HostPoolId | extend AvgConcurrent = SumConcurrent / DaySlots | join kind=inner Peaks on HostPoolId | where AvgConcurrent >= todouble(PeakConcurrentUsers) * WorkHourFloorPct | summarize StartHour = min(LocalHour), EndHour = max(LocalHour) by HostPoolId | extend WorkDurationMinutes = (EndHour - StartHour + 1) * 60;
+let UsageTotals = Buckets | extend LocalSlot = datetime_utc_to_local(Slot, LocalTimeZone) | extend LocalHour = hourofday(LocalSlot), DowN = toint(dayofweek(LocalSlot) / 1d) | extend ModelerDay = tolong(iff(DowN == 0, 7, DowN)) | join kind=leftouter WorkDays on HostPoolId | join kind=leftouter WorkWindow on HostPoolId | extend InWindow = isnotnull(StartHour) and set_has_element(coalesce(WorkDaysList, dynamic([])), ModelerDay) and LocalHour >= StartHour and LocalHour <= EndHour | summarize TotalUH = sum(todouble(ConcurrentUsers)) * 0.25, InWindowUH = sumif(todouble(ConcurrentUsers), InWindow) * 0.25 by HostPoolId | extend WeeklyUH = round(TotalUH / WeeksObserved, 1), WeeklyInWindowUH = round(InWindowUH / WeeksObserved, 1) | extend WeeklyOffUH = round(WeeklyUH - WeeklyInWindowUH, 1);
+Peaks
+| join kind=leftouter WorkWindow on HostPoolId
+| join kind=leftouter WorkDays on HostPoolId
+| join kind=leftouter UsageTotals on HostPoolId
+| join kind=leftouter PeakPerHost on HostPoolId
+| join kind=leftouter PoolMau on HostPoolId
+| project HostPoolId, PeakConcurrentUsers, StartHour, WorkDurationMinutes, WorkDaysJson = tostring(WorkDaysList), WeeklyOffUH, PeakUsersPerHost, Mau
+'@
+# Per-weekday calendar occurrence counts across the lookback (customer TZ).
+# A 30-day window holds 5 of some weekdays and 4 of others; normalizing the day
+# rule by uniform weeks penalized 4-occurrence days ~20% - a real call center's
+# Saturday shift missed the cut by exactly that bias. DowCal[0]=Sunday..[6]=Saturday.
+$tzInfo = $null
+try { $tzInfo = [TimeZoneInfo]::FindSystemTimeZoneById($TimeZone) } catch { }
+if (-not $tzInfo) {
+    # Windows PowerShell 5.1 runs on .NET Framework, which doesn't know IANA ids.
+    # Map the common ones to Windows ids; the KQL side keeps using IANA regardless.
+    $winTz = @{ 'America/New_York' = 'Eastern Standard Time'; 'America/Chicago' = 'Central Standard Time'
+                'America/Denver' = 'Mountain Standard Time'; 'America/Phoenix' = 'US Mountain Standard Time'
+                'America/Los_Angeles' = 'Pacific Standard Time'; 'Europe/London' = 'GMT Standard Time'
+                'Europe/Paris' = 'Romance Standard Time'; 'Europe/Berlin' = 'W. Europe Standard Time'
+                'Asia/Kolkata' = 'India Standard Time'; 'Australia/Sydney' = 'AUS Eastern Standard Time' }
+    if ($winTz.ContainsKey($TimeZone)) { try { $tzInfo = [TimeZoneInfo]::FindSystemTimeZoneById($winTz[$TimeZone]) } catch { } }
+}
+$dowCal = @(0, 0, 0, 0, 0, 0, 0)
+$nowUtcForCal = [DateTime]::UtcNow
+$calStart = if ($tzInfo) { [TimeZoneInfo]::ConvertTimeFromUtc($nowUtcForCal.AddDays(-$LookbackDays), $tzInfo).Date } else { $nowUtcForCal.AddDays(-$LookbackDays).Date }
+$calEnd   = if ($tzInfo) { [TimeZoneInfo]::ConvertTimeFromUtc($nowUtcForCal, $tzInfo).Date } else { $nowUtcForCal.Date }
+for ($cd = $calStart; $cd -le $calEnd; $cd = $cd.AddDays(1)) { $dowCal[[int]$cd.DayOfWeek]++ }
+# both boundary days are partial; when they share a weekday they jointly ~= one occurrence
+if ($calStart.DayOfWeek -eq $calEnd.DayOfWeek -and $calStart -ne $calEnd) { $dowCal[[int]$calStart.DayOfWeek]-- }
+$dowCalCsv = ($dowCal -join ',')
+$telemetryKql = $telemetryKql.Replace('__LOOKBACK__', "$LookbackDays").Replace('__TZ__', $TimeZone).Replace('__DOWCAL__', $dowCalCsv)
+$bucketsKql = $kqlPrelude + @'
+Buckets | project HostPoolId, SlotUtc = Slot, ConcurrentUsers
+'@
+$bucketsKql = $bucketsKql.Replace('__LOOKBACK__', "$LookbackDays").Replace('__TZ__', $TimeZone).Replace('__DOWCAL__', $dowCalCsv)
+# Sessions incl. disconnected (WVDAgentHealthStatus) - INFORMATIONAL. Connected-basis
+# sizing stays; this only feeds a review flag when NME-style counts read higher.
+# Separate query + separate catch so a schema surprise can never hurt the core pull.
+$sessionsKql = @'
+let LookbackDays = __LOOKBACK__d;
+let AgentRaw = union isfuzzy=true (datatable(TimeGenerated:datetime, SessionHostName:string, ActiveSessions:long, InactiveSessions:long, _ResourceId:string)[]), (WVDAgentHealthStatus | project TimeGenerated, SessionHostName, ActiveSessions = tolong(ActiveSessions), InactiveSessions = tolong(InactiveSessions), _ResourceId);
+AgentRaw | where TimeGenerated > ago(LookbackDays) | extend HostPoolId = tolower(_ResourceId), TotalSessions = coalesce(ActiveSessions, tolong(0)) + coalesce(InactiveSessions, tolong(0)) | summarize HostSessions = max(TotalSessions) by HostPoolId, SessionHostName, Slot = bin(TimeGenerated, 15m) | summarize PoolSessions = sum(HostSessions) by HostPoolId, Slot | summarize PeakSessions = max(PoolSessions) by HostPoolId
+'@
+$sessionsKql = $sessionsKql.Replace('__LOOKBACK__', "$LookbackDays")
+function ConvertTo-SlotText {
+    # Log Analytics hands datetimes back as ISO strings; some JSON parsers turn
+    # them into DateTime objects. One spelling everywhere: yyyy-MM-ddTHH:mm:ssZ.
+    param($Slot)
+    if ($Slot -is [DateTime]) { return $Slot.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') }
+    $dt = [DateTime]::MinValue
+    if ([DateTime]::TryParse("$Slot", [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$dt)) { return $dt.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') }
+    return "$Slot"
+}
+function Get-UsageFromSeries {
+    # v0.21: re-derives the usage aggregates (peak, work days, window, weekly
+    # off-window user-hours) from a 15-minute concurrency series with the SAME
+    # rules the KQL applies, so a merged slot family is measured exactly as one
+    # pool would be. $Series: hashtable slot text (UTC) -> concurrent users.
+    param([hashtable]$Series)
+    if ($null -eq $Series -or $Series.Count -eq 0) { return $null }
+    $peak = 0; $peakAt = ''
+    $dayUH = @(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    $local = @{}
+    foreach ($k in @($Series.Keys)) {
+        $v = [int]$Series[$k]
+        $t = [DateTime]::Parse($k, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime()
+        $lt = if ($tzInfo) { [TimeZoneInfo]::ConvertTimeFromUtc($t, $tzInfo) } else { $t }
+        $local[$k] = $lt
+        if ($v -gt $peak -or ($v -eq $peak -and $peakAt -and $k -lt $peakAt)) { $peak = $v; $peakAt = $k }
+        $dayUH[[int]$lt.DayOfWeek] += $v * 0.25
+    }
+    for ($d = 0; $d -lt 7; $d++) { $dayUH[$d] = $dayUH[$d] / [Math]::Max($dowCal[$d], 1) }
+    $maxDay = 0.0; foreach ($x in $dayUH) { if ($x -gt $maxDay) { $maxDay = $x } }
+    $workDows = @(0..6 | Where-Object { $dayUH[$_] -gt 0 -and $dayUH[$_] -ge $maxDay * 0.25 })
+    $modelerDays = @($workDows | ForEach-Object { if ($_ -eq 0) { 7 } else { $_ } } | Sort-Object)
+    $daySlots = 0.0; foreach ($d in $workDows) { $daySlots += [Math]::Max($dowCal[$d], 1) * 4.0 }
+    $hourSum = @(0..23 | ForEach-Object { 0.0 })
+    foreach ($k in @($Series.Keys)) { $lt = $local[$k]; if ($workDows -contains [int]$lt.DayOfWeek) { $hourSum[$lt.Hour] += [int]$Series[$k] } }
+    $hrs = @(0..23 | Where-Object { $daySlots -gt 0 -and ($hourSum[$_] / $daySlots) -ge $peak * 0.20 })
+    $start = $null; $end = $null; $duration = $null
+    if ($hrs.Count -gt 0) { $start = [int]($hrs | Measure-Object -Minimum).Minimum; $end = [int]($hrs | Measure-Object -Maximum).Maximum; $duration = ($end - $start + 1) * 60 }
+    $totalUH = 0.0; $inUH = 0.0
+    foreach ($k in @($Series.Keys)) {
+        $v = [int]$Series[$k]; $totalUH += $v * 0.25; $lt = $local[$k]
+        if ($null -ne $start -and ($workDows -contains [int]$lt.DayOfWeek) -and $lt.Hour -ge $start -and $lt.Hour -le $end) { $inUH += $v * 0.25 }
+    }
+    $weeks = $LookbackDays / 7.0
+    $weeklyUH = [Math]::Round($totalUH / $weeks, 1); $weeklyIn = [Math]::Round($inUH / $weeks, 1)
+    [pscustomobject]@{
+        PeakConcurrentUsers = $peak; StartHour = $start; WorkDurationMinutes = $duration
+        WorkDaysJson = ('[' + ($modelerDays -join ',') + ']'); WeeklyOffUH = [Math]::Round($weeklyUH - $weeklyIn, 1)
+        PeakUsersPerHost = $null; Mau = $null; PeakAtUtc = $peakAt; TotalUserHours = [Math]::Round($totalUH, 1)
+    }
+}
+$sessionPeaks = @{}   # poolIdLower -> peak sessions incl. disconnected (max across workspaces)
+$rawBuckets = [System.Collections.Generic.List[object]]::new()
+$usage = @{}   # poolIdLower -> usage row (keep highest peak if seen in multiple workspaces)
+$usageWs = @{} # poolIdLower -> workspace name whose row won (v0.21: the tenant-wide series uses the same choice)
+$usageRows = 0
+# v0.21: DISTINCT USERS, COUNTS ONLY. Licensing conversations need "how many
+# people used AVD this month" across the whole tenant, and a per-pool MAU sum
+# double counts anyone who touched two pools (blue/green rotation puts every
+# user in two). The union has to happen in PowerShell (pools log to different
+# workspaces), so each workspace returns one opaque token per pool-user: a
+# 64-bit hash of the sign-in name salted with a GUID minted for THIS run. The
+# tokens live in memory only, are never printed or written, and the salt dies
+# with the process, so nothing in the output can be turned back into a name.
+$script:UserSalt = [guid]::NewGuid().ToString('N')
+$userTokensByPool = @{}   # poolIdLower -> HashSet[string]
+$hashKql = $kqlPrelude + @'
+let Salt = '__SALT__';
+Sessions | summarize by HostPoolId, H = tostring(hash(strcat(Salt, tolower(UserName)))) | project HostPoolId, H
+'@
+$hashKql = $hashKql.Replace('__LOOKBACK__', "$LookbackDays").Replace('__TZ__', $TimeZone).Replace('__DOWCAL__', $dowCalCsv).Replace('__SALT__', $script:UserSalt)
+foreach ($wsId in $workspaceIds.Keys) {
+    try {
+        $wsResp = Invoke-AzRestRetry -Method GET -Path "$wsId`?api-version=2021-06-01"
+        if ($wsResp.StatusCode -ne 200) { Write-Warn2 "Cannot read workspace $wsId (HTTP $($wsResp.StatusCode)) - skipping."; continue }
+        $customerId = ($wsResp.Content | ConvertFrom-Json).properties.customerId
+        $result = Invoke-LaQuery -WorkspaceCustomerId $customerId -Query $telemetryKql
+        foreach ($row in $result.Results) {
+            $key = $row.HostPoolId.ToLower()
+            $peak = [int]$row.PeakConcurrentUsers
+            if (-not $usage.ContainsKey($key) -or $peak -gt [int]$usage[$key].PeakConcurrentUsers) { $usage[$key] = $row; $usageWs[$key] = $wsId.Split('/')[-1] }
+            $usageRows++
+        }
+        Write-Ok "Workspace $($wsId.Split('/')[-1]): usage for $(@($result.Results).Count) pool(s)."
+        try {
+            $hres = Invoke-LaQuery -WorkspaceCustomerId $customerId -Query $hashKql
+            foreach ($hrow in @($hres.Results)) {
+                $hk = "$($hrow.HostPoolId)".ToLower()
+                if (-not $userTokensByPool.ContainsKey($hk)) { $userTokensByPool[$hk] = [System.Collections.Generic.HashSet[string]]::new() }
+                [void]$userTokensByPool[$hk].Add("$($hrow.H)")
+            }
+        } catch { Write-Warn2 "Distinct-user count skipped for $($wsId.Split('/')[-1]) ($($_.Exception.Message)) - per-pool MAU unaffected; the tenant-wide count may read low." }
+        try {
+            $bres = Invoke-LaQuery -WorkspaceCustomerId $customerId -Query $bucketsKql
+            $wsName = $wsId.Split('/')[-1]
+            foreach ($brow in @($bres.Results)) { $rawBuckets.Add([pscustomobject]@{ Workspace = $wsName; HostPoolId = "$($brow.HostPoolId)".ToLower(); SlotUtc = (ConvertTo-SlotText $brow.SlotUtc); ConcurrentUsers = [int]$brow.ConcurrentUsers }) }
+        } catch { Write-Warn2 "Raw usage buckets skipped for $($wsId.Split('/')[-1]) ($($_.Exception.Message)) - aggregates unaffected." }
+        try {
+            $sres = Invoke-LaQuery -WorkspaceCustomerId $customerId -Query $sessionsKql
+            foreach ($srow in @($sres.Results)) {
+                $skey = $srow.HostPoolId.ToLower()
+                $sp = [int]$srow.PeakSessions
+                if (-not $sessionPeaks.ContainsKey($skey) -or $sp -gt $sessionPeaks[$skey]) { $sessionPeaks[$skey] = $sp }
+            }
+        } catch { }   # informational only - missing table/columns just means no session flag
+    } catch {
+        if (Test-LaNetworkBlocked $_) {
+            $script:NetBlockedWs[$wsId] = $true
+            Write-Warn2 "Workspace $($wsId.Split('/')[-1]) BLOCKED BY ITS NETWORK SETTINGS (Network Security Perimeter / public query access off) - this runner's IP is not allowed in. Not a permissions problem. Fix: run this same command from inside the customer network (local PowerShell on a VPN/corp machine usually passes), or allow this runner's IP on the workspace. Pools that only log there show as no-telemetry in THIS run."
+        } elseif (Test-LaTokenFailure "$($_.Exception.Message)") {
+            # v0.20: the query never ran. Say so - this is not "no data".
+            $script:TokenFailedWs[$wsId] = $true
+            Write-Warn2 "Workspace $($wsId.Split('/')[-1]) NOT QUERIED - Azure would not issue a Log Analytics token in this shell session ($($script:LaTokenLastError)). That is the shell's token service, not permissions and not missing diagnostics. Usage for pools that log there was NOT collected in this run."
+        } else {
+            Write-Warn2 "Workspace $($wsId.Split('/')[-1]) query failed ($($_.Exception.Message)) - pools that only log there will show as no-telemetry."
+        }
+    }
+}
+$script:TelemetryNotCollected = ($script:TokenFailedWs.Count -gt 0 -and $usageRows -eq 0)
+
+# ------------------------------------------ 5. FSLogix profile storage discovery
+# FSLogix configuration (VHDLocations) lives in GPO/Intune - invisible to Azure.
+# The COST surface is visible: profiles live on Azure Files shares / ANF volumes.
+# Discover candidates, measure provisioned + used, and (when the tenant ships
+# StorageFileLogs to Log Analytics) map shares to pools from observed usernames.
+# Everything here is skip-graceful: no candidates -> model unchanged, note printed.
+Write-Info "[5/8] Discovering FSLogix profile storage (Azure Files + ANF)..."
+$storageCandidates = [System.Collections.Generic.List[object]]::new()
+$profileNameRx = '(?i)prof|fslogix|upd|userdisk|usrprof|msix|app[-_]?attach'
+# One slow account must never abort the rest, and a skipped size must never be
+# silent: stats retry once, then fall back to the Azure Monitor FileCapacity
+# metric (platform-computed - fast where on-demand stats on huge shares hit the
+# fixed 100s timeout). Whatever still fails is NAMED and counted in the census.
+function Get-FileShareUsedGbFromMetrics {
+    param([string]$AccountId, [string]$ShareName)
+    try {
+        $uri = "$AccountId/fileServices/default/providers/Microsoft.Insights/metrics?api-version=2019-07-01&metricnames=FileCapacity&aggregation=Average&interval=PT1H&timespan=PT2H" + "&`$filter=FileShare eq '$ShareName'"
+        $r = Invoke-AzRestRetry -Method GET -Path $uri
+        if ($r.StatusCode -ne 200) { return $null }
+        $m = @((($r.Content | ConvertFrom-Json).value)) | Select-Object -First 1
+        $pts = @($m.timeseries | ForEach-Object { $_.data } | Where-Object { $null -ne $_.average -and $_.average -gt 0 })
+        if ($pts.Count -gt 0) { return [Math]::Round(@($pts)[-1].average / 1GB, 1) }
+    } catch { }
+    $null
+}
+# --- credential circuit breaker ---------------------------------------------------
+# Live failure mode (Don's Cloud Shell run 2026-08-07): mid-run, Cloud Shell's
+# token service started returning garbage ("ManagedIdentityCredential ... invalid:
+# ExpiresOn") when the script's ARM token needed a refresh. The user IS signed in;
+# the shell's token provider glitched - and every later Azure call fails instantly
+# and identically. Without a breaker that meant 72 accounts mislabeled "slow or
+# unreadable" and ~150 identical error dumps. Now: first credential-shaped
+# failure -> short pause -> one cheap probe -> if still broken, ONE honest banner
+# and every remaining Azure call is skipped fast under an accurate label.
+$script:AuthBroken = $false
+function Confirm-AzureAuthAlive {
+    if ($script:AuthBroken) { return $false }
+    Start-Sleep -Seconds 8
+    try { Invoke-AzRestMethod -Method GET -Path "/subscriptions?api-version=2020-01-01" | Out-Null; return $true }
+    catch {
+        $script:AuthBroken = $true
+        Write-Warn2 "AZURE TOKEN REFRESH IS BROKEN in this shell session - you ARE signed in, but the shell's token service returned a bad response (the Cloud Shell 'ExpiresOn' glitch) when a mid-run token refresh came due. Every remaining Azure call would fail the same way, so they are being skipped fast instead. FIX: restart Cloud Shell (or run Connect-AzAccount), then run this command again - a fresh session completes normally."
+        return $false
+    }
+}
+$storSkipped = [System.Collections.Generic.List[string]]::new()
+$storAuthSkipped = [System.Collections.Generic.List[string]]::new()
+$censusShares = 0; $censusSized = 0
+$storAccts = @()
+try {
+    $storAccts = Invoke-ArgQuery -Query @'
+resources
+| where type =~ 'microsoft.storage/storageaccounts'
+| project id, name, resourceGroup, location, accountKind = tostring(kind), skuName = tostring(sku.name)
+'@
+} catch {
+    Write-Warn2 "Storage account inventory failed ($($_.Exception.Message)) - Azure Files profile storage not modeled."
+}
+foreach ($sa in $storAccts) {
+    if ($script:AuthBroken) { $storAuthSkipped.Add($sa.name); continue }
+    try {
+        # Classification by SKU, not account kind: provisioned-v2 StandardV2/PremiumV2
+        # share the FileStorage kind, and each SKU implies its billing basis.
+        $sku = "$($sa.skuName)"
+        $isZrs = $sku -match '(?i)zrs'
+        $isPremium = $sku -match '^(?i)Premium'
+        $isV2 = $sku -match '(?i)V2_'
+        $provisionedModel = $isPremium -or $isV2   # premium (v1/v2) and standardV2 bill PROVISIONED; v1 standard bills USED
+        $shResp = Invoke-AzRestRetry -Method GET -Path "$($sa.id)/fileServices/default/shares?api-version=2023-01-01"
+        if ($shResp.StatusCode -ne 200) { continue }   # no file service or not visible
+        foreach ($sh in @((($shResp.Content | ConvertFrom-Json).value))) {
+            $shName = "$($sh.name)"
+            $smb = ($null -eq $sh.properties.enabledProtocols) -or ("$($sh.properties.enabledProtocols)" -match '(?i)smb')
+            if (-not $smb) { continue }
+            if (-not ($provisionedModel -or $shName -match $profileNameRx)) { continue }
+            $censusShares++
+            $usedGb = $null; $usedSource = ''
+            try {
+                $stResp = Invoke-AzRestRetry -Method GET -Path "$($sa.id)/fileServices/default/shares/$($shName)?api-version=2023-01-01&`$expand=stats"
+                if ($stResp.StatusCode -ne 200) { $stResp = Invoke-AzRestRetry -Method GET -Path "$($sa.id)/fileServices/default/shares/$($shName)?api-version=2023-01-01&`$expand=stats" }
+                if ($stResp.StatusCode -eq 200) {
+                    $stProps = ($stResp.Content | ConvertFrom-Json).properties
+                    if ($null -ne $stProps.shareUsageBytes) { $usedGb = [Math]::Round($stProps.shareUsageBytes / 1GB, 1); $usedSource = 'stats' }
+                }
+            } catch { }
+            if ($null -eq $usedGb) {
+                $usedGb = Get-FileShareUsedGbFromMetrics -AccountId $sa.id -ShareName $shName
+                if ($null -ne $usedGb) { $usedSource = 'metrics' }
+            }
+            if ($null -ne $usedGb) { $censusSized++ }
+            $provGb = if ($null -ne $sh.properties.shareQuota) { [int]$sh.properties.shareQuota } else { $null }
+            $tierLabel = if ($isPremium) { "Azure Files Premium$(if ($isV2) { ' v2' }) ($(if ($isZrs) { 'ZRS' } else { 'LRS' }))" }
+                         elseif ($isV2) { 'Azure Files Standard (provisioned v2)' }
+                         else { 'Azure Files Standard' }
+            # Modeler storage enum (dropdown order): 1=Files Premium LRS, 2=Files Premium ZRS,
+            # 3=ANF Standard, 4=ANF Premium, 5=ANF Ultra. No standard-Files option exists.
+            $tierNote = if (-not $isPremium) { "the Modeler has no standard Files tier, so this models as Azure Files Premium (LRS) on $(if ($provisionedModel) { 'PROVISIONED' } else { 'USED' }) GB; conservative" } else { '' }
+            $storageCandidates.Add([pscustomobject]@{
+                ResourceId = $sa.id; BillingUnit = "$($sa.name)/$shName"
+                Kind = $tierLabel; Sku = $sku; BillingModel = $(if ($provisionedModel) { 'Provisioned' } else { 'Used' })
+                Account = $sa.name; Share = $shName; RG = $sa.resourceGroup; Region = $sa.location
+                ProvisionedGb = $provGb; UsedGb = $usedGb; UsedSource = $usedSource
+                ProvisionedIops = $sh.properties.provisionedIops; ThroughputMibps = $sh.properties.provisionedBandwidthMibps
+                NameMatch = [bool]($shName -match $profileNameRx)
+                StorageTypeEnum = if ($isPremium -and $isZrs) { 2 } else { 1 }
+                TierNote = $tierNote
+                Classification = ''; Evidence = 'none'; Confidence = ''
+                ServesPools = @(); Notes = ''
+            })
+        }
+    } catch {
+        if (Test-CredError "$($_.Exception.Message)") {
+            if (Confirm-AzureAuthAlive) { $storSkipped.Add("$($sa.name) (transient auth)") }
+            else { $storAuthSkipped.Add($sa.name) }
+        } else { $storSkipped.Add($sa.name) }
+    }
+}
+if ($storSkipped.Count -gt 0) {
+    Write-Warn2 "$($storSkipped.Count) storage account(s) skipped (slow or unreadable): $($storSkipped -join ', '). Their shares were NOT checked - they appear nowhere below."
+}
+if ($storAuthSkipped.Count -gt 0) {
+    Write-Warn2 "$($storAuthSkipped.Count) storage account(s) NOT checked because the Azure token broke (see banner above) - nothing wrong with these accounts; a fresh-session re-run reads them: $($storAuthSkipped -join ', ')"
+}
+# ANF is quantified at its BILLING boundary: Azure bills the capacity POOL's
+# provisioned size; volumes only carve quota from it. Pricing per-volume can
+# badly undercount real spend, so candidates here are capacity pools - member
+# SMB volumes listed, pools shared with non-SMB/non-profile volumes flagged.
+if ($script:AuthBroken) { Write-Warn2 "Azure NetApp Files discovery skipped - Azure token broken (see banner above); a fresh-session re-run covers it." }
+else {
+try {
+    $anfVols = Invoke-ArgQuery -Query @'
+resources
+| where type =~ 'microsoft.netapp/netappaccounts/capacitypools/volumes'
+| project id, name, resourceGroup, location,
+          provisionedBytes = tolong(properties.usageThreshold),
+          protocols = properties.protocolTypes,
+          serviceLevel = tostring(properties.serviceLevel)
+'@
+    $anfPools = @()
+    try {
+        $anfPools = Invoke-ArgQuery -Query @'
+resources
+| where type =~ 'microsoft.netapp/netappaccounts/capacitypools'
+| project id, name, poolBytes = tolong(properties.size), serviceLevel = tostring(properties.serviceLevel)
+'@
+    } catch { }
+    $poolInfo = @{}
+    foreach ($cp in $anfPools) { $poolInfo["$($cp.id)".ToLowerInvariant()] = $cp }
+    foreach ($grp in (@($anfVols) | Group-Object { ("$($_.id)" -split '(?i)/volumes/')[0].ToLowerInvariant() })) {
+        $parentId = $grp.Name
+        $volsAll = @($grp.Group)
+        $volsSmb = @($volsAll | Where-Object { ((@($_.protocols) | ForEach-Object { "$_" }) -join ',') -match '(?i)cifs|smb' })
+        if ($volsSmb.Count -eq 0) { continue }   # capacity pool with no SMB volumes - not an FSLogix candidate
+        $censusShares++
+        $cp = $poolInfo[$parentId]
+        $poolGb = if ($cp -and $cp.poolBytes) { [int][Math]::Round($cp.poolBytes / 1GB) }
+                  else { [int][Math]::Round((($volsAll | Measure-Object provisionedBytes -Sum).Sum) / 1GB) }
+        $lvl = if ($cp) { "$($cp.serviceLevel)" } else { "$($volsSmb[0].serviceLevel)" }
+        $anfEnum = switch -Regex ($lvl) { '^(?i)standard$' { 3; break } '^(?i)premium$' { 4; break } '^(?i)ultra$' { 5; break } default { 4 } }
+        # used GB best effort from the VolumeLogicalSize metric per SMB volume
+        $usedSum = $null
+        foreach ($v in $volsSmb) {
+            try {
+                $mr = Invoke-AzRestRetry -Method GET -Path "$($v.id)/providers/Microsoft.Insights/metrics?api-version=2019-07-01&metricnames=VolumeLogicalSize&aggregation=Average&interval=PT1H&timespan=PT2H"
+                if ($mr.StatusCode -eq 200) {
+                    $mm = @((($mr.Content | ConvertFrom-Json).value)) | Select-Object -First 1
+                    $pts = @($mm.timeseries | ForEach-Object { $_.data } | Where-Object { $null -ne $_.average -and $_.average -gt 0 })
+                    if ($pts.Count -gt 0) { $usedSum = [Math]::Round((Coalesce $usedSum 0) + @($pts)[-1].average / 1GB, 1) }
+                }
+            } catch { }
+        }
+        if ($null -ne $usedSum) { $censusSized++ }
+        $poolName = ($parentId -split '/')[-1]
+        $anfAcct = ($parentId -split '/')[-3]
+        $memberNames = @($volsSmb | ForEach-Object { ("$($_.name)" -split '/')[-1] })
+        $sharedNote = if ($volsAll.Count -gt $volsSmb.Count) { "capacity pool shared with $($volsAll.Count - $volsSmb.Count) non-SMB volume(s) - pool billed as a whole" } else { '' }
+        $storageCandidates.Add([pscustomobject]@{
+            ResourceId = $parentId; BillingUnit = "$anfAcct/$poolName (capacity pool)"
+            Kind = "Azure NetApp Files $lvl (capacity pool)"; Sku = "ANF $lvl"; BillingModel = 'Provisioned'
+            Account = $anfAcct; Share = $poolName; RG = $volsSmb[0].resourceGroup; Region = $volsSmb[0].location
+            ProvisionedGb = $poolGb; UsedGb = $usedSum; UsedSource = $(if ($null -ne $usedSum) { 'metrics' } else { '' })
+            ProvisionedIops = $null; ThroughputMibps = $null
+            NameMatch = [bool](@($memberNames | Where-Object { $_ -match $profileNameRx }).Count -gt 0)
+            StorageTypeEnum = $anfEnum
+            TierNote = "$(if ($lvl -notmatch '^(?i)(standard|premium|ultra)$') { "ANF service level '$lvl' unrecognized - modeled as ANF Premium; verify" })"
+            Classification = ''; Evidence = 'none'; Confidence = ''
+            ServesPools = @(); Notes = "$("volumes: $($memberNames -join ', ')")$(if ($sharedNote) { "; $sharedNote" })"
+        })
+    }
+} catch {
+    if (Test-CredError "$($_.Exception.Message)") { Confirm-AzureAuthAlive | Out-Null; Write-Warn2 "Azure NetApp Files discovery hit the token failure - ANF not read this run; a fresh-session re-run covers it." }
+    else { Write-Warn2 "Azure NetApp Files discovery failed ($($_.Exception.Message)) - ANF profile storage not modeled; Azure Files results above are unaffected." }
+}
+}
+
+# ---- share -> pool mapping evidence (best effort - the prompt pass decides) ------
+# IP-first: StorageFileLogs caller IPs joined to WVDConnections session-host IPs.
+# All joins happen in POWERSHELL so evidence still lands when storage logs and
+# AVD logs live in different workspaces. Username overlap = fallback evidence.
+$mapEvidence = [System.Collections.Generic.List[object]]::new()
+if ($storageCandidates.Count -gt 0 -and $workspaceIds.Keys.Count -gt 0 -and -not $script:AuthBroken) {
+    Write-Info "      Checking Log Analytics for file-access logs (share -> pool evidence)..."
+    # storage accounts may ship StorageFileLogs to workspaces the AVD side never uses
+    $mapWorkspaceIds = @{}
+    foreach ($k in $workspaceIds.Keys) { $mapWorkspaceIds[$k] = $true }
+    foreach ($acctId in (@($storageCandidates | Where-Object { $_.Kind -notmatch 'NetApp' } | ForEach-Object { $_.ResourceId }) | Select-Object -Unique)) {
+        try {
+            $dsResp = Invoke-AzRestRetry -Method GET -Path "$acctId/fileServices/default/providers/Microsoft.Insights/diagnosticSettings?api-version=2021-05-01-preview"
+            if ($dsResp.StatusCode -eq 200) {
+                foreach ($ds in ((($dsResp.Content | ConvertFrom-Json).value))) {
+                    if ($ds.properties.workspaceId) { $mapWorkspaceIds[$ds.properties.workspaceId.ToLower()] = $true }
+                }
+            }
+        } catch { }
+    }
+    # v0.21: the username-overlap evidence never sees a username. Both sides hash
+    # the account name with this run's salt inside Log Analytics and only the
+    # opaque tokens come back; overlap is counted on tokens.
+    $mapSharesKql = @'
+let LookbackDays = __LOOKBACK__d;
+let Salt = '__SALT__';
+let FileOps = union isfuzzy=true (datatable(TimeGenerated:datetime, AccountName:string, ObjectKey:string, CallerIpAddress:string)[]), (StorageFileLogs | project TimeGenerated, AccountName, ObjectKey, CallerIpAddress);
+let Ops = FileOps | where TimeGenerated > ago(LookbackDays) | extend Parts = split(ObjectKey, '/') | extend Share = tolower(tostring(Parts[2])) | where isnotempty(Share) | extend AccountName = tolower(AccountName);
+let ShareIps = Ops | extend Ip = tostring(split(CallerIpAddress, ':')[0]) | where isnotempty(Ip) | summarize OpsCount = count() by RowType = 'shareip', AccountName, Share, Ip | extend UserGuess = '';
+let ShareUsers = Ops | extend U1 = extract(@'(?i)Profiles?[_-]([^/\\.]+)\.vhdx?', 1, ObjectKey) | extend U2 = extract(@'(?i)/([^/]+?)_S-1-[0-9-]+', 1, ObjectKey) | extend UserRaw = tolower(coalesce(U1, U2)) | where isnotempty(UserRaw) | extend UserGuess = tostring(hash(strcat(Salt, UserRaw))) | summarize OpsCount = count() by RowType = 'shareuser', AccountName, Share, UserGuess | extend Ip = '';
+ShareIps | union ShareUsers | project RowType, AccountName, Share, Ip, UserGuess, OpsCount
+'@
+    $mapPoolsKql = @'
+let LookbackDays = __LOOKBACK__d;
+let Salt = '__SALT__';
+let Conn = union isfuzzy=true (datatable(TimeGenerated:datetime, State:string, UserName:string, SessionHostIPAddress:string, _ResourceId:string)[]), (WVDConnections | project TimeGenerated, State, UserName, SessionHostIPAddress, _ResourceId) | where TimeGenerated > ago(LookbackDays) | where State == 'Connected';
+let HostIps = Conn | where isnotempty(SessionHostIPAddress) | summarize by RowType = 'hostip', Ip = tostring(SessionHostIPAddress), HostPoolId = tolower(_ResourceId) | extend UserGuess = '';
+let PoolUsers = Conn | summarize by RowType = 'pooluser', UserGuess = tostring(hash(strcat(Salt, tolower(tostring(split(UserName, '@')[0]))))), HostPoolId = tolower(_ResourceId) | extend Ip = '';
+HostIps | union PoolUsers | project RowType, Ip, UserGuess, HostPoolId
+'@
+    $mapSharesKql = $mapSharesKql.Replace('__LOOKBACK__', "$LookbackDays").Replace('__SALT__', $script:UserSalt)
+    $mapPoolsKql = $mapPoolsKql.Replace('__LOOKBACK__', "$LookbackDays").Replace('__SALT__', $script:UserSalt)
+    $shareRows = [System.Collections.Generic.List[object]]::new()
+    $poolRows = [System.Collections.Generic.List[object]]::new()
+    foreach ($wsId in $mapWorkspaceIds.Keys) {
+        try {
+            $wsResp = Invoke-AzRestRetry -Method GET -Path "$wsId`?api-version=2021-06-01"
+            if ($wsResp.StatusCode -ne 200) { continue }
+            $customerId = ($wsResp.Content | ConvertFrom-Json).properties.customerId
+            foreach ($row in @((Invoke-LaQuery -WorkspaceCustomerId $customerId -Query $mapSharesKql).Results)) { $shareRows.Add($row) }
+            if ($workspaceIds.ContainsKey($wsId)) {
+                foreach ($row in @((Invoke-LaQuery -WorkspaceCustomerId $customerId -Query $mapPoolsKql).Results)) { $poolRows.Add($row) }
+            }
+        } catch {
+            if (Test-LaNetworkBlocked $_) { $script:NetBlockedWs[$wsId] = $true }
+            elseif (Test-LaTokenFailure "$($_.Exception.Message)") { $script:TokenFailedWs[$wsId] = $true }
+        }
+    }
+    $poolNameById = @{}
+    foreach ($p in $pools) { $poolNameById["$($p.id)".ToLowerInvariant()] = $p.name }
+    $ipToPools = @{}
+    foreach ($r in ($poolRows | Where-Object { $_.RowType -eq 'hostip' })) { $ipToPools["$($r.Ip)"] = @(@($ipToPools["$($r.Ip)"]) + @("$($r.HostPoolId)") | Where-Object { $_ } | Select-Object -Unique) }
+    $userToPools = @{}
+    foreach ($r in ($poolRows | Where-Object { $_.RowType -eq 'pooluser' })) { $userToPools["$($r.UserGuess)"] = @(@($userToPools["$($r.UserGuess)"]) + @("$($r.HostPoolId)") | Where-Object { $_ } | Select-Object -Unique) }
+    foreach ($cand in ($storageCandidates | Where-Object { $_.Kind -notmatch 'NetApp' })) {
+        $acct = $cand.Account.ToLowerInvariant(); $shr = $cand.Share.ToLowerInvariant()
+        $mine = @($shareRows | Where-Object { "$($_.AccountName)" -eq $acct -and "$($_.Share)" -eq $shr })
+        # IP evidence first (strong): distinct session-host IPs seen opening this share, per pool
+        $ipHits = @{}
+        foreach ($r in ($mine | Where-Object { $_.RowType -eq 'shareip' })) {
+            foreach ($pid_ in @($ipToPools["$($r.Ip)"])) { $ipHits[$pid_] = 1 + (Coalesce $ipHits[$pid_] 0) }
+        }
+        # username-overlap fallback (weak): distinct extracted usernames per pool, >= 2
+        $userHits = @{}
+        foreach ($r in ($mine | Where-Object { $_.RowType -eq 'shareuser' })) {
+            foreach ($pid_ in @($userToPools["$($r.UserGuess)"])) { $userHits[$pid_] = 1 + (Coalesce $userHits[$pid_] 0) }
+        }
+        $hitIds = @()
+        if ($ipHits.Keys.Count -gt 0) { $hitIds = @($ipHits.Keys); $cand.Evidence = 'logs-ip'; $cand.Confidence = 'high' }
+        elseif (@($userHits.Keys | Where-Object { $userHits[$_] -ge 2 }).Count -gt 0) { $hitIds = @($userHits.Keys | Where-Object { $userHits[$_] -ge 2 }); $cand.Evidence = 'logs-user'; $cand.Confidence = 'medium' }
+        if ($hitIds.Count -gt 0) {
+            $cand.ServesPools = @($hitIds | ForEach-Object { $poolNameById["$_"] } | Where-Object { $_ } | Select-Object -Unique)   # ALL pools kept - no cap
+            foreach ($pid_ in $hitIds) { $mapEvidence.Add([pscustomobject]@{ Account = $cand.Account; Share = $cand.Share; HostPoolId = $pid_; Evidence = $cand.Evidence; Strength = (Coalesce $ipHits[$pid_] $userHits[$pid_]) }) }
+        }
+    }
+    $mappedCount = @($storageCandidates | Where-Object { $_.ServesPools.Count -gt 0 }).Count
+    if ($mappedCount -gt 0) { Write-Ok "File-access logs found - $mappedCount store(s) carry pool evidence in the ledger's ServesPools column." }
+    elseif ($script:NetBlockedWs.Count -gt 0) { Write-Warn2 "      Share->pool evidence unavailable: $($script:NetBlockedWs.Count) workspace(s) rejected the query at the NETWORK layer (see the workspace warnings above) - not missing diagnostics. ServesPools stays empty in THIS run; an inside-the-network run fills it." }
+    elseif ($script:TokenFailedWs.Count -gt 0) { Write-Warn2 "      Share->pool evidence NOT COLLECTED: the file-access log query never ran (no Log Analytics token in this shell session - see the workspace warnings above). Not missing diagnostics. A re-run fills ServesPools." }
+    else { Write-Info "      No StorageFileLogs data (file-share diagnostics not enabled) - ServesPools stays empty in the ledger; the AVD admin can annotate it." }
+}
+
+# ---- automatic classification + census -------------------------------------------
+$junkRx = '(?i)^pvcn?-|^mq(ha|prod|trace)|sftp|backup|tracelog'
+$appAttachRx = '(?i)msix|app[-_]?attach'
+foreach ($cand in $storageCandidates) {
+    $cand.Classification = if ($cand.Share -match $appAttachRx) { 'AppAttach' }
+                           elseif ($cand.NameMatch) { 'Profiles' }
+                           elseif ($cand.Share -match $junkRx) { 'NonAVD' }
+                           else { 'Unknown' }
+    if ($cand.Evidence -eq 'none' -and $cand.NameMatch) { $cand.Evidence = 'name-match'; $cand.Confidence = 'low' }
+}
+if ($storageCandidates.Count -gt 0) {
+    $storageCandidates | Sort-Object Account, Share | Select-Object Kind, Account, Share, Region, ProvisionedGb, UsedGb, Classification, @{n='ServesPools'; e={ @($_.ServesPools | Select-Object -First 6) -join ', ' }} |
+        Format-Table -AutoSize | Out-String -Width 220 | Write-Host
+} else {
+    Write-Info "No storage candidates found - fsLogix stays off in the model (add by hand in the Modeler if profiles live outside Azure's view)."
+}
+
+# Storage is NEVER modeled in the Modeler JSON (Don's ruling, v0.15): every
+# discovered store goes to the storage ledger CSV, with automatic classification
+# and any log-derived pool evidence. No prompts, no runner data entry - the run
+# flows straight through, and the ledger is the storage deliverable.
+if ($storageCandidates.Count -gt 0) {
+    Write-Info "Storage policy: all $($storageCandidates.Count) store(s) recorded in the storage ledger; the Modeler JSON carries host pools only (fsLogix off everywhere)."
+}
+$censusUnsized = $censusShares - $censusSized
+Write-Info "Storage census: $(@($storAccts).Count) account(s) found, $($storAuthSkipped.Count) blocked by the token failure, $($storSkipped.Count) skipped (slow/unreadable), $censusShares candidate store(s), $censusSized sized, $censusUnsized without a size."
+$gap = 0.0
+foreach ($cand in ($storageCandidates | Where-Object { $_.Classification -in @('Profiles', 'Unknown') })) {
+    if ($cand.BillingModel -eq 'Provisioned' -and $null -ne $cand.ProvisionedGb -and $null -ne $cand.UsedGb) { $gap += [Math]::Max(0, $cand.ProvisionedGb - $cand.UsedGb) }
+}
+if ($gap -gt 0) { Write-Info "Provisioned-over-used gap across provisioned-model profile/unknown storage: $([Math]::Round($gap)) GB - the gap Nerdio storage auto-scale reclaims." }
+
+# --------------------------------------------------------------- 6. assemble the model
+Write-Info "[6/8] Assembling deployments..."
+$adminTasks = @'
+{"0":[{"id":0,"isEnabled":true,"hoursWithoutNerdio":5,"hoursWithNerdio":0.5},{"id":1,"isEnabled":true,"hoursWithoutNerdio":2,"hoursWithNerdio":0.5},{"id":2,"isEnabled":true,"hoursWithoutNerdio":16,"hoursWithNerdio":4},{"id":3,"isEnabled":true,"hoursWithoutNerdio":20,"hoursWithNerdio":0.5},{"id":4,"isEnabled":false,"hoursWithoutNerdio":0,"hoursWithNerdio":2},{"id":5,"isEnabled":true,"hoursWithoutNerdio":16,"hoursWithNerdio":4}],"1":[{"id":6,"isEnabled":true,"hoursWithoutNerdio":5,"hoursWithNerdio":0.5},{"id":7,"isEnabled":true,"hoursWithoutNerdio":10,"hoursWithNerdio":2},{"id":8,"isEnabled":true,"hoursWithoutNerdio":3,"hoursWithNerdio":0.5},{"id":9,"isEnabled":true,"hoursWithoutNerdio":2,"hoursWithNerdio":0.5},{"id":10,"isEnabled":true,"hoursWithoutNerdio":3,"hoursWithNerdio":5}],"2":[{"id":11,"isEnabled":true,"hoursWithoutNerdio":10,"hoursWithNerdio":2.5},{"id":12,"isEnabled":true,"hoursWithoutNerdio":8,"hoursWithNerdio":0.5},{"id":13,"isEnabled":true,"hoursWithoutNerdio":10,"hoursWithNerdio":0.5},{"id":14,"isEnabled":true,"hoursWithoutNerdio":8,"hoursWithNerdio":2},{"id":15,"isEnabled":true,"hoursWithoutNerdio":5,"hoursWithNerdio":1},{"id":16,"isEnabled":true,"hoursWithoutNerdio":20,"hoursWithNerdio":2},{"id":17,"isEnabled":true,"hoursWithoutNerdio":3,"hoursWithNerdio":0.5},{"id":18,"isEnabled":true,"hoursWithoutNerdio":10,"hoursWithNerdio":2},{"id":19,"isEnabled":true,"hoursWithoutNerdio":2.5,"hoursWithNerdio":0.5},{"id":20,"isEnabled":true,"hoursWithoutNerdio":8,"hoursWithNerdio":2},{"id":21,"isEnabled":true,"hoursWithoutNerdio":2,"hoursWithNerdio":0.5},{"id":22,"isEnabled":true,"hoursWithoutNerdio":3,"hoursWithNerdio":0},{"id":23,"isEnabled":true,"hoursWithoutNerdio":3,"hoursWithNerdio":0.5},{"id":24,"isEnabled":true,"hoursWithoutNerdio":5,"hoursWithNerdio":1},{"id":25,"isEnabled":true,"hoursWithoutNerdio":2,"hoursWithNerdio":1},{"id":26,"isEnabled":false,"hoursWithoutNerdio":0,"hoursWithNerdio":0.5}]}
+'@ | ConvertFrom-Json
+$globalSettings = '{"enterpriseDiscount":0,"windows365Discount":0,"azureType":1,"nerdioLicenseCost":{"type":0,"perUserCost":null,"windows365PerUserCost":null,"monthMinimumCost":null},"nerdioResourceCost":3}' | ConvertFrom-Json
+$nameCounts = @{}
+foreach ($p in $pools) { $nameCounts[$p.name] = 1 + (Coalesce $nameCounts[$p.name] 0) }
+# Modeler disk-size tiers (from the UI dropdown); actual sizes snap UP to the nearest offered tier
+$diskTiers = @(128, 256, 512, 1024, 2048, 4096)
+$deployments = [System.Collections.Generic.List[object]]::new()
+$review = [System.Collections.Generic.List[object]]::new()
+$emptyPools = [System.Collections.Generic.List[object]]::new()
+$poolFacts = @{}   # v0.21: per-pool facts kept for the slot-family merge and the tenant summary
+function Resolve-WindowFields {
+    # Window, days, and overtime from a usage row (KQL aggregates or a re-derived
+    # series), with the Modeler's UI bounds applied. Shared by pools and families.
+    param($U, [int]$Peak)
+    $startHr  = if ($U -and $null -ne $U.StartHour -and "$($U.StartHour)" -ne '') { [int]$U.StartHour } else { 9 }
+    $durationRaw = if ($U -and $null -ne $U.WorkDurationMinutes -and "$($U.WorkDurationMinutes)" -ne '') { [int]$U.WorkDurationMinutes } else { 540 }
+    $maxDur = 1425 - 60 * $startHr   # UI allows 12:00AM - 11:45PM and cannot cross midnight
+    $duration = if ($durationRaw -gt $maxDur) { $maxDur } else { $durationRaw }
+    $workDays = @(1,2,3,4,5)
+    if ($U -and $U.WorkDaysJson) { try { $wd = @(($U.WorkDaysJson | ConvertFrom-Json) | ForEach-Object { [int]$_ }); if ($wd.Count -gt 0) { $workDays = $wd } } catch { } }
+    $offUH = if ($U -and $null -ne $U.WeeklyOffUH -and "$($U.WeeklyOffUH)" -ne '') { [double]$U.WeeklyOffUH } else { 0.0 }
+    $otHours = 1; $otPct = 0
+    if ($Peak -gt 0 -and $offUH -gt 0) {
+        $rawOt = $offUH / 7.0 / $Peak
+        if ($rawOt -gt 1.0) { $otHours = [int][Math]::Ceiling($rawOt) }
+        $otPct = [int][Math]::Min(100, [Math]::Round(100.0 * $offUH / 7.0 / ($Peak * $otHours)))
+    }
+    $sparse = ($Peak -gt 0 -and $U -and ($null -eq $U.StartHour -or "$($U.StartHour)" -eq ''))
+    [pscustomobject]@{ StartHr = $startHr; Duration = $duration; DurationRaw = $durationRaw; WorkDays = $workDays; OffUH = $offUH; OtHours = $otHours; OtPct = $otPct; Sparse = $sparse }
+}
+function New-ModelerDeployment {
+    param([string]$Name, [int]$Peak, $Win, [int]$Experience, [string]$Region, [string]$VmSize, [int]$DiskGb, [string]$DiskSku, [bool]$Ephemeral, [double]$Density, [bool]$CustomImage)
+    [ordered]@{
+        mode = 'avd'
+        name = $Name
+        users = [ordered]@{ total = [Math]::Max(1, $Peak); absentPercent = 0; overtimeEnabled = ($Win.OtPct -gt 0); overtimePercent = $Win.OtPct; overtimeHours = $(if ($Win.OtPct -gt 0) { $Win.OtHours } else { 0 }) }
+        experience = $Experience
+        region = $Region
+        workload = [ordered]@{
+            type = 5; vmSize = $VmSize
+            disk = [ordered]@{ isEphemeral = $Ephemeral; size = $DiskGb; type = $DiskSku }
+            maxUsersPerVCpu = $Density; stoppedDiskType = 'Standard_LRS'; rdpEgressGb = 10
+        }
+        image = if ($CustomImage) { [ordered]@{ type = 2; monthlyRunningHours = 6; vmSize = 'Standard_D2s_v5'; isCisHardenedImage = $false } }
+                else { [ordered]@{ type = 1; isCisHardenedImage = $false } }
+        autoScale = [ordered]@{ type = 0; workDays = @($Win.WorkDays); workStartHour = $Win.StartHr; workStartMinutes = 0; workDurationMinutes = $Win.Duration }
+        fsLogix = [ordered]@{ enabled = $false }
+        administrative = [ordered]@{ tasks = $adminTasks; hourlyRate = 100; isEnabled = $false }
+        savings = [ordered]@{ reservedInstances = [ordered]@{ count = 0; years = 1 } }
+    }
+}
+function Get-OverProvisionFlag {
+    # v0.21: hosts registered against the measured peak. Fires when the pool
+    # (or merged family) holds at least twice the hosts a 10% headroom needs.
+    param([int]$Hosts, [int]$Peak, [int]$UsersPerHost)
+    if ($Peak -le 0 -or $UsersPerHost -le 0 -or $Hosts -lt 4) { return $null }
+    $needed = [int][Math]::Ceiling($Peak / [double]$UsersPerHost * 1.10)
+    if ($Hosts -ge 2 * $needed) { return "over-provisioned: $Hosts hosts registered for a peak of $Peak users ($UsersPerHost per host); $needed would carry it with 10% headroom" }
+    $null
+}
+foreach ($p in $pools) {
+    $key = $p.id.ToLower()
+    $u = $usage[$key]
+    $hostCount = if ($poolVmIds.ContainsKey($key)) { @($poolVmIds[$key]).Count } else { 0 }
+    # representative VM spec = the pool's most common SIZE first, then the most
+    # common ephemeral/image combo among hosts of that size. The old single
+    # grouping keyed on vmSize+ephemeral+imageId at once, so two same-size hosts
+    # running different images split into count-1 groups: a 4-host pool
+    # (D2as x2 + D4as + D8as) became a 4-way tie, and tie order is not stable in
+    # Windows PowerShell - the same command minutes apart returned D2as from
+    # Cloud Shell (the true mode) and a one-off D8as from 5.1. Every pick now
+    # sorts Count desc THEN name asc, so every shell chooses identically.
+    $spec = $null
+    if ($poolVmIds.ContainsKey($key)) {
+        $hostSpecs = @($poolVmIds[$key] | ForEach-Object { $vmSpecs[$_] } | Where-Object { $_ })
+        if ($hostSpecs.Count -gt 0) {
+            $sizeGrp = @($hostSpecs | Group-Object vmSize |
+                Sort-Object @{Expression='Count';Descending=$true}, @{Expression='Name';Descending=$false})[0]
+            $spec = @($sizeGrp.Group | Group-Object ephemeral, imageId |
+                Sort-Object @{Expression='Count';Descending=$true}, @{Expression='Name';Descending=$false})[0].Group[0]
+        }
+    }
+    $vmSize   = if ($spec -and $spec.vmSize) { $spec.vmSize } else { 'Standard_D4s_v5' }
+    $vcpus    = [int]([regex]::Match($vmSize, '_[A-Za-z]+?(\d+)').Groups[1].Value); if ($vcpus -lt 1) { $vcpus = 4 }
+    $disk     = if ($spec -and $spec.osDiskId -and $diskSpecs.ContainsKey($spec.osDiskId)) { $diskSpecs[$spec.osDiskId] } else { $null }
+    $diskGbRaw = if ($disk -and $disk.diskSizeGb) { [int]$disk.diskSizeGb } else { 128 }
+    $diskGb   = ($diskTiers | Where-Object { $_ -ge $diskGbRaw } | Select-Object -First 1); if (-not $diskGb) { $diskGb = 4096 }
+    $diskSku  = if ($disk -and $disk.diskSku) { $disk.diskSku } else { 'Premium_LRS' }
+    $limit    = if ($null -ne $p.maxSessionLimit) { [int]$p.maxSessionLimit } else { 0 }
+    # Modeler DesktopExperience enum, read from the Modeler app itself (v0.20):
+    # 1 MultiSession, 2 DedicatedPersonal, 3 FloatingPersonal (single user,
+    # pooled), 4 RemoteApplication, 5 Windows365Desktops.
+    $experience = if ($p.hostPoolType -eq 'Personal') { 2 }
+                  elseif ($p.preferredAppGroupType -eq 'RailApplications') { 4 }
+                  elseif ($limit -eq 1) { 3 } else { 1 }
+    # EMPTY POOL = the pool object exists but nothing is behind it: no session
+    # host resolves to a VM, no connection appeared in the lookback, no session
+    # was ever counted. Field feedback (a 114-pool tenant carried 38 such
+    # shells): each used to export as a fake 1-user 9:00+9h deployment - a
+    # third of that model was noise. Shells stay OUT of the JSON; they remain
+    # in the review table flagged EMPTY, land in rawdata.json (emptyPools),
+    # and are counted out loud. Pools WITH hosts but no users still export -
+    # that is real, idle compute worth modeling. NOTE: the review table keeps
+    # exactly one row per pool IN POOL ORDER (cost attribution indexes on it).
+    $hasSessions = $sessionPeaks.ContainsKey($key) -and ([int]$sessionPeaks[$key] -gt 0)
+    if ((-not $spec) -and (-not $u) -and (-not $hasSessions)) {
+        $emptyPools.Add([ordered]@{ id = $p.id; name = $p.name })
+        $emptyDisplay = if ($nameCounts[$p.name] -gt 1) { "$($p.name) ($($p.resourceGroup))" } else { $p.name }
+        $review.Add([pscustomobject]@{
+            Pool = $emptyDisplay; RG = $p.resourceGroup; Type = $p.hostPoolType; Exp = $experience; Region = $p.location
+            VmSize = '-'; Hosts = $hostCount; Limit = $limit; Density = '-'; PerHostPeak = 0
+            PeakUsers = 0; MAU = ''; Window = '-'; Days = '-'
+            Overtime = '-'; MergedInto = ''; Flags = 'EMPTY - excluded from the Modeler JSON (no session hosts, no activity in the lookback)'
+        })
+        continue
+    }
+    $limitSane = ($limit -ge 1 -and $limit -lt 100)
+    $obsPerHost = if ($u -and $u.PSObject.Properties['PeakUsersPerHost'] -and "$($u.PeakUsersPerHost)" -ne '') { [int]$u.PeakUsersPerHost } else { 0 }
+    $density = 1.0
+    $densityBasis = 'defaulted'
+    $densityFloored = $false
+    # Single-session experiences (personal, single-user pooled) are one user per
+    # host by definition; the Modeler forces maxUsersPerVCpu to 1 for them.
+    if ($experience -eq 2 -or $experience -eq 3) { $density = 1.0; $densityBasis = 'single-session (1 user per host)' }
+    elseif ($obsPerHost -ge 1) {
+        $usersPerHost = if ($limitSane) { [Math]::Min($obsPerHost, $limit) } else { $obsPerHost }
+        $density = [Math]::Round($usersPerHost / [double]$vcpus, 2, [MidpointRounding]::AwayFromZero)
+        $densityBasis = "observed per-host peak ($obsPerHost users/host)"
+    }
+    elseif ($limitSane) { $density = [Math]::Round($limit / [double]$vcpus, 2, [MidpointRounding]::AwayFromZero); $densityBasis = 'session limit (no per-host telemetry)' }
+    if ($density -gt 10) { $density = 10; $densityBasis += '; capped at UI max 10' }
+    # v0.20: the Modeler's import validator rejects anything under 0.1 ("Maximum
+    # users per vCPU must be at least 0.1") and the WHOLE file fails to import.
+    # Live case: session limit 1 on a 16-vCPU host = 0.06.
+    if ($density -lt 0.1) { $density = 0.1; $densityFloored = $true; $densityBasis += '; raised to the Modeler minimum 0.1' }
+    $peak     = if ($u) { [int]$u.PeakConcurrentUsers } else { 0 }
+    $win = Resolve-WindowFields -U $u -Peak $peak
+    $startHr = $win.StartHr; $duration = $win.Duration; $durationRaw = $win.DurationRaw; $workDays = $win.WorkDays; $otHours = $win.OtHours; $otPct = $win.OtPct
+    $mau = if ($u -and $u.PSObject.Properties['Mau'] -and "$($u.Mau)" -ne '') { [int]$u.Mau } else { 0 }
+    if ($userTokensByPool.ContainsKey($key) -and $userTokensByPool[$key].Count -gt $mau) { $mau = $userTokensByPool[$key].Count }
+    $usersPerHostCap = if ($experience -eq 2 -or $experience -eq 3) { 1 } elseif ($limitSane) { $limit } elseif ($obsPerHost -ge 1) { $obsPerHost } else { 0 }
+    $sessPeak = if ($sessionPeaks.ContainsKey($key)) { [int]$sessionPeaks[$key] } else { 0 }
+    $flags = @()
+    if ($peak -eq 0) {
+        # v0.20: say WHY there is no usage. "no telemetry" means the query ran and
+        # found nothing; a token failure or a network block means it never ran.
+        $myWs = @($(if ($poolWorkspaces.ContainsKey($key)) { $poolWorkspaces[$key] } else { @() }))
+        $tokenWs = @($myWs | Where-Object { $script:TokenFailedWs.ContainsKey($_) })
+        $blockedWs = @($myWs | Where-Object { $script:NetBlockedWs.ContainsKey($_) })
+        if ($tokenWs.Count -gt 0 -and $tokenWs.Count -eq $myWs.Count) { $flags += 'usage NOT collected this run (no Log Analytics token - re-run); users set to 1' }
+        elseif ($blockedWs.Count -gt 0 -and $blockedWs.Count -eq $myWs.Count) { $flags += 'usage NOT collected this run (workspace blocked this runner at the network layer - re-run from inside the network); users set to 1' }
+        else { $flags += 'no telemetry (users set to 1)' }
+    }
+    if ($peak -gt 0 -and $sessPeak -ge [int][Math]::Ceiling(1.15 * $peak)) { $flags += "sessions incl. disconnected peaked at $sessPeak vs $peak connected - NME console counts read higher; compute is sized on connected users" }
+    if ($experience -ne 2 -and $experience -ne 3 -and $obsPerHost -lt 1) {
+        $flags += if ($limitSane) { 'density from session limit (no per-host telemetry)' }
+                  else { 'no session limit and no per-host telemetry; density defaulted 1.0/vCPU' }
+    }
+    if ($densityFloored) { $flags += 'density raised to the Modeler minimum 0.1 (session limit / vCPUs was lower; the file would not import otherwise)' }
+    if (-not $spec) { $flags += 'VM spec defaulted' }
+    if ($diskGb -ne $diskGbRaw) { $flags += "disk $($diskGbRaw)GB snapped up to $($diskGb)GB tier" }
+    if ($duration -ne $durationRaw) { $flags += 'window trimmed to the 23:45 UI boundary' }
+    if ($durationRaw -ge 1200) { $flags += "round-the-clock usage ($([Math]::Round($durationRaw/60.0,1))h window) - regular presence at nearly every hour; check for parked/service sessions" }
+    if ($win.Sparse) { $flags += 'usage too sparse to derive a window - defaulted 9:00+9h; all load lands in overtime' }
+    $overFlag = Get-OverProvisionFlag -Hosts $hostCount -Peak $peak -UsersPerHost $usersPerHostCap
+    if ($overFlag) { $flags += $overFlag }
+    $displayName = if ($nameCounts[$p.name] -gt 1) { "$($p.name) ($($p.resourceGroup))" } else { $p.name }
+    $depName = if ($peak -eq 0) { "$displayName (no usage data)" } else { $displayName }
+    $dep = New-ModelerDeployment -Name $depName -Peak $peak -Win $win -Experience $experience -Region $p.location -VmSize $vmSize -DiskGb $diskGb -DiskSku $diskSku -Ephemeral ([bool]($spec -and $spec.ephemeral)) -Density $density -CustomImage ([bool]($spec -and $spec.imageId))
+    $deployments.Add($dep)
+    $row = [pscustomobject]@{
+        Pool = $displayName; RG = $p.resourceGroup; Type = $p.hostPoolType; Exp = $experience; Region = $p.location
+        VmSize = $vmSize; Hosts = $hostCount; Limit = $limit; Density = $density; PerHostPeak = $obsPerHost
+        PeakUsers = $peak; MAU = $(if ($mau -gt 0) { $mau } else { '' }); Window = "$startHr`:00+$([Math]::Round($duration/60.0,2))h"; Days = ($workDays -join ',')
+        Overtime = "$otPct% x $($otHours)h"; MergedInto = ''; Flags = ($flags -join '; ')
+    }
+    $review.Add($row)
+    $poolFacts[$key] = @{
+        key = $key; name = $p.name; displayName = $displayName; region = $p.location; rg = $p.resourceGroup
+        spec = $spec; vmSize = $vmSize; vcpus = $vcpus; diskGb = $diskGb; diskSku = $diskSku
+        limit = $limit; limitSane = $limitSane; experience = $experience; obsPerHost = $obsPerHost
+        peak = $peak; hosts = $hostCount; mau = $mau; usersPerHostCap = $usersPerHostCap
+        deployment = $dep; review = $row
+    }
+}
+if ($emptyPools.Count -gt 0) {
+    $emptyNames = @($emptyPools | ForEach-Object { $_.name })
+    $shownNames = if ($emptyNames.Count -gt 12) { (@($emptyNames | Select-Object -First 10) -join ', ') + ", ...and $($emptyNames.Count - 10) more" } else { $emptyNames -join ', ' }
+    Write-Warn2 "$($emptyPools.Count) EMPTY host pool(s) excluded from the Modeler JSON - the pool object exists but has no session hosts and no activity in the lookback, so a defaulted 1-user deployment would only be noise. Marked EMPTY in the review table, listed in rawdata.json: $shownNames"
+}
+
+# ---- v0.21: blue/green slot families -> ONE deployment each ----------------------
+# A 47-pool customer runs every production family as two host pools, slot one
+# and slot two, and swaps them every image release. The two slots serve the
+# SAME people in turn, so a per-pool model carried every user twice (2,373
+# users across 35 deployments for a tenant whose true peak was 1,065). The
+# family is now measured as one pool: the 15-minute samples of its slots are
+# added per slot and the peak, window, days, and overtime are re-derived with
+# the same rules the KQL applies to a single pool. Hosts add up, per-host peak
+# is the highest slot's, MAU is the distinct-user union across the slots, and
+# the VM spec comes from the slot holding the most hosts. Empty slots (the
+# idle slot already scaled to zero) never take part. -NoSlotMerge keeps the
+# per-pool deployments; the review CSV always keeps one row per pool.
+$slotSuffixRx = '(?i)[-_ ]?(?:slot[-_ ]?(?:one|two|three|four|1|2|3|4)|blue|green)$'
+$famGroups = [ordered]@{}   # family key -> [poolKey,...] in pool order (non-empty pools only)
+foreach ($p in $pools) {
+    $key = $p.id.ToLower()
+    if (-not $poolFacts.ContainsKey($key)) { continue }
+    if ($p.name -notmatch $slotSuffixRx) { continue }
+    $fk = ($p.name -replace $slotSuffixRx, '').TrimEnd('-', '_', ' ').ToLowerInvariant()
+    if (-not $fk) { continue }
+    if (-not $famGroups.Contains($fk)) { $famGroups[$fk] = @() }
+    $famGroups[$fk] += $key
+}
+$bucketsByPool = @{}   # poolKey -> list of (slot, users) from the workspace whose aggregates won
+foreach ($b in $rawBuckets) {
+    if (-not $usageWs.ContainsKey($b.HostPoolId) -or $usageWs[$b.HostPoolId] -ne $b.Workspace) { continue }
+    if (-not $bucketsByPool.ContainsKey($b.HostPoolId)) { $bucketsByPool[$b.HostPoolId] = [System.Collections.Generic.List[object]]::new() }
+    $bucketsByPool[$b.HostPoolId].Add($b)
+}
+$slotFamilies = [System.Collections.Generic.List[object]]::new()
+$mergedMembers = @{}   # poolKey -> family display name
+foreach ($fk in @($famGroups.Keys)) {
+    $members = @($famGroups[$fk])
+    if ($members.Count -lt 2) { continue }
+    $facts = @($members | ForEach-Object { $poolFacts[$_] })
+    $lead = @($facts | Sort-Object @{Expression={ $_.hosts }; Descending=$true}, @{Expression={ $_.peak }; Descending=$true}, @{Expression={ $_.name }; Descending=$false})[0]
+    $famName = ($lead.name -replace $slotSuffixRx, '').TrimEnd('-', '_', ' ')
+    $series = @{}
+    foreach ($f in $facts) {
+        if (-not $bucketsByPool.ContainsKey($f.key)) { continue }
+        foreach ($b in $bucketsByPool[$f.key]) { $series[$b.SlotUtc] = [int](Coalesce $series[$b.SlotUtc] 0) + [int]$b.ConcurrentUsers }
+    }
+    $mu = Get-UsageFromSeries -Series $series
+    $peak = if ($mu) { [int]$mu.PeakConcurrentUsers } else { 0 }
+    $obsPerHost = [int](($facts | ForEach-Object { [int]$_.obsPerHost } | Measure-Object -Maximum).Maximum)
+    $hosts = [int](($facts | ForEach-Object { [int]$_.hosts } | Measure-Object -Sum).Sum)
+    $limit = [int]$lead.limit; $limitSane = [bool]$lead.limitSane; $experience = [int]$lead.experience; $vcpus = [int]$lead.vcpus
+    $density = 1.0; $densityNote = ''
+    if ($experience -eq 2 -or $experience -eq 3) { $density = 1.0 }
+    elseif ($obsPerHost -ge 1) { $density = [Math]::Round($(if ($limitSane) { [Math]::Min($obsPerHost, $limit) } else { $obsPerHost }) / [double]$vcpus, 2, [MidpointRounding]::AwayFromZero) }
+    elseif ($limitSane) { $density = [Math]::Round($limit / [double]$vcpus, 2, [MidpointRounding]::AwayFromZero); $densityNote = 'density from session limit (no per-host telemetry)' }
+    if ($density -gt 10) { $density = 10 }
+    if ($density -lt 0.1) { $density = 0.1; $densityNote = 'density raised to the Modeler minimum 0.1' }
+    $win = Resolve-WindowFields -U $mu -Peak $peak
+    $famTokens = [System.Collections.Generic.HashSet[string]]::new()
+    foreach ($f in $facts) { if ($userTokensByPool.ContainsKey($f.key)) { $famTokens.UnionWith($userTokensByPool[$f.key]) } }
+    $mau = if ($famTokens.Count -gt 0) { $famTokens.Count } else { [int](($facts | ForEach-Object { [int]$_.mau } | Measure-Object -Maximum).Maximum) }
+    $usersPerHostCap = if ($experience -eq 2 -or $experience -eq 3) { 1 } elseif ($limitSane) { $limit } elseif ($obsPerHost -ge 1) { $obsPerHost } else { 0 }
+    $fflags = @()
+    if ($peak -eq 0) { $fflags += 'no telemetry in any slot (users set to 1)' }
+    if ($densityNote) { $fflags += $densityNote }
+    if ($win.Sparse) { $fflags += 'usage too sparse to derive a window - defaulted 9:00+9h; all load lands in overtime' }
+    if (-not $tzInfo) { $fflags += "merged window computed in UTC (this shell does not know time zone '$TimeZone')" }
+    $regions = @($facts | ForEach-Object { "$($_.region)" } | Select-Object -Unique)
+    if ($regions.Count -gt 1) { $fflags += "slots span regions ($($regions -join ', ')); modeled in $($lead.region)" }
+    $exps = @($facts | ForEach-Object { [int]$_.experience } | Select-Object -Unique)
+    if ($exps.Count -gt 1) { $fflags += "slots differ in experience type; modeled as the largest slot's ($experience)" }
+    $overFlag = Get-OverProvisionFlag -Hosts $hosts -Peak $peak -UsersPerHost $usersPerHostCap
+    if ($overFlag) { $fflags += $overFlag }
+    $memberNames = @($facts | ForEach-Object { $_.name })
+    $depName = "$famName (slots merged: $($memberNames -join ' + '))$(if ($peak -eq 0) { ' (no usage data)' })"
+    $dep = New-ModelerDeployment -Name $depName -Peak $peak -Win $win -Experience $experience -Region $lead.region -VmSize $lead.vmSize -DiskGb $lead.diskGb -DiskSku $lead.diskSku -Ephemeral ([bool]($lead.spec -and $lead.spec.ephemeral)) -Density $density -CustomImage ([bool]($lead.spec -and $lead.spec.imageId))
+    $slotFamilies.Add([pscustomobject]@{
+        Family = $famName; Slots = $memberNames.Count; Members = ($memberNames -join ' + '); Region = $lead.region
+        VmSize = $lead.vmSize; Hosts = $hosts; Limit = $limit; Density = $density; PerHostPeak = $obsPerHost
+        PeakUsers = $peak; PerSlotPeaks = (@($facts | ForEach-Object { $_.peak }) -join '/'); MAU = $(if ($mau -gt 0) { $mau } else { '' })
+        Window = "$($win.StartHr)`:00+$([Math]::Round($win.Duration/60.0,2))h"; Days = ($win.WorkDays -join ','); Overtime = "$($win.OtPct)% x $($win.OtHours)h"
+        Merged = (-not $NoSlotMerge); Flags = ($fflags -join '; ')
+        _keys = $members; _dep = $dep; _lead = $lead.key; _peakAt = $(if ($mu) { $mu.PeakAtUtc } else { '' })
+    })
+    if (-not $NoSlotMerge) { foreach ($f in $facts) { $mergedMembers[$f.key] = $famName; $f.review.MergedInto = $famName } }
+}
+if ($slotFamilies.Count -gt 0 -and -not $NoSlotMerge) {
+    $rebuilt = [System.Collections.Generic.List[object]]::new()
+    $famByLead = @{}
+    foreach ($fam in $slotFamilies) { $famByLead[$fam._lead] = $fam }
+    foreach ($p in $pools) {
+        $key = $p.id.ToLower()
+        if (-not $poolFacts.ContainsKey($key)) { continue }
+        if ($famByLead.ContainsKey($key)) { $rebuilt.Add($famByLead[$key]._dep); continue }
+        if ($mergedMembers.ContainsKey($key)) { continue }
+        $rebuilt.Add($poolFacts[$key].deployment)
+    }
+    $deployments = $rebuilt
+    Write-Ok "Blue/green slot families merged: $($slotFamilies.Count) famil$(if ($slotFamilies.Count -eq 1) { 'y' } else { 'ies' }) ($($mergedMembers.Count) slot pools) now export as one deployment each, measured from the slots' combined usage. Per-pool rows stay in the review CSV (MergedInto column). Use -NoSlotMerge to keep them separate."
+} elseif ($slotFamilies.Count -gt 0) {
+    Write-Info "$($slotFamilies.Count) blue/green slot famil$(if ($slotFamilies.Count -eq 1) { 'y' } else { 'ies' }) detected and kept as separate deployments (-NoSlotMerge). Note that the slots of a family serve the same people in turn, so the model counts them twice."
+}
+
+# ---- v0.21: tenant-wide usage, counts only ------------------------------------------
+# The licensing question is "how many people used AVD this month, across the
+# tenant" and the sizing question is "how many were on at once, across the
+# tenant". Per-pool numbers cannot answer either: a person in two pools is
+# counted twice, and pools peak at different moments. Both are computed here
+# from the same samples and tokens the pools use. Numbers only.
+$tenantSeries = @{}
+foreach ($pk in $bucketsByPool.Keys) { foreach ($b in $bucketsByPool[$pk]) { $tenantSeries[$b.SlotUtc] = [int](Coalesce $tenantSeries[$b.SlotUtc] 0) + [int]$b.ConcurrentUsers } }
+$tenantUsage = Get-UsageFromSeries -Series $tenantSeries
+$tenantTokens = [System.Collections.Generic.HashSet[string]]::new()
+foreach ($pk in $userTokensByPool.Keys) { $tenantTokens.UnionWith($userTokensByPool[$pk]) }
+$mauSum = 0; foreach ($f in $poolFacts.Values) { $mauSum += [int]$f.mau }
+$hostsRegistered = 0; foreach ($pk in $poolVmIds.Keys) { $hostsRegistered += @($poolVmIds[$pk]).Count }
+$tenantPeakLocal = ''
+if ($tenantUsage -and $tenantUsage.PeakAtUtc) {
+    try {
+        $tp = [DateTime]::Parse($tenantUsage.PeakAtUtc, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime()
+        $tenantPeakLocal = if ($tzInfo) { [TimeZoneInfo]::ConvertTimeFromUtc($tp, $tzInfo).ToString('ddd MMM d, h:mm tt') + " ($TimeZone)" } else { $tp.ToString('ddd MMM d, HH:mm') + ' UTC' }
+    } catch { }
+}
+$script:TenantSummary = [ordered]@{
+    peakConcurrentUsers = $(if ($tenantUsage) { [int]$tenantUsage.PeakConcurrentUsers } else { 0 })
+    peakAtUtc = $(if ($tenantUsage) { $tenantUsage.PeakAtUtc } else { '' }); peakAtLocal = $tenantPeakLocal
+    distinctUsers = $tenantTokens.Count; distinctUsersBasis = 'union of per-user tokens across every pool and workspace queried (counts only; tokens are salted hashes held in memory for this run)'
+    perPoolMauSum = $mauSum; userHoursInLookback = $(if ($tenantUsage) { $tenantUsage.TotalUserHours } else { 0 })
+    hostsRegistered = $hostsRegistered
+    slotFamilies = $slotFamilies.Count; slotPoolsMerged = $mergedMembers.Count
+}
+
+# ---- storage stays OUT of the model: ledger only (v0.15 ruling) ------------------
+# No carrier deployments, no fsLogix blocks, no prompts. The storage ledger CSV
+# (written with the review CSV below) is the complete storage deliverable.
+
+$model = [ordered]@{
+    schema = 4
+    name = $ModelName
+    description = "Generated from actuals, lookback $($LookbackDays)d, $(Get-Date -Format 'yyyy-MM-dd')$(if ($slotFamilies.Count -gt 0 -and -not $NoSlotMerge) { "; $($slotFamilies.Count) blue/green slot famil$(if ($slotFamilies.Count -eq 1) { 'y' } else { 'ies' }) merged into one deployment each" })$(if ($script:TelemetryNotCollected) { ' - USAGE NOT COLLECTED (Log Analytics token failure): every pool is defaulted to 1 user; re-run before using' })"
+    deployments = $deployments
+    globalSettings = $globalSettings
+}
+
+# ---- import pre-flight: replay the Modeler's own import checks (v0.20) ----------
+# Rules read from the public Modeler app (nmeadvisor.getnerdio.com, Sept 2026).
+# A deployment that fails ANY of them fails its Review step, and the Modeler
+# refuses the whole file with "One or more review steps are not completed".
+# Everything here is corrected in place and printed, so a file cannot leave
+# this script unimportable. Silent fallbacks the Modeler makes on its own
+# (a disk size it does not know becomes its first list entry) are pre-empted too.
+$diskTierIds = @{ 'Standard_LRS' = 'S'; 'StandardSSD_LRS' = 'E'; 'Premium_LRS' = 'P' }
+$preflightFixes = [System.Collections.Generic.List[string]]::new()
+foreach ($d in $deployments) {
+    $w = $d.workload; $us = $d.users; $as = $d.autoScale
+    if ([string]::IsNullOrWhiteSpace($d.name)) { $d.name = 'Unnamed pool'; $preflightFixes.Add('an unnamed deployment was named "Unnamed pool"') }
+    if (-not ($us.total -ge 1)) { $preflightFixes.Add("$($d.name): users.total $($us.total) -> 1"); $us.total = 1 }
+    if ([string]::IsNullOrWhiteSpace($d.region)) { $d.region = 'eastus'; $preflightFixes.Add("$($d.name): region was empty -> eastus (check it)") }
+    if ($d.experience -notin @(1, 2, 3, 4)) { $preflightFixes.Add("$($d.name): experience $($d.experience) -> 1"); $d.experience = 1 }
+    if ($w.type -ne 5) { $preflightFixes.Add("$($d.name): workload type $($w.type) -> 5 (Custom)"); $w.type = 5 }
+    if (-not ($w.maxUsersPerVCpu -ge 0.1)) { $preflightFixes.Add("$($d.name): maxUsersPerVCpu $($w.maxUsersPerVCpu) -> 0.1 (Modeler minimum)"); $w.maxUsersPerVCpu = 0.1 }
+    if (-not ($w.rdpEgressGb -gt 0)) { $preflightFixes.Add("$($d.name): rdpEgressGb $($w.rdpEgressGb) -> 10"); $w.rdpEgressGb = 10 }
+    if (-not $diskTierIds.ContainsKey("$($w.disk.type)")) { $preflightFixes.Add("$($d.name): disk type '$($w.disk.type)' is not a Modeler tier -> Premium_LRS"); $w.disk.type = 'Premium_LRS' }
+    if ($w.disk.size -notin $diskTiers) {
+        $snap = ($diskTiers | Where-Object { $_ -ge [int]$w.disk.size } | Select-Object -First 1); if (-not $snap) { $snap = 4096 }
+        $preflightFixes.Add("$($d.name): disk size $($w.disk.size) -> $snap (Modeler tier)"); $w.disk.size = $snap
+    }
+    if ("$($w.stoppedDiskType)" -notin @('Standard_LRS', 'StandardSSD_LRS', 'Premium_LRS')) { $preflightFixes.Add("$($d.name): stoppedDiskType -> Standard_LRS"); $w.stoppedDiskType = 'Standard_LRS' }
+    if ($d.image.type -eq 2 -and -not ($d.image.monthlyRunningHours -gt 0)) { $preflightFixes.Add("$($d.name): custom image running hours -> 6"); $d.image.monthlyRunningHours = 6 }
+    if ($us.absentPercent -lt 0 -or $us.absentPercent -gt 100) { $preflightFixes.Add("$($d.name): absentPercent -> 0"); $us.absentPercent = 0 }
+    $otBad = ($us.overtimeEnabled -and ($us.overtimePercent -le 0 -or $us.overtimeHours -le 0)) -or ((-not $us.overtimeEnabled) -and ($us.overtimePercent -ne 0 -or $us.overtimeHours -ne 0)) -or ($us.overtimePercent -gt 100)
+    if ($otBad) { $preflightFixes.Add("$($d.name): overtime fields were inconsistent -> overtime off"); $us.overtimeEnabled = $false; $us.overtimePercent = 0; $us.overtimeHours = 0 }
+    if (@($as.workDays).Count -eq 0) { $preflightFixes.Add("$($d.name): empty work days -> Mon-Fri"); $as.workDays = @(1, 2, 3, 4, 5) }
+    if ($as.workStartHour -lt 0 -or $as.workStartHour -gt 23) { $preflightFixes.Add("$($d.name): work start hour $($as.workStartHour) -> 9"); $as.workStartHour = 9 }
+    if ($as.workStartMinutes -lt 0) { $as.workStartMinutes = 0 }
+    if (-not ($as.workDurationMinutes -gt 0)) { $preflightFixes.Add("$($d.name): work duration $($as.workDurationMinutes) -> 540"); $as.workDurationMinutes = 540 }
+}
+foreach ($fx in $preflightFixes) { Write-Warn2 "Import pre-flight corrected: $fx" }
+Write-Ok "Import pre-flight: $($deployments.Count)/$($deployments.Count) deployments pass the Modeler's import checks$(if ($preflightFixes.Count -gt 0) { " ($($preflightFixes.Count) value(s) corrected above)" })."
+
+# ------------------------------------------------------------------- 6. output + download
+Write-Info "[7/8] Writing $OutFile..."
+Write-Utf8NoBom -FilePath $OutFile -Content ($model | ConvertTo-Json -Depth 30 -Compress)
+
+# ---------------------------------------- 7. actual spend (optional, skip-safe)
+if ($script:AuthBroken -and -not $SkipCosts) {
+    Write-Warn2 "[8/8] Cost pull skipped - Azure token broken (see banner above); a fresh-session re-run fills ActualMo in."
+}
+if (-not $SkipCosts -and -not $script:AuthBroken) {
+    Write-Info "[8/8] Pulling last month's ACTUAL spend for session-host VMs + disks (one query per subscription; waits politely if Azure throttles, so this step can take a few minutes on a busy tenant)..."
+    $costByResource = @{}
+    $costCurrency = ''
+    $rgScopes = @{}
+    foreach ($vmId in $vmSpecs.Keys) { $parts = $vmId -split '/'; $rgScopes["/subscriptions/$($parts[2])/resourcegroups/$($parts[4])"] = $parts[4] }
+    # storage ledger gets actual spend too - add each candidate's resource group scope
+    foreach ($cand in $storageCandidates) { if ($cand.ResourceId) { $parts = $cand.ResourceId -split '/'; $rgScopes["/subscriptions/$($parts[2])/resourcegroups/$($parts[4])"] = $parts[4] } }
+    # v0.19: group the resource groups by subscription and ask ONCE per subscription
+    # (ResourceGroupName filter). A refused subscription-level query expands into the
+    # per-resource-group items of the pre-v0.19 path. Scopes still throttled after
+    # their own retry budget wait for a second pass after a cooldown.
+    $bySub = @{}
+    foreach ($scope in $rgScopes.Keys) {
+        $sub = ($scope -split '/')[2]
+        if (-not $bySub.ContainsKey($sub)) { $bySub[$sub] = @() }
+        $bySub[$sub] += $rgScopes[$scope]
+    }
+    $queue = New-Object System.Collections.ArrayList
+    foreach ($sub in ($bySub.Keys | Sort-Object)) {
+        $rgs = @($bySub[$sub] | Sort-Object -Unique)
+        [void]$queue.Add(@{ Kind = 'sub'; Scope = "/subscriptions/$sub"; Sub = $sub; RGs = $rgs; Label = "subscription $sub ($($rgs.Count) resource group(s): $($rgs -join ', '))" })
+    }
+    $costOk = 0; $rgCovered = 0; $costSkipped = @(); $costStopped = $false
+    $deferred = New-Object System.Collections.ArrayList
+    for ($pass = 1; $pass -le 2 -and -not $costStopped; $pass++) {
+        if ($pass -eq 2) {
+            if ($deferred.Count -eq 0) { break }
+            Write-Warn2 "Cost Management kept throttling $($deferred.Count) scope(s) past the retry budget. Cooling down 90s so the rate-limit window resets, then trying them once more before giving up..."
+            if ($env:MODELER_FAST_RETRY -ne '1') { Start-Sleep -Seconds 90 }
+            $queue = $deferred; $deferred = New-Object System.Collections.ArrayList
+        }
+        while ($queue.Count -gt 0) {
+            $item = $queue[0]; $queue.RemoveAt(0)
+            if ($script:Throttle.Hits -gt 0) { Write-Info "Cost scope: $($item.Label) ($($queue.Count) more queued$(if ($pass -eq 2) { ', second pass' }))." }
+            $res = Invoke-CostScope $item
+            if ($res.ok -and $item.Kind -eq 'sub' -and @($res.rows).Count -eq 0) {
+                # Zero rows for resource groups that hold running session hosts is suspicious
+                # (a filter quirk would show up exactly this way). The per-RG path is the
+                # proven one - confirm through it rather than record a silent zero.
+                Write-Info "Subscription-level cost query for $($item.Sub) returned no rows - confirming with one query per resource group."
+                foreach ($rg in $item.RGs) {
+                    [void]$queue.Add(@{ Kind = 'rg'; Scope = "/subscriptions/$($item.Sub)/resourcegroups/$rg"; Sub = $item.Sub; RGs = @($rg); Label = "resource group $rg" })
+                }
+                continue
+            }
+            if ($res.ok) {
+                $costOk++; $rgCovered += @($item.RGs).Count
+                foreach ($row in $res.rows) {
+                    $costByResource[$row.ResourceId] = (Coalesce $costByResource[$row.ResourceId] 0) + $row.Cost
+                    if (-not $costCurrency -and $row.Currency) { $costCurrency = $row.Currency }
+                }
+                if ($pass -eq 2) { $script:Throttle.Recovered += ,@($item.RGs); Write-Ok "Recovered on the second pass: $($item.Label)." }
+                continue
+            }
+            $st = "$($res.status)"
+            if ($st -match '^HTTP 429') {
+                if ($pass -eq 1) { [void]$deferred.Add($item) }
+                else { $costSkipped += [pscustomobject]@{ RG = (@($item.RGs) -join ', '); Reason = $st } }
+                continue
+            }
+            if ((Test-CredError $st) -and -not (Confirm-AzureAuthAlive)) {
+                Write-Warn2 "Cost pull stopped at the token failure - remaining scopes untried; a fresh-session re-run fills ActualMo in."
+                $costStopped = $true; break
+            }
+            if ($item.Kind -eq 'sub') {
+                Write-Info "Subscription-level cost query for $($item.Sub) was refused ($st) - falling back to one query per resource group for its $(@($item.RGs).Count) resource group(s)."
+                foreach ($rg in $item.RGs) {
+                    [void]$queue.Add(@{ Kind = 'rg'; Scope = "/subscriptions/$($item.Sub)/resourcegroups/$rg"; Sub = $item.Sub; RGs = @($rg); Label = "resource group $rg" })
+                }
+                continue
+            }
+            $costSkipped += [pscustomobject]@{ RG = (@($item.RGs) -join ', '); Reason = $st }
+        }
+    }
+    if ($costByResource.Count -gt 0) {
+        # v0.20: attribution by resource id alone missed REBUILT hosts. A customer
+        # that re-creates every session host on each release billed last month's
+        # generation under ids that no longer exist; nine production pools showed
+        # ActualMo 0 while their spend sat in "other". Now a billed VM (or its OS
+        # disk) that is NOT a current host is attributed to a pool when its name
+        # follows that pool's host naming (same stem once trailing numbers and
+        # hex suffixes are stripped: avd-ec1-7-3-94 and avd-ec1-8-1-108 both stem
+        # to "avd-ec"), flagged "hosts rebuilt". If several pools in the same
+        # resource group share a stem, the row splits by current host count. A
+        # resource group that holds ONE pool's hosts does NOT sweep everything in:
+        # image builders, jump boxes, and orphaned disks live in AVD resource
+        # groups too (a demo tenant carried an $807 image VM next to its hosts).
+        # Anything that matches no pool's naming is reported by group, top items
+        # named, so the reviewer can see exactly what it was. Storage accounts
+        # never enter a pool's total.
+        $costLower = @{}
+        foreach ($k in $costByResource.Keys) { $lk = "$k".ToLowerInvariant(); $costLower[$lk] = (Coalesce $costLower[$lk] 0) + $costByResource[$k] }
+        $currentIds = @{}
+        foreach ($vmId in $vmSpecs.Keys) { $currentIds["$vmId".ToLowerInvariant()] = $true; if ($vmSpecs[$vmId].osDiskId) { $currentIds["$($vmSpecs[$vmId].osDiskId)".ToLowerInvariant()] = $true } }
+        # pool -> host-name stems (per resource group), and rg|stem -> pools that use it
+        $stemPools = @{}     # "rgScopeLower|stem" -> @(poolKey,...)
+        $stemHostCount = @{} # "rgScopeLower|stem|poolKey" -> current hosts with that stem
+        foreach ($pk in $poolVmIds.Keys) {
+            foreach ($vmId in $poolVmIds[$pk]) {
+                $rgKey = ((("$vmId" -split '/')[0..4]) -join '/').ToLowerInvariant()
+                $st = Get-HostNameStem (("$vmId" -split '/')[-1])
+                if (-not $st) { continue }
+                $sk = "$rgKey|$st"
+                if (-not $stemPools.ContainsKey($sk)) { $stemPools[$sk] = @() }
+                if ($stemPools[$sk] -notcontains $pk) { $stemPools[$sk] += $pk }
+                $stemHostCount["$sk|$pk"] = 1 + [int](Coalesce $stemHostCount["$sk|$pk"] 0)
+            }
+        }
+        $byNaming = @{}      # poolKey -> spend attributed by host naming
+        $byNamingDisk = @{}  # poolKey -> the disk portion of byNaming (v0.21)
+        $byNamingRows = @{}  # poolKey -> count of rebuilt VMs (not disks)
+        $byNamingSplit = @{} # poolKey -> portion of byNaming that was a split across pools
+        $unattributed = @{}  # rgScopeLower -> @(@{ name; cost }...)
+        $storageSpend = 0.0; $vmDiskSpend = 0.0; $unattributedTotal = 0.0
+        foreach ($rid in $costLower.Keys) {
+            $isVm = $rid -match '/providers/microsoft\.compute/virtualmachines/'
+            $isDisk = $rid -match '/providers/microsoft\.compute/disks/'
+            if (-not ($isVm -or $isDisk)) { $storageSpend += $costLower[$rid]; continue }
+            $vmDiskSpend += $costLower[$rid]
+            if ($currentIds.ContainsKey($rid)) { continue }
+            $rgKey = ((($rid -split '/')[0..4]) -join '/')
+            $leaf = ($rid -split '/')[-1]
+            $st = Get-HostNameStem $leaf
+            $owners = @($(if ($st -and $stemPools.ContainsKey("$rgKey|$st")) { $stemPools["$rgKey|$st"] } else { @() }))
+            if ($owners.Count -eq 0) {
+                if (-not $unattributed.ContainsKey($rgKey)) { $unattributed[$rgKey] = @() }
+                $unattributed[$rgKey] += ,@{ name = $leaf; cost = $costLower[$rid] }
+                $unattributedTotal += $costLower[$rid]
+                continue
+            }
+            $all = 0; foreach ($o in $owners) { $all += [int](Coalesce $stemHostCount["$rgKey|$st|$o"] 0) }
+            foreach ($o in $owners) {
+                $share = if ($owners.Count -eq 1 -or $all -le 0) { $costLower[$rid] / [Math]::Max(1, $owners.Count) } else { $costLower[$rid] * [int](Coalesce $stemHostCount["$rgKey|$st|$o"] 0) / $all }
+                $byNaming[$o] = (Coalesce $byNaming[$o] 0) + $share
+                if ($isDisk) { $byNamingDisk[$o] = (Coalesce $byNamingDisk[$o] 0) + $share }
+                if ($owners.Count -gt 1) { $byNamingSplit[$o] = (Coalesce $byNamingSplit[$o] 0) + $share }
+                if ($isVm) { $byNamingRows[$o] = 1 + [int](Coalesce $byNamingRows[$o] 0) }
+            }
+        }
+        $attributedById = 0.0; $attributedByNaming = 0.0; $attributedSplit = 0.0
+        $costAttribution = [System.Collections.Generic.List[object]]::new()
+        for ($i = 0; $i -lt $pools.Count; $i++) {
+            $key = $pools[$i].id.ToLower()
+            $byId = 0.0; $byIdDisk = 0.0
+            if ($poolVmIds.ContainsKey($key)) {
+                foreach ($vmId in $poolVmIds[$key]) {
+                    $byId += (Coalesce $costLower["$vmId".ToLowerInvariant()] 0)
+                    $vmSpec = $vmSpecs[$vmId]
+                    if ($vmSpec -and $vmSpec.osDiskId) { $dk = [double](Coalesce $costLower["$($vmSpec.osDiskId)".ToLowerInvariant()] 0); $byId += $dk; $byIdDisk += $dk }
+                }
+            }
+            $nm = [double](Coalesce $byNaming[$key] 0)
+            $sp = [double](Coalesce $byNamingSplit[$key] 0)
+            $rebuiltVms = [int](Coalesce $byNamingRows[$key] 0)
+            $sum = $byId + $nm
+            $diskPart = $byIdDisk + [double](Coalesce $byNamingDisk[$key] 0)
+            $vmPart = $sum - $diskPart
+            $basis = if ($sum -le 0) { '' } elseif ($nm -gt 0 -and $sp -gt 0) { 'by id + host naming (hosts rebuilt; part split across pools sharing a name pattern)' } elseif ($nm -gt 0) { 'by id + host naming (hosts rebuilt)' } else { 'by resource id' }
+            $attributedById += $byId; $attributedByNaming += $nm; $attributedSplit += $sp
+            $review[$i] | Add-Member -NotePropertyName ActualMo -NotePropertyValue ([Math]::Round($sum, 2))
+            $review[$i] | Add-Member -NotePropertyName ActualVm -NotePropertyValue ([Math]::Round($vmPart, 2))
+            $review[$i] | Add-Member -NotePropertyName ActualDisk -NotePropertyValue ([Math]::Round($diskPart, 2))
+            $review[$i] | Add-Member -NotePropertyName ActualBasis -NotePropertyValue $basis
+            if ($nm -gt 0) {
+                $note = "ActualMo includes $([Math]::Round($nm, 2)) for $rebuiltVms VM(s) (and their disks) named like this pool's hosts that are not current hosts - hosts rebuilt since the billing month$(if ($sp -gt 0) { "; $([Math]::Round($sp, 2)) of it split by host count with other pools sharing the name pattern (estimate)" })"
+                $review[$i].Flags = (@(@($review[$i].Flags) + @($note) | Where-Object { $_ }) -join '; ')
+            }
+            # v0.21: when OS disks are a big share of a pool's bill the hosts sit stopped
+            # most of the month while their disks keep billing - Nerdio's stopped-disk
+            # tier switch and fewer idle hosts are the levers, not compute schedules.
+            if ($sum -ge 100 -and $diskPart / $sum -ge 0.40) {
+                $dnote = "OS disks are $([int][Math]::Round(100 * $diskPart / $sum))% of this pool's bill - hosts are stopped most of the month while their disks keep billing; the stopped-disk tier switch and fewer idle hosts are the levers"
+                $review[$i].Flags = (@(@($review[$i].Flags) + @($dnote) | Where-Object { $_ }) -join '; ')
+            }
+            $costAttribution.Add([ordered]@{ poolId = $pools[$i].id; actualMo = [Math]::Round($sum, 2); actualVm = [Math]::Round($vmPart, 2); actualDisk = [Math]::Round($diskPart, 2); byResourceId = [Math]::Round($byId, 2); byHostNaming = [Math]::Round($nm, 2); ofWhichSplitAcrossPools = [Math]::Round($sp, 2); rebuiltVmsBilled = $rebuiltVms })
+        }
+        # v0.21: a slot family's actuals are its slots' actuals added up
+        $poolIndex = @{}; for ($i = 0; $i -lt $pools.Count; $i++) { $poolIndex[$pools[$i].id.ToLower()] = $i }
+        foreach ($fam in $slotFamilies) {
+            $fa = 0.0; $fv = 0.0; $fd = 0.0
+            foreach ($mk in $fam._keys) { $r = $review[$poolIndex[$mk]]; $fa += [double]$r.ActualMo; $fv += [double]$r.ActualVm; $fd += [double]$r.ActualDisk }
+            $fam | Add-Member -NotePropertyName ActualMo -NotePropertyValue ([Math]::Round($fa, 2)) -Force
+            $fam | Add-Member -NotePropertyName ActualVm -NotePropertyValue ([Math]::Round($fv, 2)) -Force
+            $fam | Add-Member -NotePropertyName ActualDisk -NotePropertyValue ([Math]::Round($fd, 2)) -Force
+            if ($fa -ge 100 -and $fd / $fa -ge 0.40) { $fam.Flags = (@(@($fam.Flags) + @("OS disks are $([int][Math]::Round(100 * $fd / $fa))% of this family's bill") | Where-Object { $_ }) -join '; ') }
+        }
+        $attributed = $attributedById + $attributedByNaming
+        $pulledTotal = [Math]::Round(($costLower.Values | Measure-Object -Sum).Sum, 2)
+        Write-Ok "Actual spend (last full month, $costCurrency) pulled for $rgCovered resource group(s) in $costOk query scope(s): $pulledTotal total. Attributed to session hosts + disks: $([Math]::Round($attributed, 2))$(if ($attributedByNaming -gt 0) { " ($([Math]::Round($attributedById, 2)) by resource id; $([Math]::Round($attributedByNaming, 2)) by host naming to VMs that were rebuilt since the billing month$(if ($attributedSplit -gt 0) { ", of which $([Math]::Round($attributedSplit, 2)) is split by host count across pools sharing a name pattern" }))" }). Storage accounts in those groups: $([Math]::Round($storageSpend, 2)).$(if ($unattributedTotal -gt 0.005) { " VM/disk spend matching no pool's host naming: $([Math]::Round($unattributedTotal, 2)) (listed below)." })"
+        if ($attributedByNaming -gt 0) { Write-Warn2 "Hosts were rebuilt since the billing month in $(@($costAttribution | Where-Object { $_.rebuiltVmsBilled -gt 0 }).Count) pool(s): last month's VMs no longer exist, so their spend was attributed by host naming. See ActualBasis and Flags in the review CSV." }
+        $unattributedList = [System.Collections.Generic.List[object]]::new()
+        foreach ($rgKey in ($unattributed.Keys | Sort-Object)) {
+            $rows = @($unattributed[$rgKey] | Sort-Object { -[double]$_.cost })
+            $rgTotal = 0.0; foreach ($r in $rows) { $rgTotal += [double]$r.cost }
+            $top = @($rows | Select-Object -First 5 | ForEach-Object { "$($_.name) $([Math]::Round([double]$_.cost, 2))" }) -join ', '
+            Write-Info "  Not attributed: $([Math]::Round($rgTotal, 2)) of VM/disk spend in $(($rgKey -split '/')[4]) matches no pool's host naming ($($rows.Count) item(s); top: $top)$(if ($rows.Count -gt 5) { ' - full list in rawdata.json' })."
+            $unattributedList.Add([ordered]@{ resourceGroup = ($rgKey -split '/')[4]; scope = $rgKey; total = [Math]::Round($rgTotal, 2); items = @($rows | ForEach-Object { [ordered]@{ name = $_.name; cost = [Math]::Round([double]$_.cost, 2) } }) })
+        }
+        Write-Info "Compare the ActualMo column against the Modeler's monthly cost per deployment after import. Actuals already include their current scaling behavior; the model is the Nerdio-run future."
+    } elseif ($rgScopes.Count -gt 0 -and $costOk -eq 0) {
+        Write-Warn2 "No cost data was retrievable from any scope - model output unaffected."
+    }
+    # ---- v0.21: effective rates vs retail -> the Azure agreement discount to enter ----
+    $script:Discount = $null
+    if ($costByResource.Count -gt 0 -and -not $script:AuthBroken -and -not $costStopped) {
+        try {
+            $meterRows = @()
+            foreach ($sub in ($bySub.Keys | Sort-Object)) {
+                $rgs = @($bySub[$sub] | Sort-Object -Unique)
+                try { $mr = Get-MeterRateRows -Scope "/subscriptions/$sub" -ResourceGroupFilter $rgs } catch { $mr = @{ ok = $false; status = "error: $($_.Exception.Message)" } }
+                if ($mr.ok) { $meterRows += @($mr.rows) } else { Write-Info "Meter-level cost query for subscription $sub was refused ($($mr.status)) - the agreement discount is measured from the other subscriptions, if any." }
+            }
+            $byMeter = @{}
+            foreach ($r in $meterRows) {
+                if (-not $byMeter.ContainsKey($r.MeterId)) { $byMeter[$r.MeterId] = @{ MeterId = $r.MeterId; Meter = $r.Meter; Cost = 0.0; Quantity = 0.0; Currency = $r.Currency } }
+                $byMeter[$r.MeterId].Cost += $r.Cost; $byMeter[$r.MeterId].Quantity += $r.Quantity
+            }
+            $meterTotal = 0.0; foreach ($mm in $byMeter.Values) { $meterTotal += $mm.Cost }
+            $top = @($byMeter.Values | Where-Object { $_.Cost -gt 0 -and $_.Quantity -gt 0 } | Sort-Object { -$_.Cost } | Select-Object -First 25)
+            $cur = if ($costCurrency) { $costCurrency } else { 'USD' }
+            $meterFindings = [System.Collections.Generic.List[object]]::new()
+            foreach ($mm in $top) {
+                $retail = Get-RetailUnitPrice -MeterId $mm.MeterId -Currency $cur
+                if ($null -eq $retail -or $retail.price -le 0) { $meterFindings.Add([pscustomobject]@{ Meter = $mm.Meter; MeterId = $mm.MeterId; Cost = [Math]::Round($mm.Cost, 2); Quantity = [Math]::Round($mm.Quantity, 3); EffectiveUnit = [Math]::Round($mm.Cost / $mm.Quantity, 6); RetailUnit = $null; Unit = ''; Kind = 'unknown'; DiscountPct = $null; Note = 'no retail price found for this meter' }); continue }
+                $eff = $mm.Cost / $mm.Quantity
+                $disc = [Math]::Round(100.0 * (1.0 - $eff / $retail.price), 1)
+                $kind = if ($retail.service -match '(?i)virtual machines') { 'compute' } elseif ($retail.product -match '(?i)managed disks|disks') { 'disk' } elseif ($retail.service -match '(?i)storage') { 'storage' } else { 'other' }
+                $note = if ($disc -lt -5 -or $disc -gt 90) { 'effective and retail units do not reconcile (quantity unit differs from the retail unit); excluded from the average' } else { '' }
+                $meterFindings.Add([pscustomobject]@{ Meter = $mm.Meter; MeterId = $mm.MeterId; Cost = [Math]::Round($mm.Cost, 2); Quantity = [Math]::Round($mm.Quantity, 3); EffectiveUnit = [Math]::Round($eff, 6); RetailUnit = $retail.price; Unit = $retail.unit; Kind = $kind; DiscountPct = $disc; Note = $note })
+            }
+            $usable = @($meterFindings | Where-Object { $null -ne $_.DiscountPct -and -not $_.Note })
+            if ($usable.Count -gt 0) {
+                $wavg = { param($rows) $c = 0.0; $w = 0.0; foreach ($x in $rows) { $c += $x.Cost; $w += $x.Cost * $x.DiscountPct }; if ($c -gt 0) { [Math]::Round($w / $c, 1) } else { $null } }
+                $compRows = @($usable | Where-Object { $_.Kind -eq 'compute' }); $diskRows = @($usable | Where-Object { $_.Kind -eq 'disk' }); $storRows = @($usable | Where-Object { $_.Kind -eq 'storage' })
+                $compDisc = & $wavg $compRows; $diskDisc = & $wavg $diskRows; $storDisc = & $wavg $storRows; $blend = & $wavg $usable
+                $compCost = [Math]::Round((($compRows | Measure-Object Cost -Sum).Sum), 2); $diskCost = [Math]::Round((($diskRows | Measure-Object Cost -Sum).Sum), 2); $storCost = [Math]::Round((($storRows | Measure-Object Cost -Sum).Sum), 2)
+                $enter = [int][Math]::Max(0, [Math]::Round((Coalesce $blend 0)))
+                $script:Discount = [ordered]@{
+                    currency = $cur; basis = 'last full month, meters in the session-host and profile-storage resource groups, effective unit cost (cost / usage quantity) against the public retail price for the same meter'
+                    compute = [ordered]@{ discountPct = $compDisc; spend = $compCost; meters = $compRows.Count }
+                    disk = [ordered]@{ discountPct = $diskDisc; spend = $diskCost; meters = $diskRows.Count }
+                    storage = [ordered]@{ discountPct = $storDisc; spend = $storCost; meters = $storRows.Count }
+                    blendedPct = $blend; enteredInModel = $enter
+                    meters = @($meterFindings)
+                }
+                Write-Host ""
+                Write-Ok "AZURE AGREEMENT DISCOUNT TO ENTER IN THE MODELER: $enter%  (measured: last month's effective unit prices against the public retail price list, $cur)"
+                if ($null -ne $compDisc) { Write-Info "    compute meters: $($compDisc)% under retail across $($compRows.Count) meter(s), $compCost spend" }
+                if ($null -ne $diskDisc) { Write-Info "    OS disk meters: $($diskDisc)% under retail across $($diskRows.Count) meter(s), $diskCost spend" }
+                if ($null -ne $storDisc) { Write-Info "    other storage meters: $($storDisc)% under retail across $($storRows.Count) meter(s), $storCost spend" }
+                Write-Info "    Blended by spend: $($blend)%. The JSON carries it as enterpriseDiscount $enter; the Modeler applies one discount to everything, so adjust it if compute and disks differ a lot. Per-meter detail is in rawdata.json (discount.meters)."
+                $skippedM = @($meterFindings | Where-Object { $_.Note })
+                if ($skippedM.Count -gt 0) { Write-Info "    $($skippedM.Count) meter(s) left out of the average (no retail price, or units that do not reconcile): $((@($skippedM | ForEach-Object { $_.Meter }) | Select-Object -First 6) -join ', ')" }
+                if ($script:Discount.enteredInModel -gt 0) { $model.globalSettings.enterpriseDiscount = $script:Discount.enteredInModel; Write-Utf8NoBom -FilePath $OutFile -Content ($model | ConvertTo-Json -Depth 30 -Compress) }
+            } else {
+                Write-Info "Agreement discount not measured: no meter in the billed resource groups could be matched to a retail price (prices.azure.com unreachable, or the offer bills in units the retail list does not use)."
+            }
+        } catch {
+            Write-Info "Agreement discount not measured ($($_.Exception.Message)) - enter it by hand in the Modeler."
+        }
+    }
+    if ($costSkipped.Count -gt 0) {
+        foreach ($g in ($costSkipped | Group-Object Reason)) {
+            Write-Warn2 "Cost query skipped for $(@($g.Group.RG) -join ', '): $($g.Name)"
+        }
+        $throttledSkips = @($costSkipped | Where-Object { "$($_.Reason)" -match '^HTTP 429' })
+        $otherSkips = @($costSkipped | Where-Object { "$($_.Reason)" -notmatch '^HTTP 429' })
+        if ($throttledSkips.Count -gt 0) { Write-Warn2 "HTTP 429 = Cost Management kept throttling even after this run honored its Retry-After across two passes ($($script:Throttle.Hits) throttled replies, $($script:Throttle.WaitedSeconds)s waited). Not a permissions or offer problem: something else is hammering this tenant's Cost Management API right now (a FinOps tool, another export). Re-run in an hour to fill these scopes' ActualMo; nothing else is affected." }
+        if ($otherSkips.Count -gt 0) { Write-Warn2 "Common causes: subscription offer type without cost API support (sponsored/internal/MSDN - typical in demo and lab tenants), CSP without customer cost visibility, or an EA where 'view charges' is disabled. Skipped cleanly - nothing else is affected." }
+    }
+}
+Write-Host ""
+Write-Host "================= REVIEW =================" -ForegroundColor Cyan
+$review | Sort-Object Pool | Format-Table -AutoSize | Out-String -Width 300 | Write-Host
+if ($slotFamilies.Count -gt 0) {
+    Write-Host "========== BLUE/GREEN SLOT FAMILIES$(if ($NoSlotMerge) { ' (detected, kept separate: -NoSlotMerge)' } else { ' (one deployment each, measured from the combined usage)' }) ==========" -ForegroundColor Cyan
+    $slotFamilies | Select-Object Family, Slots, Hosts, PeakUsers, PerSlotPeaks, MAU, Window, Days, Overtime, Density, VmSize, ActualMo, ActualVm, ActualDisk, Flags | Format-Table -AutoSize | Out-String -Width 300 | Write-Host
+}
+$reviewFile = ($OutFile -replace '\.json$', '') + '-review.csv'
+# Export-Csv takes its column set from the FIRST row - make ActualMo uniform so the
+# column survives even when the first pool had no cost attribution (empty = skipped).
+foreach ($r in $review) {
+    if (-not $r.PSObject.Properties['ActualMo']) { $r | Add-Member -NotePropertyName ActualMo -NotePropertyValue '' }
+    if (-not $r.PSObject.Properties['ActualVm']) { $r | Add-Member -NotePropertyName ActualVm -NotePropertyValue '' }
+    if (-not $r.PSObject.Properties['ActualDisk']) { $r | Add-Member -NotePropertyName ActualDisk -NotePropertyValue '' }
+    if (-not $r.PSObject.Properties['ActualBasis']) { $r | Add-Member -NotePropertyName ActualBasis -NotePropertyValue '' }
+}
+$review | Sort-Object Pool | Export-Csv -Path $reviewFile -NoTypeInformation
+Write-Ok "Review table (including ActualMo when pulled) also written to: $reviewFile"
+# ---- the storage ledger: EVERY discovered store, whatever the model decided ------
+$ledgerFile = $null
+if ($storageCandidates.Count -gt 0) {
+    $ledgerFile = ($OutFile -replace '\.json$', '') + '-storage-ledger.csv'
+    $costLookup = @{}
+    if (Get-Variable -Name costByResource -ErrorAction SilentlyContinue) {
+        foreach ($k in $costByResource.Keys) { $costLookup[$k.ToLowerInvariant()] = $costByResource[$k] }
+    }
+    $storageCandidates | Sort-Object Classification, Account, Share | ForEach-Object {
+        [pscustomobject]@{
+            BillingUnit = $_.BillingUnit; Account = $_.Account; Share = $_.Share
+            Kind = $_.Kind; Sku = $_.Sku; BillingModel = $_.BillingModel; Region = $_.Region; RG = $_.RG
+            ProvisionedGb = $_.ProvisionedGb; UsedGb = $_.UsedGb; UsedSource = $_.UsedSource
+            ProvisionedIops = $_.ProvisionedIops; ThroughputMibps = $_.ThroughputMibps
+            Classification = $_.Classification; Evidence = $_.Evidence; Confidence = $_.Confidence
+            ServesPools = (@($_.ServesPools) -join '; ')
+            ActualMo = $(if ($costLookup.ContainsKey("$($_.ResourceId)".ToLowerInvariant())) { [Math]::Round($costLookup["$($_.ResourceId)".ToLowerInvariant()], 2) } else { '' })
+            Notes = "$($_.Notes)$(if ($_.TierNote) { "; $($_.TierNote)" })".TrimStart('; ')
+        }
+    } | Export-Csv -Path $ledgerFile -NoTypeInformation
+    Write-Ok "Storage ledger written: $ledgerFile ($($storageCandidates.Count) store(s) - classification, evidence, pools, sizes, and actual cost where visible)."
+}
+$poolRowsOnly = @($review | Where-Object { $_.Pool -notlike 'FSLogix:*' -and $_.Pool -notlike 'AppAttach:*' })
+$withUsage = @($poolRowsOnly | Where-Object { $_.PeakUsers -gt 0 }).Count
+$flagged   = @($poolRowsOnly | Where-Object { $_.Flags }).Count
+if ($script:TelemetryNotCollected) {
+    Write-Warn2 "TELEMETRY NOT COLLECTED - the usage queries never ran: Azure would not issue a Log Analytics token in this shell session ($($script:TokenFailedWs.Count) workspace(s), last error: $($script:LaTokenLastError)). Every pool is defaulted to 1 user and a 9:00+9h window; DO NOT read those as measured usage. RE-RUN THIS COMMAND: local PowerShell after Connect-AzAccount is the sure path, and a fresh Cloud Shell session usually works too. Inventory, storage, and cost in this output are complete and can be reused."
+} elseif ($usageRows -eq 0 -and $workspaceIds.Count -gt 0 -and $script:NetBlockedWs.Count -ge $workspaceIds.Count) {
+    Write-Warn2 "TELEMETRY NOT COLLECTED - every discovered workspace rejected this runner at the network layer (see the workspace warnings above). Every pool is defaulted to 1 user. Re-run from inside the customer network."
+} elseif ($usageRows -eq 0) {
+    Write-Warn2 "WORKSPACE CHECK: FAIL - the usage query ran and found no WVDConnections data in any discovered workspace. All usage fields defaulted. Check that AVD Insights / host pool diagnostics (WVDConnections) actually flow to the workspaces found above."
+} else {
+    Write-Ok "Usage found for $withUsage of $($pools.Count) pool(s)."
+    if ($script:TokenFailedWs.Count -gt 0) { Write-Warn2 "$($script:TokenFailedWs.Count) workspace(s) were NOT queried (no Log Analytics token) - pools that log only there are defaulted and flagged 'usage NOT collected'. A re-run fills them in." }
+}
+if ($flagged -gt 0) { Write-Warn2 "$flagged pool(s) carry flags - see the Flags column above." }
+$ts = $script:TenantSummary
+if ($ts.peakConcurrentUsers -gt 0 -or $ts.distinctUsers -gt 0) {
+    $distinctText = if ($ts.distinctUsers -gt 0) { "$($ts.distinctUsers) distinct user(s) connected in the $LookbackDays-day lookback (the per-pool MAU column adds to $($ts.perPoolMauSum); a person who used two pools is in both)" } else { "distinct user count not available (the per-user token query did not run)" }
+    Write-Ok "TENANT-WIDE, COUNTS ONLY: peak $($ts.peakConcurrentUsers) concurrent user(s)$(if ($ts.peakAtLocal) { " at $($ts.peakAtLocal)" }); $distinctText; $($ts.hostsRegistered) session host(s) registered."
+}
+if ($script:Throttle.Hits -gt 0) {
+    $bySvc = @($script:Throttle.Services.Keys | Sort-Object | ForEach-Object { "$_ x$($script:Throttle.Services[$_])" }) -join ', '
+    $lost = @($(if (Get-Variable -Name costSkipped -ErrorAction SilentlyContinue) { $costSkipped } else { @() }) | Where-Object { "$($_.Reason)" -match '^HTTP 429' }).Count
+    Write-Info "Azure throttled this run $($script:Throttle.Hits) time(s) ($bySvc); waited $($script:Throttle.WaitedSeconds)s total as Azure asked$(if ($script:Throttle.Recovered.Count -gt 0) { ", recovered $($script:Throttle.Recovered.Count) scope(s) on the second pass" }). $(if ($lost -eq 0) { 'Nothing was lost to throttling.' } else { "$lost scope(s) still refused - see above." })"
+}
+Write-Ok "Model written: $OutFile ($($deployments.Count) deployments$(if ($emptyPools.Count -gt 0) { "; $($emptyPools.Count) empty pool(s) excluded" }))"
+$vmRgGroups = @($vmSpecs.Keys | ForEach-Object { ($_ -split '/')[4] } | Group-Object | Sort-Object Count -Descending)
+if ($vmRgGroups.Count -gt 0) {
+    Write-Host ""
+    Write-Info "Session-host VMs live in these resource groups (Cost Management: filter Resource group to this list, Service name = Virtual Machines + Storage):"
+    foreach ($g in $vmRgGroups) { Write-Host ("      {0}  ({1} VM(s))" -f $g.Name, $g.Count) -ForegroundColor Gray }
+}
+Write-Info "After import, touch up: RDP egress GB (10), custom-image VM hours, any '(no usage data)' pools."
+# ---- raw decision data: everything observed, so adjustments never need a re-run ---
+$rawFile = ($OutFile -replace '\.json$', '') + '-rawdata.json'
+$bucketsFile = ($OutFile -replace '\.json$', '') + '-usage-buckets.csv'
+try {
+    $raw = [ordered]@{
+        meta = [ordered]@{
+            tool = 'Get-NerdioModelerJson.ps1'; version = $ScriptVersion; generatedUtc = [DateTime]::UtcNow.ToString('o')
+            parameters = [ordered]@{ ModelName = $ModelName; LookbackDays = $LookbackDays; TimeZone = $TimeZone; SubscriptionId = @($SubscriptionId); SkipCosts = [bool]$SkipCosts; NoSlotMerge = [bool]$NoSlotMerge }
+            identity = [ordered]@{
+                account = "$($script:AcctText)"; accountMasked = $true; tenantId = "$($script:TenText)"
+                scopeSubscriptions = @(foreach ($sid in $script:ScopeSubIds) { [ordered]@{ id = "$sid"; name = "$($script:SubNameById["$sid".ToLower()])" } })
+            }
+            notes = 'usage-buckets.csv holds per-pool 15-minute concurrency (UTC slots; convert with meta.parameters.TimeZone). Buckets include every reachable workspace - when a pool logs to several, the aggregates used the max-peak workspace, so filter buckets by Workspace to match. PeakUsersPerHost is an aggregate (per-host slot detail is not exported). No user identifiers are exported anywhere: MAU and the tenant distinct-user count come from salted per-run hashes that were held in memory only. Not re-derivable offline: a longer lookback, or telemetry that was not flowing during this run.'
+        }
+        pools = @($pools)
+        emptyPools = @($emptyPools)
+        poolVmIds = @($poolVmIds.Keys | ForEach-Object { [ordered]@{ poolId = $_; vmIds = @($poolVmIds[$_]) } })
+        vmSpecs = @($vmSpecs.Keys | ForEach-Object { [ordered]@{ vmId = $_; spec = $vmSpecs[$_] } })
+        workspaces = @($workspaceIds.Keys)
+        usageAggregates = @($usage.Values)
+        tenant = $script:TenantSummary
+        slotFamilies = @($slotFamilies | ForEach-Object { [ordered]@{
+            family = $_.Family; members = @($_.Members -split ' \+ '); memberPoolIds = @($_._keys); merged = [bool]$_.Merged
+            hosts = $_.Hosts; peakConcurrentUsers = $_.PeakUsers; peakAtUtc = $_._peakAt; perSlotPeaks = $_.PerSlotPeaks; mau = $_.MAU
+            window = $_.Window; days = $_.Days; overtime = $_.Overtime; density = $_.Density; vmSize = $_.VmSize; region = $_.Region
+            actualMo = $(if ($_.PSObject.Properties['ActualMo']) { $_.ActualMo } else { $null }); actualVm = $(if ($_.PSObject.Properties['ActualVm']) { $_.ActualVm } else { $null }); actualDisk = $(if ($_.PSObject.Properties['ActualDisk']) { $_.ActualDisk } else { $null })
+            deploymentName = $_._dep.name; flags = $_.Flags } })
+        discount = $(if ($script:Discount) { $script:Discount } else { $null })
+        sessionPeaks = @($sessionPeaks.Keys | ForEach-Object { [ordered]@{ poolId = $_; peakSessionsInclDisconnected = $sessionPeaks[$_] } })
+        storageCandidates = @($storageCandidates)
+        mapEvidence = @($(if (Get-Variable -Name mapEvidence -ErrorAction SilentlyContinue) { $mapEvidence } else { @() }))
+        costByResource = @($(if (Get-Variable -Name costByResource -ErrorAction SilentlyContinue) { $costByResource.Keys | ForEach-Object { [ordered]@{ resourceId = $_; cost = $costByResource[$_] } } } else { @() }))
+        costSkipped = @($(if (Get-Variable -Name costSkipped -ErrorAction SilentlyContinue) { $costSkipped } else { @() }))
+        costCurrency = $(if (Get-Variable -Name costCurrency -ErrorAction SilentlyContinue) { $costCurrency } else { $null })
+        costAttribution = @($(if (Get-Variable -Name costAttribution -ErrorAction SilentlyContinue) { $costAttribution } else { @() }))
+        costUnattributed = @($(if (Get-Variable -Name unattributedList -ErrorAction SilentlyContinue) { $unattributedList } else { @() }))
+        telemetry = [ordered]@{
+            collected = (-not $script:TelemetryNotCollected)
+            usageRows = $usageRows
+            workspacesNotQueried_tokenFailure = @($script:TokenFailedWs.Keys)
+            workspacesBlockedByNetwork = @($script:NetBlockedWs.Keys)
+            poolWorkspaces = @($poolWorkspaces.Keys | ForEach-Object { [ordered]@{ poolId = $_; workspaces = @($poolWorkspaces[$_]) } })
+        }
+        throttle = [ordered]@{
+            mode = 'one Cost Management query per subscription (ResourceGroupName filter), per-resource-group fallback, Retry-After honored, second pass after 90s cooldown'
+            hits = $script:Throttle.Hits; waitedSeconds = $script:Throttle.WaitedSeconds
+            byService = $script:Throttle.Services
+            recoveredOnSecondPass = @($script:Throttle.Recovered | ForEach-Object { @($_) -join ', ' })
+        }
+    }
+    Write-Utf8NoBom -FilePath $rawFile -Content ($raw | ConvertTo-Json -Depth 12)
+    if ($rawBuckets.Count -gt 0) { Write-Utf8NoBom -FilePath $bucketsFile -Content ((@($rawBuckets | ConvertTo-Csv -NoTypeInformation)) -join [Environment]::NewLine) }
+    $bucketsNote = if ($rawBuckets.Count -gt 0) { " + $bucketsFile ($($rawBuckets.Count) usage slots)" } else { '' }
+    Write-Ok "Raw decision data written: $rawFile$bucketsNote - adjustments can be re-derived from the zip without another customer run."
+} catch {
+    Write-Warn2 "Raw data export failed ($($_.Exception.Message)) - zip will carry the standard outputs only."
+}
+
+# ---- one-file handoff: zip = model JSON + review CSV + console log ---------------
+$zipFile = ($OutFile -replace '\.json$', '') + '.zip'
+if ($script:TranscriptOn) {
+    try { Stop-Transcript | Out-Null } catch { }
+    $script:TranscriptOn = $false
+    try {
+        $rawLog = Get-Content -LiteralPath $script:TranscriptFile -Raw
+        $clean = $rawLog -replace "`e\[[0-9;]*[A-Za-z]", ''
+        # v0.21: the transcript header names the person and the machine, and the
+        # output path carries the profile folder. The zip travels; redact them.
+        $clean = [regex]::Replace($clean, '(?m)^(Username|RunAs User|Machine|Host Application)\s*:.*$', '$1: [redacted]')
+        $clean = [regex]::Replace($clean, '(?i)([A-Za-z]:\\Users\\)[^\\\r\n]+', '$1[user]')
+        $clean = [regex]::Replace($clean, '(?i)(/(?:home|Users)/)[^/\s]+', '$1[user]')
+        Set-Content -LiteralPath $script:TranscriptFile -Value $clean -Encoding utf8
+    } catch { }
+}
+$zipOk = $false
+try {
+    $zipItems = @(@($OutFile, $reviewFile, $ledgerFile, $rawFile, $bucketsFile, $script:TranscriptFile) | Where-Object { $_ -and (Test-Path -LiteralPath $_) })
+    Compress-Archive -Path $zipItems -DestinationPath $zipFile -Force
+    $zipOk = $true
+    Write-Ok "Packaged into one file: $zipFile (model JSON + review CSV + storage ledger + raw decision data + console log)"
+    Write-Info "Send that single zip back - it carries the model, the review table, and the full run log."
+} catch {
+    Write-Warn2 "Could not build the zip ($($_.Exception.Message)) - files download individually."
+}
+if (-not $SkipDownload) {
+    if ($zipOk) { Invoke-CloudShellDownload -Path $zipFile }
+    else { Invoke-CloudShellDownload -Path $OutFile; Invoke-CloudShellDownload -Path $reviewFile }
+} else {
+    Write-Info "Downloads skipped (-SkipDownload). In the session: $(if ($zipOk) { $zipFile } else { \"$OutFile, $reviewFile\" })"
+}
